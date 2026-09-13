@@ -1,0 +1,3 @@
+{"file": "docs/agent-start.md", "reason": "Acceptance criteria and privacy/security checks"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Quality and verification guidance"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Logging and redaction checks"}

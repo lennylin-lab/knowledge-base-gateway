@@ -1,0 +1,4 @@
+{"file": "docs/agent-start.md", "reason": "Authoritative MVP scope, contracts, security boundaries, and implementation order"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend guideline index and planned Go layering"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Error classification and handling conventions"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "PostgreSQL/Redis and migration boundaries"}
