@@ -1,54 +1,6 @@
-# Directory Structure
+# Frontend Directory Structure
 
-> How frontend code is organized in this project.
+No frontend application exists in this repository and the MVP explicitly excludes an administration UI. Do not create frontend directories or tooling as part of gateway work. Operational endpoints (`/healthz`, `/readyz`, `/metrics`) are HTTP APIs, not pages.
 
----
+If a separately approved frontend is added, define its framework and source layout in that task before changing these guidelines; do not infer React, Vue or a state library from this empty repository.
 
-## Overview
-
-<!--
-Document your project's frontend directory structure here.
-
-Questions to answer:
-- Where do components live?
-- How are features/modules organized?
-- Where are shared utilities?
-- How are assets organized?
--->
-
-(To be filled by the team)
-
----
-
-## Directory Layout
-
-```
-<!-- Replace with your actual structure -->
-src/
-├── ...
-└── ...
-```
-
----
-
-## Module Organization
-
-<!-- How should new features be organized? -->
-
-(To be filled by the team)
-
----
-
-## Naming Conventions
-
-<!-- File and folder naming rules -->
-
-(To be filled by the team)
-
----
-
-## Examples
-
-<!-- Link to well-organized modules as examples -->
-
-(To be filled by the team)

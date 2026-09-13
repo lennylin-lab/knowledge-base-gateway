@@ -1,51 +1,8 @@
 # Logging Guidelines
 
-> How logging is done in this project.
+The gateway requires structured, machine-readable logs. The concrete Go logger is not selected yet; it must support correlation fields and redaction before serialization.
 
----
+Use DEBUG for development diagnostics, INFO for startup/shutdown and completed requests, WARN for rejected requests, limits, retries and degraded dependencies, and ERROR for unexpected failures and provider outages. Include timestamp, level, message, request_id/trace_id, operation, public model, status and latency where applicable.
 
-## Overview
+Never log raw Authorization headers, API keys, provider secrets, internal URLs, full headers, prompt/completion bodies, or sensitive SQL values. Token usage may be logged only when supplied by the provider; missing usage is unknown, not zero.
 
-<!--
-Document your project's logging conventions here.
-
-Questions to answer:
-- What logging library do you use?
-- What are the log levels and when to use each?
-- What should be logged?
-- What should NOT be logged (PII, secrets)?
--->
-
-(To be filled by the team)
-
----
-
-## Log Levels
-
-<!-- When to use each level: debug, info, warn, error -->
-
-(To be filled by the team)
-
----
-
-## Structured Logging
-
-<!-- Log format, required fields -->
-
-(To be filled by the team)
-
----
-
-## What to Log
-
-<!-- Important events to log -->
-
-(To be filled by the team)
-
----
-
-## What NOT to Log
-
-<!-- Sensitive data, PII, secrets -->
-
-(To be filled by the team)

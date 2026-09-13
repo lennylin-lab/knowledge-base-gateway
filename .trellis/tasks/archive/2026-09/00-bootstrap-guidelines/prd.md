@@ -21,9 +21,9 @@ the rest conversationally.
 
 ## Status (update the checkboxes as you complete each item)
 
-- [ ] Fill backend guidelines
-- [ ] Fill frontend guidelines
-- [ ] Add code examples
+- [x] Fill backend guidelines
+- [x] Fill frontend guidelines (documented as not applicable until a UI is introduced)
+- [x] Add code examples (Go provider boundary and JSON error envelope)
 
 ---
 

@@ -1,51 +1,14 @@
 # Error Handling
 
-> How errors are handled in this project.
+Errors cross an HTTP/provider boundary, so classify them before returning them. Every request has a trace/request ID and errors are auditable without prompt content.
 
----
+Return this stable envelope:
 
-## Overview
+```json
+{"error":{"type":"authentication_error","code":"invalid_api_key","message":"invalid API key","request_id":"req_..."}}
+```
 
-<!--
-Document your project's error handling conventions here.
+Use 401 for invalid/expired/revoked keys, 403 for forbidden models, 400/422 for invalid input, 429 for limits, 504 for upstream timeout, 503 for temporary upstream failure, and 500 for unknown internal failures. Do not pass through provider status codes or private error JSON unchanged.
 
-Questions to answer:
-- What error types do you define?
-- How are errors propagated?
-- How are errors logged?
-- How are errors returned to clients?
--->
+Wrap errors with operation context while preserving cancellation. Retry only pre-output network errors, 429 and 5xx under one total deadline; never retry after SSE starts. Client cancellation stops upstream work. Log classification, request ID, model and latency, never authorization headers, raw bodies, secrets, SQL values or internal URLs.
 
-(To be filled by the team)
-
----
-
-## Error Types
-
-<!-- Custom error classes/types -->
-
-(To be filled by the team)
-
----
-
-## Error Handling Patterns
-
-<!-- Try-catch patterns, error propagation -->
-
-(To be filled by the team)
-
----
-
-## API Error Responses
-
-<!-- Standard error response format -->
-
-(To be filled by the team)
-
----
-
-## Common Mistakes
-
-<!-- Error handling mistakes your team has made -->
-
-(To be filled by the team)
