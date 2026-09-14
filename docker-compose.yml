@@ -1,0 +1,111 @@
+# Gateway-owned container stack: PostgreSQL + Redis + one-shot migration +
+# gateway in database-backed Redis mode.
+#
+# Dependency order:
+#
+#   postgres healthy -\
+#                     +--> migrate "up" completed successfully --> gateway ready
+#   redis healthy ----/
+#
+# Security: the gateway and migrate services reuse the image built by
+# Dockerfile, which runs as uid 10001 (non-root). No provider secret, API
+# key, or DSN is baked into the image; everything below is run-time
+# configuration. The PostgreSQL password default is a deterministic local
+# throwaway (same policy as CI) — override POSTGRES_PASSWORD for anything
+# less disposable. Destructive rollback (`migrate down`) is intentionally not
+# wired into this file; `up` is idempotent.
+#
+# Host ports default to values that do not collide with a co-existing
+# knowledge-base-server stack (5432/6379); override via the *_HOST_PORT
+# variables documented in README.md.
+
+name: kb-gateway
+
+x-app-image: &app-image
+  image: ${GATEWAY_IMAGE:-kb-gateway:local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+# Single source of truth for the in-network DSN used by both the migration
+# job and the gateway. Interpolated from the POSTGRES_* variables, so
+# overrides stay consistent between services.
+x-database-url: &database-url "postgres://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway-local-throwaway}@postgres:5432/${POSTGRES_DB:-gateway}?sslmode=disable"
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway-local-throwaway}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway} -d ${POSTGRES_DB:-gateway}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6381}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+    security_opt:
+      - no-new-privileges:true
+
+  # One-shot migration job: applies pending migrations and exits 0. Idempotent
+  # for `up` (a fully-applied schema is a successful no-op). Never rolls back.
+  # entrypoint is reset because the image entrypoint is the gateway binary.
+  migrate:
+    <<: *app-image
+    entrypoint: ["/app/migrate"]
+    command: ["-dsn", *database-url, "-dir", "/app/migrations", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  # Production mode: catalog/routes/policies/keys from PostgreSQL, distributed
+  # limits/quotas in Redis. Development-only GATEWAY_API_KEYS /
+  # GATEWAY_MODELS / GATEWAY_PROVIDER are deliberately absent; the seeded
+  # fake provider registry needs no credentials.
+  gateway:
+    <<: *app-image
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      GATEWAY_DATABASE_URL: *database-url
+      GATEWAY_LIMITS_MODE: redis
+      GATEWAY_REDIS_ADDR: redis:6379
+    ports:
+      - "127.0.0.1:${GATEWAY_HOST_PORT:-8091}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres-data:
