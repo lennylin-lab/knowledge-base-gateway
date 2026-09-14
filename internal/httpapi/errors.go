@@ -10,6 +10,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
 )
 
 // APIError is the stable, documented error envelope.
@@ -37,10 +38,17 @@ func writeError(w http.ResponseWriter, requestID string, status int, typ, code, 
 // mapError translates internal failures into the documented envelope without
 // leaking provider status codes, secrets, or internal details.
 func mapError(w http.ResponseWriter, requestID string, err error) {
-	// Limiter infrastructure failure: 503-class with a non-leaky envelope;
-	// must not be confused with a genuine rate limit (429).
+	// Limiter/quota infrastructure failure: 503-class with a non-leaky
+	// envelope; must not be confused with a genuine limit denial (429).
 	if errors.Is(err, limiter.ErrUnavailable) {
 		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "limiter_unavailable", "the service is temporarily unable to accept requests")
+		return
+	}
+	var qErr *quota.Error
+	if errors.As(err, &qErr) {
+		// Quota denial: 429 with the stable quota_exceeded code. Policy
+		// internals (limits, remaining budgets) are never echoed.
+		writeError(w, requestID, http.StatusTooManyRequests, "rate_limit_error", qErr.Code, "token quota exceeded for this subject")
 		return
 	}
 	var lErr *limiter.Error

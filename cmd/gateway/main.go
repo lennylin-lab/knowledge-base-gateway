@@ -23,6 +23,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/router"
 	pgstore "github.com/knowledge-base/knowledge-base-gateway/internal/store/pg"
 )
@@ -191,8 +192,11 @@ func main() {
 	keyManager = auth.NewManager(lifecycleStore)
 
 	// Limits: in-memory is development-only; Redis mode must be verified by
-	// readiness before traffic is served.
+	// readiness before traffic is served. The token-quota gate shares the
+	// mode: in-memory for single-process development, Redis for
+	// multi-instance atomic daily/monthly budgets.
 	var rateLimiter limiter.Gate
+	var quotaGate quota.Gate
 	if cfg.RedisEnabled {
 		rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 		rl := limiter.NewRedis(rdb, "gw", cfg.RatePerMinute, cfg.MaxConcurrent)
@@ -207,9 +211,11 @@ func main() {
 			}
 		}
 		rateLimiter = rl
+		quotaGate = quota.NewRedis(rdb, "gw")
 		defer rdb.Close()
 	} else {
 		rateLimiter = limiter.New(cfg.RatePerMinute, cfg.MaxConcurrent)
+		quotaGate = quota.NewMemory()
 	}
 
 	reg := metrics.New()
@@ -218,7 +224,8 @@ func main() {
 	}
 
 	chat := &httpapi.ChatHandler{
-		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Audit: auditSink, Metrics: reg,
+		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
+		Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxMsgs: cfg.MaxMessages, MaxChars: cfg.MaxMessageChars,
 	}
 

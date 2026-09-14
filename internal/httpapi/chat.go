@@ -17,6 +17,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
 )
 
 var errValidation = errors.New("invalid request")
@@ -43,6 +44,7 @@ type ChatHandler struct {
 	Service  *gateway.Service
 	Policy   *policy.Policy
 	Limiter  limiter.Gate
+	Quota    quota.Gate
 	Audit    audit.Sink
 	Metrics  *metrics.Registry
 	MaxBody  int64
@@ -134,34 +136,82 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	// 5. Token quota: reserve a deterministic bounded estimate before any
+	// provider invocation. Subjects without a configured daily/monthly
+	// budget skip quota entirely.
+	var qres quota.Reservation = quota.Done
+	if h.Quota != nil && h.Policy != nil {
+		if limits, found := h.Policy.LimitsFor(principal.SubjectID); found {
+			ql := quota.Limits{DailyTokens: limits.DailyTokens, MonthlyTokens: limits.MonthlyTokens}
+			if ql.Configured() {
+				est := quota.Estimate(req.MaxTokens, limits.MaxOutputTokens, messageChars(req.Messages))
+				res, qErr := h.Quota.Reserve(r.Context(), principal.SubjectID, ql, est, time.Now())
+				if qErr != nil {
+					var denial *quota.Error
+					if errors.As(qErr, &denial) {
+						// Genuine quota denial: 429 quota_exceeded, provider
+						// never invoked. Retry-After points at the UTC
+						// boundary that resets the denied budget.
+						h.MetricsIncRateLimited(req.Model)
+						if denial.RetryAfter > 0 {
+							w.Header().Set("Retry-After", fmt.Sprintf("%d", int(denial.RetryAfter.Seconds())+1))
+						}
+					}
+					// Otherwise this is quota infrastructure failure, which
+					// mapError routes to the 503 limiter_unavailable contract.
+					fail(qErr)
+					return
+				}
+				qres = res
+			}
+		}
+	}
+
 	preq := provider.ChatRequest{
 		Model: plan.Primary(), Messages: req.Messages, Temperature: req.Temperature,
 		MaxTokens: req.MaxTokens, RequestID: requestID,
 	}
 
 	if !req.Stream {
-		h.complete(w, r, requestID, traceID, principal, req.Model, plan, preq, start)
+		h.complete(w, r, requestID, traceID, principal, req.Model, plan, preq, qres, start)
 		return
 	}
-	h.stream(w, r, requestID, traceID, principal, req.Model, plan, preq, start)
+	h.stream(w, r, requestID, traceID, principal, req.Model, plan, preq, qres, start)
 }
 
-func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, requestID, traceID string, principal auth.Principal, model string, plan gateway.Plan, preq provider.ChatRequest, start time.Time) {
+// messageChars sums message content sizes as the deterministic input signal
+// for the quota estimate. Content is never stored.
+func messageChars(msgs []provider.Message) int {
+	n := 0
+	for _, m := range msgs {
+		n += len(m.Content)
+	}
+	return n
+}
+
+func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, requestID, traceID string, principal auth.Principal, model string, plan gateway.Plan, preq provider.ChatRequest, qres quota.Reservation, start time.Time) {
 	resp, providerName, err := h.Service.Complete(r.Context(), plan, preq)
 	if err != nil {
+		// No billable response: refund the reservation idempotently.
+		qres.Release()
 		mapError(w, requestID, err)
 		h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, 0, err, 1, nil, false, start)
 		return
 	}
+	// Settle exactly once to the reported total; unknown usage keeps the
+	// conservative reservation and is never fabricated as zero.
+	qres.Settle(usageTotal(resp.Usage))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
 	h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, http.StatusOK, nil, 1, resp.Usage, false, start)
 }
 
-func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID, traceID string, principal auth.Principal, model string, plan gateway.Plan, preq provider.ChatRequest, start time.Time) {
+func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID, traceID string, principal auth.Principal, model string, plan gateway.Plan, preq provider.ChatRequest, qres quota.Reservation, start time.Time) {
 	flusher, canFlush := w.(http.Flusher)
 	if !canFlush {
+		// No provider call will happen; refund the reservation.
+		qres.Release()
 		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "streaming_unsupported", "streaming is not supported by this connection")
 		return
 	}
@@ -190,6 +240,11 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID, 
 		if writeErr == nil {
 			flusher.Flush()
 		}
+	} else if !sawOutput {
+		// Failed before any output: nothing billable, refund idempotently.
+		// Failures after output started keep the conservative reservation
+		// because the consumed usage is unknown and never fabricated.
+		qres.Release()
 	}
 	h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, statusFor(err, sawOutput), err, attempts(plan), nil, true, start)
 	if err != nil && !sawOutput {
@@ -274,6 +329,16 @@ func usageTokens(u *provider.Usage, prompt bool) *int {
 		v = u.CompletionTokens
 	}
 	return &v
+}
+
+// usageTotal reports the upstream total token count for quota settlement,
+// or nil when usage is unknown so the conservative reservation is retained.
+func usageTotal(u *provider.Usage) *int64 {
+	if u == nil || !u.Known {
+		return nil
+	}
+	t := int64(u.TotalTokens)
+	return &t
 }
 
 func bearer(r *http.Request) (string, bool) {
