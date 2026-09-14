@@ -141,7 +141,7 @@ environment only and are never persisted, logged, or echoed in errors.
 | `GATEWAY_REDIS_ADDR` | `127.0.0.1:6379` | Redis address for distributed limits |
 | `GATEWAY_ADMIN_TOKEN` | – | Bearer token for the admin API (admin API disabled when unset) |
 | `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
-| `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic` |
+| `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | – | Anthropic credentials (env only) |
 | `GATEWAY_ALLOW_INSECURE_BASE_URLS` | `false` | Allow `http://` provider base URLs (development only) |
 
