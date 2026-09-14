@@ -42,11 +42,11 @@ export GATEWAY_MODELS="gpt-4o-mini:openai:gpt-4o-mini"
 | Variable | Default | Meaning |
 |---|---|---|
 | `GATEWAY_ADDR` | `:8080` | Listen address |
-| `GATEWAY_PROVIDER` | `fake` | `fake` (dev echo) or `openai` |
+| `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set |
 | `OPENAI_API_KEY` | – | Provider secret; required when provider is `openai` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
 | `GATEWAY_API_KEYS` | – | Dev-only: `id:subject:plaintext-key` comma-separated. Production keys live in PostgreSQL (`api_keys` table, salted hashes). |
-| `GATEWAY_MODELS` | – | `public-name:provider:upstream-model` comma-separated |
+| `GATEWAY_MODELS` | – | Dev-only: `public-name:provider:upstream-model` comma-separated. Production catalog lives in PostgreSQL. |
 | `GATEWAY_MAX_RETRIES` | `2` | Finite retries for pre-output network/429/5xx/timeout failures |
 | `GATEWAY_RATE_PER_MINUTE` | `120` | Per-subject request rate (fixed window) |
 
@@ -123,6 +123,16 @@ migrations" below); there is no auto-migration at startup. Set
 distributed rate/concurrency limiter — readiness fails until Redis answers.
 Set `GATEWAY_ADMIN_TOKEN` to enable the admin API on `GATEWAY_ADMIN_ADDR`
 (default `:8081`, internal network only).
+
+`GATEWAY_DATABASE_URL` is the configuration-mode boundary. In database mode
+the persisted configuration is authoritative: the development-only
+`GATEWAY_API_KEYS` and `GATEWAY_MODELS` lists are optional (a supplied value
+is still validated so a typo fails startup), and the legacy `GATEWAY_PROVIDER`
+selector is ignored. Every enabled `providers` row is credential-checked at
+startup — `fake` needs no secret, `openai` requires `OPENAI_API_KEY`, and
+`anthropic` requires `ANTHROPIC_API_KEY` — and a missing credential aborts
+startup before the server can report ready. Secrets are read from the process
+environment only and are never persisted, logged, or echoed in errors.
 
 | Variable | Default | Meaning |
 |---|---|---|
