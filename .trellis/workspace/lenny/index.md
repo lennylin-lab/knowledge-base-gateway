@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
+- **Total Sessions**: 6
 - **Last Active**: 2026-09-15
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~141 | Active |
+| `journal-1.md` | ~163 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-09-15 | Migrate CLI DSN echo sanitization | `e6b371c` | `master` |
 | 5 | 2026-09-15 | Startup hardening and chat-path smoke coverage | `bb3816a`, `25ea579`, `821f36e` | `master` |
 | 4 | 2026-09-15 | Gateway production readiness: config boundary, CI, container smoke | `1a51a0f`, `df7d03a`, `a1b2222`, `2c194f7`, `446db0a`, `d954053`, `c84d150`, `5a663f1`, `f497ae8`, `606be25`, `d30c51a` | `master` |
 | 3 | 2026-09-15 | Real-service integration verification | `c1abae4`, `2688f0c`, `4f78361` | `master` |

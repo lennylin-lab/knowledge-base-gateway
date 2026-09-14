@@ -139,3 +139,25 @@ Closed the three deferred observations from production-readiness. (1) Database c
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: Migrate CLI DSN echo sanitization
+<!-- trellis-session: v=2 fp=e6cdf00ea91036c9 -->
+
+**Date**: 2026-09-15
+**Task**: Migrate CLI DSN echo sanitization
+**Branch**: `master`
+
+### Summary
+
+Closed the last deferred observation: cmd/migrate's fatal("connect: %v") could echo DSN-derived error text. The connect-failure classifier moved from the gateway binary into the shared internal/dberr package (with leak-prevention unit tests covering pgconn's DSN-embedding message shapes), cmd/migrate now classifies at the connect fatal, and newMigrator pings eagerly with a 10s bound so lazy database/sql failures funnel into the sanitized path instead of surfacing from Up/Version with DSN-bearing text. Verified live: bad-host DSN -> unreachable classification, wrong-password DSN -> credentials classification, zero DSN components in either output; healthy path (version 2) unchanged; gofmt/vet/full suite green. database-guidelines updated to note that both pgstore.Connect and the migrate CLI follow the eager-ping-plus-classifier pattern.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e6b371c` | fix: classify migrate connect errors through shared dberr package |
+
+### Status
+
+[OK] **Completed**
