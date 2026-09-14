@@ -24,7 +24,12 @@ type DB struct {
 	Pool *pgxpool.Pool
 }
 
-// Connect builds a pool from a database URL or DSN.
+// Connect builds a pool from a database URL or DSN and verifies that the
+// server actually accepts a connection. Pool creation in pgx v5 is lazy
+// (MinConns defaults to 0), so without an explicit ping a bad host or a
+// rejected credential would only surface at the first query. Callers may
+// treat a Connect error as "database unavailable": it carries no DSN text
+// (main sanitizes it before logging).
 func Connect(ctx context.Context, url string) (*DB, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
@@ -33,6 +38,14 @@ func Connect(ctx context.Context, url string) (*DB, error) {
 	cfg.MaxConns = 10
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
+		return nil, fmt.Errorf("connect database: %w", err)
+	}
+	// Bound the verification independently of the caller's context: startup
+	// must fail fast and classifiably, not hang on a blackholed host.
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("connect database: %w", err)
 	}
 	return &DB{Pool: pool}, nil
@@ -323,6 +336,34 @@ func (d *DB) LoadLimits(ctx context.Context) (map[string]policy.Limits, error) {
 			return nil, err
 		}
 		out[subject] = l
+	}
+	return out, rows.Err()
+}
+
+// ModelGrant is one access_policies grant: the subject may use the public
+// model. Grants answer the Permitted question; ceilings live in LoadLimits.
+type ModelGrant struct {
+	Subject string
+	Model   string
+}
+
+// LoadGrants reads the explicit subject/model grants from access_policies.
+// In database mode these are the only permitted (subject, model) pairs;
+// subjects without a row stay denied for that model.
+func (d *DB) LoadGrants(ctx context.Context) ([]ModelGrant, error) {
+	rows, err := d.Pool.Query(ctx,
+		`SELECT subject_id, public_model FROM access_policies ORDER BY subject_id, public_model`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ModelGrant
+	for rows.Next() {
+		var g ModelGrant
+		if err := rows.Scan(&g.Subject, &g.Model); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
 	}
 	return out, rows.Err()
 }

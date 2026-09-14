@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -65,7 +67,11 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		var err error
 		dbw, err = pgstore.Connect(ctx, cfg.DatabaseURL)
 		if err != nil {
-			return fmt.Errorf("database connect: %w", err)
+			// pgx parse/connect errors embed parts of the connection string
+			// (host, user, database, password-redacted URL). Classify the
+			// failure instead of wrapping it so nothing DSN-shaped reaches
+			// the logs.
+			return fmt.Errorf("database connect: %s", describeDBConnectFailure(err))
 		}
 		defer dbw.Close()
 		authenticator = &pgstore.Authenticator{DB: dbw, Now: time.Now}
@@ -150,7 +156,9 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 
 	// Policy: dev mode allows each configured subject every model; database
-	// mode loads explicit model grants and limits.
+	// mode loads explicit model grants and limits. A subject without a grant
+	// row stays denied (the HTTP layer collapses that to the same non-leaky
+	// 403 as an unknown model).
 	pol := policy.New()
 	if dbw != nil {
 		limits, err := dbw.LoadLimits(ctx)
@@ -159,6 +167,13 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		}
 		for subject, l := range limits {
 			pol.SetLimits(subject, l)
+		}
+		grants, err := dbw.LoadGrants(ctx)
+		if err != nil {
+			return fmt.Errorf("load policy grants: %w", err)
+		}
+		for _, g := range grants {
+			pol.Allow(g.Subject, g.Model)
 		}
 	} else {
 		subjects := map[string]struct{}{}
@@ -254,37 +269,81 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		Metrics: reg.Handler(),
 	})
 
+	// Bind both listeners synchronously so a port conflict is an ordinary
+	// run() failure returned to main; listener goroutines never exit the
+	// process. Serve receives the pre-bound listener, so a graceful Shutdown
+	// can never race a not-yet-opened socket.
+	ln, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("http listen %s: %w", cfg.Addr, err)
+	}
+	defer ln.Close()
+
+	var adminSrv *http.Server
+	var adminLn net.Listener
+	if cfg.AdminToken != "" {
+		adminLn, err = net.Listen("tcp", cfg.AdminAddr)
+		if err != nil {
+			return fmt.Errorf("admin listen %s: %w", cfg.AdminAddr, err)
+		}
+		defer func() { _ = adminLn.Close() }()
+		adminSrv = &http.Server{
+			Addr: cfg.AdminAddr, ReadHeaderTimeout: 10 * time.Second,
+			Handler: httpapi.NewAdminMux(httpapi.AdminDeps{Manager: keyManager, Logger: logger, Token: cfg.AdminToken}),
+		}
+	}
+
 	srv := &http.Server{Addr: cfg.Addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+
+	// runCtx covers the serving lifetime: it cancels when the process is
+	// signalled (parent ctx) or when either listener fails, so both exit
+	// paths converge on the same graceful-shutdown epilogue. serveErr carries
+	// the first listener failure out to the return value.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	serveErr := make(chan error, 2)
+
 	go func() {
 		logger.Info("gateway listening", "addr", cfg.Addr, "provider", cfg.Provider,
 			"persistence", cfg.DatabaseURL != "", "limits_mode", cfg.LimitsMode)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server failed", "error", err)
-			os.Exit(1)
+			serveErr <- err
+			cancelRun()
 		}
 	}()
 
 	// Admin API: separate listener, token-gated, internal network only.
-	if cfg.AdminToken != "" {
-		adminSrv := &http.Server{
-			Addr: cfg.AdminAddr, ReadHeaderTimeout: 10 * time.Second,
-			Handler: httpapi.NewAdminMux(httpapi.AdminDeps{Manager: keyManager, Logger: logger, Token: cfg.AdminToken}),
-		}
+	if adminSrv != nil {
 		go func() {
 			logger.Info("admin api listening", "addr", cfg.AdminAddr)
-			if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := adminSrv.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("admin server failed", "error", err)
+				serveErr <- err
+				cancelRun()
 			}
 		}()
-		defer adminSrv.Close()
 	}
 
-	<-ctx.Done()
+	<-runCtx.Done()
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
+	}
+	if adminSrv != nil {
+		if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("graceful admin shutdown failed", "error", err)
+		}
+	}
+	// A listener failure cancelled runCtx; surface it so main exits non-zero.
+	// The goroutine sends to the buffered channel before cancelling, so the
+	// value is visible here.
+	select {
+	case err := <-serveErr:
+		return fmt.Errorf("serve: %w", err)
+	default:
 	}
 	return nil
 }
@@ -319,6 +378,44 @@ func newProviderFromRegistry(cfg config.Config, kind, name, baseURL string) (pro
 		return provider.Fake{}, nil
 	default:
 		return nil, fmt.Errorf("provider %s: unsupported kind %q", name, kind)
+	}
+}
+
+// describeDBConnectFailure classifies a database connect failure for logging
+// without echoing any DSN component. pgconn wraps connection strings in its
+// parse/connect errors (host, user, database, and the password-redacted URL
+// all appear in the message text), so the original error is inspected and
+// reduced to a coarse operation-plus-cause phrase. Keyword matching runs
+// against the lowercased message only; the message itself is never returned.
+func describeDBConnectFailure(err error) string {
+	if err == nil {
+		return "unknown failure"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "timed out reaching the server"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "password authentication failed"),
+		strings.Contains(msg, "authentication failed"),
+		strings.Contains(msg, "login"),
+		strings.Contains(msg, `role "`),
+		strings.Contains(msg, "tenant or user not found"):
+		return "the server rejected the credentials"
+	case strings.Contains(msg, "no such host"),
+		strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "network is unreachable"),
+		strings.Contains(msg, "host unreachable"),
+		strings.Contains(msg, "i/o timeout"),
+		strings.Contains(msg, "dial error"):
+		return "the server was unreachable (dns, dial, or timeout failure)"
+	case strings.Contains(msg, "parse"),
+		strings.Contains(msg, "invalid"),
+		strings.Contains(msg, "keyword"),
+		strings.Contains(msg, "unsupported"):
+		return "the configured connection string is invalid"
+	default:
+		return "a connection could not be established"
 	}
 }
 
