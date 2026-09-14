@@ -79,22 +79,66 @@ upstream rejected request -> 400; upstream timeout -> 504; upstream
 unavailable/rate-limited -> 503; unknown internal -> 500. Provider status
 codes are never passed through raw.
 
-## Design notes and known limitations (MVP)
+## V1.1 production mode
 
-- **Rate limiting is in-memory** (`internal/limiter`) and per-process. It is
-  correct only for a single instance. Multi-instance deployments need the
-  Redis-backed implementation behind `store.LimiterState` (interface declared,
-  implementation deferred).
-- **Persistence is interface-only** (`internal/store`): the MVP uses in-memory
-  auth/catalog/audit substitutes wired in `cmd/gateway`. The initial
-  PostgreSQL schema is in `migrations/0001_init.sql`; repository
-  implementations and a migration test harness are the next slice.
-- **Audit is metadata-only** (subject, model, status, latency, token usage
-  when reported, request id). Prompts/completions are never logged or stored;
-  unknown token usage is recorded as unknown, never zero.
-- **Retries** are finite (`GATEWAY_MAX_RETRIES`), deadline-bounded, and only
-  for pre-output network/429/5xx/timeout failures. Streaming never retries
-  after output has started and never switches providers mid-stream.
+Set `GATEWAY_DATABASE_URL` to enable PostgreSQL persistence (keys, catalog,
+providers, primary/backup routes, policies, audit records). Migrations live in
+`migrations/` and are applied out of band; there is no auto-migration at
+startup. Set `GATEWAY_LIMITS_MODE=redis` (+ `GATEWAY_REDIS_ADDR`) for the
+distributed rate/concurrency limiter — readiness fails until Redis answers.
+Set `GATEWAY_ADMIN_TOKEN` to enable the admin API on `GATEWAY_ADMIN_ADDR`
+(default `:8081`, internal network only).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GATEWAY_DATABASE_URL` | – | PostgreSQL DSN; enables persistent keys/catalog/routes/policies/audit |
+| `GATEWAY_LIMITS_MODE` | `local` | `local` (dev-only, single instance) or `redis` |
+| `GATEWAY_REDIS_ADDR` | `127.0.0.1:6379` | Redis address for distributed limits |
+| `GATEWAY_ADMIN_TOKEN` | – | Bearer token for the admin API (admin API disabled when unset) |
+| `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
+| `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic` |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | – | Anthropic credentials (env only) |
+| `GATEWAY_ALLOW_INSECURE_BASE_URLS` | `false` | Allow `http://` provider base URLs (development only) |
+
+### Admin API
+
+Token-gated (`Authorization: Bearer $GATEWAY_ADMIN_TOKEN`):
+
+- `POST /admin/keys` `{"subject":"svc","tenant_id":"...","expires_in_hours":24}` — returns the plaintext key exactly once
+- `GET /admin/keys?subject=svc` — metadata only (prefix, status, timestamps)
+- `POST /admin/keys/{id}/rotate` — new plaintext, old key revoked
+- `POST /admin/keys/{id}/revoke`
+
+### Routing and reliability
+
+Public models route through `model_routes` (priority order) to a primary and
+a backup provider. Circuit breakers track consecutive failures per route and
+recover via half-open probes. Retries remain finite, deadline-bounded, and
+only for pre-output network/429/5xx/timeout failures; streaming never switches
+providers once output has reached the client. Provider base URLs are validated
+at startup against SSRF rules (https only unless explicitly allowed).
+
+### Metrics
+
+`/metrics` exposes `gateway_requests_total{model,status}`,
+`gateway_upstream_errors_total{model,provider,class}`,
+`gateway_tokens_total{model,kind}`, and
+`gateway_rate_limit_total{model}`. `X-Trace-ID` is honored (or derived from
+the request ID) and echoed for log/trace/audit correlation.
+
+See `docs/gateway-client-contract.md` for the knowledge-base-server client
+contract.
+
+## Design notes and known limitations
+
+- **Audit is metadata-only** (subject, model, provider, status, latency, token
+  usage when reported, request/trace id). Prompts/completions are never logged
+  or stored; unknown token usage is recorded as unknown, never zero.
+- **Token ceilings** cap `max_tokens` from policy; upstream-reported usage is
+  required for accounting, and daily/monthly quota enforcement beyond policy
+  storage is not yet implemented.
+- **Local limiter** is development-only and per-process; multi-instance
+  deployments must use `GATEWAY_LIMITS_MODE=redis` (readiness gates this).
 - The `Known` flag on usage is internal; token usage absent from an upstream
   response is not fabricated.
 

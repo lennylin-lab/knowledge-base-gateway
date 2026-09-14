@@ -43,6 +43,18 @@ type Config struct {
 
 	Keys   []KeyEntry
 	Models []ModelEntry
+
+	// V1.1 production settings. All optional; the gateway runs in
+	// development mode (in-memory stores, local limiter) when unset.
+	DatabaseURL   string // GATEWAY_DATABASE_URL enables PostgreSQL persistence
+	RedisAddr     string // GATEWAY_REDIS_ADDR enables the distributed limiter
+	RedisEnabled  bool
+	LimitsMode    string // "local" (default, dev-only) or "redis"
+	AdminToken    string // GATEWAY_ADMIN_TOKEN; enables the admin API
+	AdminAddr     string // defaults :8081
+	AllowInsecure bool   // GATEWAY_ALLOW_INSECURE_BASE_URLS (dev only)
+	AnthropicKey  string
+	AnthropicURL  string
 }
 
 // FromEnv builds a Config from environment variables and validates it.
@@ -111,8 +123,37 @@ func FromEnv() (Config, error) {
 	if c.Provider == "openai" && c.OpenAIKey == "" {
 		return c, fmt.Errorf("OPENAI_API_KEY must be set when GATEWAY_PROVIDER=openai")
 	}
-	if c.Provider != "openai" && c.Provider != "fake" {
+	switch c.Provider {
+	case "openai":
+		if c.OpenAIKey == "" {
+			return c, fmt.Errorf("OPENAI_API_KEY must be set when GATEWAY_PROVIDER=openai")
+		}
+	case "anthropic":
+		if c.AnthropicKey == "" {
+			return c, fmt.Errorf("ANTHROPIC_API_KEY must be set when GATEWAY_PROVIDER=anthropic")
+		}
+	case "fake":
+	default:
 		return c, fmt.Errorf("GATEWAY_PROVIDER: unsupported provider %q", c.Provider)
+	}
+
+	if v := os.Getenv("GATEWAY_DATABASE_URL"); v != "" {
+		c.DatabaseURL = v
+	}
+	c.AdminToken = os.Getenv("GATEWAY_ADMIN_TOKEN")
+	c.AdminAddr = env("GATEWAY_ADMIN_ADDR", ":8081")
+	c.AnthropicKey = os.Getenv("ANTHROPIC_API_KEY")
+	c.AnthropicURL = env("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+	c.AllowInsecure = os.Getenv("GATEWAY_ALLOW_INSECURE_BASE_URLS") == "true"
+
+	c.LimitsMode = env("GATEWAY_LIMITS_MODE", "local")
+	switch c.LimitsMode {
+	case "redis":
+		c.RedisAddr = env("GATEWAY_REDIS_ADDR", "127.0.0.1:6379")
+		c.RedisEnabled = true
+	case "local":
+	default:
+		return c, fmt.Errorf("GATEWAY_LIMITS_MODE: want \"local\" or \"redis\", got %q", c.LimitsMode)
 	}
 	return c, nil
 }

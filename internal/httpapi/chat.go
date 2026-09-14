@@ -31,12 +31,18 @@ type chatRequest struct {
 	Metadata    json.RawMessage    `json:"metadata"`
 }
 
+// Authenticator is the bearer-key resolution boundary; both the in-memory
+// auth.Store and the PostgreSQL-backed authenticator satisfy it.
+type Authenticator interface {
+	Authenticate(key string, now time.Time) (auth.Principal, error)
+}
+
 // ChatHandler serves POST /v1/chat/completions.
 type ChatHandler struct {
-	Auth     *auth.Store
+	Auth     Authenticator
 	Service  *gateway.Service
 	Policy   *policy.Policy
-	Limiter  *limiter.Limiter
+	Limiter  limiter.Gate
 	Audit    audit.Sink
 	Metrics  *metrics.Registry
 	MaxBody  int64
@@ -51,11 +57,16 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		requestID = newRequestID()
 	}
 	w.Header().Set("X-Request-ID", requestID)
+	traceID := r.Header.Get("X-Trace-ID")
+	if traceID == "" {
+		traceID = requestID // request ID doubles as the trace root
+	}
+	w.Header().Set("X-Trace-ID", traceID)
 
 	var principal auth.Principal
 	fail := func(err error) {
 		mapError(w, requestID, err)
-		h.record(requestID, principal.SubjectID, principal.KeyID, "", "", 0, err, nil, false, start)
+		h.record(requestID, traceID, principal.SubjectID, principal.KeyID, "", "", 0, err, 1, nil, false, start)
 	}
 
 	// 1. Authentication before anything else.
@@ -88,7 +99,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Model existence + subject policy (non-leaky combined errors).
-	p, upstreamModel, err := h.Service.Resolve(principal.SubjectID, req.Model)
+	plan, err := h.Service.Resolve(principal.SubjectID, req.Model)
 	if err != nil {
 		fail(err)
 		return
@@ -97,41 +108,58 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(gateway.ErrNotPermitted)
 		return
 	}
+	if h.Policy != nil {
+		if limits, ok := h.Policy.LimitsFor(principal.SubjectID); ok && limits.MaxOutputTokens > 0 {
+			if req.MaxTokens == nil || *req.MaxTokens > limits.MaxOutputTokens {
+				capped := limits.MaxOutputTokens
+				req.MaxTokens = &capped
+			}
+		}
+	}
 
 	// 4. Rate/concurrency limits.
-	ok, release := h.Limiter.Allow(principal.SubjectID, time.Now())
+	ok, retryAfter, release, limErr := h.Limiter.Allow(r.Context(), principal.SubjectID, time.Now())
+	if limErr != nil {
+		// Limiter infrastructure failure: 503-class, never a rate-limit 429.
+		fail(limErr)
+		return
+	}
 	if !ok {
+		if retryAfter > 0 {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())+1))
+		}
+		h.MetricsIncRateLimited(req.Model)
 		fail(&limiter.Error{Code: "rate_limit_exceeded"})
 		return
 	}
 	defer release()
 
 	preq := provider.ChatRequest{
-		Model: upstreamModel, Messages: req.Messages, Temperature: req.Temperature,
+		Model: plan.Primary(), Messages: req.Messages, Temperature: req.Temperature,
 		MaxTokens: req.MaxTokens, RequestID: requestID,
 	}
 
 	if !req.Stream {
-		h.complete(w, r, requestID, principal, req.Model, p, preq, start)
+		h.complete(w, r, requestID, traceID, principal, req.Model, plan, preq, start)
 		return
 	}
-	h.stream(w, r, requestID, principal, req.Model, p, preq, start)
+	h.stream(w, r, requestID, traceID, principal, req.Model, plan, preq, start)
 }
 
-func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, requestID string, principal auth.Principal, model string, p provider.Provider, preq provider.ChatRequest, start time.Time) {
-	resp, err := h.Service.Complete(r.Context(), p, preq)
+func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, requestID, traceID string, principal auth.Principal, model string, plan gateway.Plan, preq provider.ChatRequest, start time.Time) {
+	resp, providerName, err := h.Service.Complete(r.Context(), plan, preq)
 	if err != nil {
 		mapError(w, requestID, err)
-		h.record(requestID, principal.SubjectID, principal.KeyID, model, p.Name(), 0, err, nil, false, start)
+		h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, 0, err, 1, nil, false, start)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
-	h.record(requestID, principal.SubjectID, principal.KeyID, model, p.Name(), http.StatusOK, nil, resp.Usage, false, start)
+	h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, http.StatusOK, nil, 1, resp.Usage, false, start)
 }
 
-func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID string, principal auth.Principal, model string, p provider.Provider, preq provider.ChatRequest, start time.Time) {
+func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID, traceID string, principal auth.Principal, model string, plan gateway.Plan, preq provider.ChatRequest, start time.Time) {
 	flusher, canFlush := w.(http.Flusher)
 	if !canFlush {
 		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "streaming_unsupported", "streaming is not supported by this connection")
@@ -155,7 +183,7 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID s
 		return nil
 	}
 
-	err := h.Service.Stream(r.Context(), p, preq, send)
+	providerName, err := h.Service.Stream(r.Context(), plan, preq, send)
 	if err == nil {
 		// Terminal event only on normal completion.
 		_, writeErr = io.WriteString(w, "data: [DONE]\n\n")
@@ -163,7 +191,7 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID s
 			flusher.Flush()
 		}
 	}
-	h.record(requestID, principal.SubjectID, principal.KeyID, model, p.Name(), statusFor(err, sawOutput), err, nil, true, start)
+	h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, statusFor(err, sawOutput), err, attempts(plan), nil, true, start)
 	if err != nil && !sawOutput {
 		// Nothing was sent yet: emit a normalized SSE error event.
 		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"type\":\"%s\",\"request_id\":%q}}\n\n", errorType(err), requestID)
@@ -192,7 +220,20 @@ func errorType(err error) string {
 	}
 }
 
-func (h *ChatHandler) record(requestID, subject, keyID, model, providerName string, status int, err error, usage *provider.Usage, streaming bool, start time.Time) {
+func attempts(plan gateway.Plan) int {
+	if len(plan.Candidates) > 1 {
+		return len(plan.Candidates)
+	}
+	return 1
+}
+
+func (h *ChatHandler) MetricsIncRateLimited(model string) {
+	if h.Metrics != nil {
+		h.Metrics.IncRateLimit(model)
+	}
+}
+
+func (h *ChatHandler) record(requestID, traceID, subject, keyID, model, providerName string, status int, err error, routeAttempts int, usage *provider.Usage, streaming bool, start time.Time) {
 	if h.Audit == nil {
 		return
 	}
@@ -207,9 +248,16 @@ func (h *ChatHandler) record(requestID, subject, keyID, model, providerName stri
 		PromptTokens:     usageTokens(usage, true),
 		CompletionTokens: usageTokens(usage, false),
 		Streaming:        streaming, CreatedAt: start,
+		TraceID: traceID, RouteAttempts: routeAttempts,
 	})
 	if h.Metrics != nil {
 		h.Metrics.IncRequest(model, fmt.Sprint(status))
+		if usage != nil && usage.Known {
+			h.Metrics.AddTokens(model, usage.PromptTokens, usage.CompletionTokens)
+		}
+		if err != nil && provider.ClassOf(err) != provider.ClassInternal {
+			h.Metrics.IncUpstreamError(model, providerName, provider.ClassOf(err).String())
+		}
 	}
 }
 

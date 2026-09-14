@@ -37,6 +37,12 @@ func writeError(w http.ResponseWriter, requestID string, status int, typ, code, 
 // mapError translates internal failures into the documented envelope without
 // leaking provider status codes, secrets, or internal details.
 func mapError(w http.ResponseWriter, requestID string, err error) {
+	// Limiter infrastructure failure: 503-class with a non-leaky envelope;
+	// must not be confused with a genuine rate limit (429).
+	if errors.Is(err, limiter.ErrUnavailable) {
+		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "limiter_unavailable", "the service is temporarily unable to accept requests")
+		return
+	}
 	var lErr *limiter.Error
 	if errors.As(err, &lErr) {
 		writeError(w, requestID, http.StatusTooManyRequests, "rate_limit_error", lErr.Code, "rate limit exceeded")
@@ -49,6 +55,8 @@ func mapError(w http.ResponseWriter, requestID string, err error) {
 		writeError(w, requestID, http.StatusUnauthorized, "authentication_error", "api_key_expired", "API key expired")
 	case errors.Is(err, auth.ErrRevoked):
 		writeError(w, requestID, http.StatusUnauthorized, "authentication_error", "api_key_revoked", "API key revoked")
+	case errors.Is(err, gateway.ErrNoRoute):
+		writeError(w, requestID, http.StatusServiceUnavailable, "temporary_error", "no_route_available", "no provider route is currently available")
 	case errors.Is(err, gateway.ErrUnknownModel), errors.Is(err, gateway.ErrNotPermitted):
 		// Deliberately non-leaky: missing vs forbidden are indistinguishable.
 		writeError(w, requestID, http.StatusForbidden, "permission_error", "model_not_allowed", "the requested model is not available for this principal")

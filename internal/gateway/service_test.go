@@ -41,7 +41,11 @@ func TestCompleteEnforcesTotalDeadline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	start := time.Now()
-	if _, err := svc.Complete(ctx, svc.Providers["slow"], provider.ChatRequest{}); err == nil {
+	plan, rerr := svc.Resolve("s", "m")
+	if rerr != nil {
+		t.Fatalf("resolve: %v", rerr)
+	}
+	if _, _, err := svc.Complete(ctx, plan, provider.ChatRequest{}); err == nil {
 		t.Fatal("expected deadline error")
 	}
 	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
@@ -51,17 +55,20 @@ func TestCompleteEnforcesTotalDeadline(t *testing.T) {
 
 func TestStreamEnforcesTotalDeadline(t *testing.T) {
 	svc := newTestService(500*time.Millisecond, 50*time.Millisecond)
+	plan, rerr := svc.Resolve("s", "m")
+	if rerr != nil {
+		t.Fatalf("resolve: %v", rerr)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	err := svc.Stream(ctx, svc.Providers["slow"], provider.ChatRequest{}, func([]byte) error { return nil })
-	if err == nil {
+	if _, err := svc.Stream(ctx, plan, provider.ChatRequest{}, func([]byte) error { return nil }); err == nil {
 		t.Fatal("expected deadline error")
 	}
 }
 
 func TestResolveUnknownModelNonLeaky(t *testing.T) {
 	svc := newTestService(time.Millisecond, time.Second)
-	if _, _, err := svc.Resolve("subject-a", "nope"); err != ErrUnknownModel {
+	if _, err := svc.Resolve("subject-a", "nope"); err != ErrUnknownModel {
 		t.Fatalf("want ErrUnknownModel, got %v", err)
 	}
 }

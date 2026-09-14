@@ -22,6 +22,9 @@ type Event struct {
 	CompletionTokens *int
 	Streaming        bool
 	CreatedAt        time.Time
+	TraceID          string
+	RouteAttempts    int
+	CostMicros       *int64 // estimated cost; nil when unknown
 }
 
 // Sink persists audit events. The in-memory sink is development-only; a
@@ -72,3 +75,5 @@ func (m *MemorySink) Snapshot() []Event {
 	copy(out, m.events)
 	return out
 }
+
+// Trace correlation fields added for v1.1; both are metadata only.

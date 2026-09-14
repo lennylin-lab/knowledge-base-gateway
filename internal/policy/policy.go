@@ -14,11 +14,12 @@ type Policy struct {
 	mu        sync.RWMutex
 	allowed   map[string]map[string]struct{} // subject -> set of public model names
 	wildcards map[string]struct{}            // subjects allowed any catalog model
+	limits    map[string]Limits              // subject -> persisted ceilings
 }
 
 // New creates an empty policy.
 func New() *Policy {
-	return &Policy{allowed: map[string]map[string]struct{}{}, wildcards: map[string]struct{}{}}
+	return &Policy{allowed: map[string]map[string]struct{}{}, wildcards: map[string]struct{}{}, limits: map[string]Limits{}}
 }
 
 // Allow grants a subject access to one model.
@@ -91,4 +92,43 @@ func (p *Policy) Permitted(subject, publicModel string) bool {
 	}
 	_, ok := p.allowed[subject][publicModel]
 	return ok
+}
+
+// Limits are per-subject rate, concurrency, and token ceilings.
+type Limits struct {
+	RatePerMinute   int
+	MaxConcurrent   int
+	DailyTokens     int64 // zero means unset/unknown
+	MonthlyTokens   int64
+	MaxOutputTokens int // zero means unset; caps request max_tokens
+}
+
+// All returns every catalog entry (for router and readiness wiring).
+func (c *Catalog) All() []ModelInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]ModelInfo, 0, len(c.models))
+	for _, m := range c.models {
+		out = append(out, m)
+	}
+	return out
+}
+
+// LimitsFor returns configured limits for a subject; ok is false when no
+// explicit policy exists and defaults apply.
+func (p *Policy) LimitsFor(subject string) (Limits, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	l, ok := p.limits[subject]
+	return l, ok
+}
+
+// SetLimits records per-subject limits loaded from persisted policy.
+func (p *Policy) SetLimits(subject string, l Limits) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.limits == nil {
+		p.limits = map[string]Limits{}
+	}
+	p.limits[subject] = l
 }
