@@ -251,7 +251,9 @@ func (h *ChatHandler) record(requestID, traceID, subject, keyID, model, provider
 		TraceID: traceID, RouteAttempts: routeAttempts,
 	})
 	if h.Metrics != nil {
-		h.Metrics.IncRequest(model, fmt.Sprint(status))
+		statusLabel := fmt.Sprint(status)
+		h.Metrics.IncRequest(model, statusLabel)
+		h.Metrics.ObserveDuration(model, statusLabel, time.Since(start))
 		if usage != nil && usage.Known {
 			h.Metrics.AddTokens(model, usage.PromptTokens, usage.CompletionTokens)
 		}

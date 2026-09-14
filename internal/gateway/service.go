@@ -9,6 +9,8 @@ import (
 	"errors"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
+
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/router"
@@ -54,8 +56,7 @@ type Service struct {
 	Routes     *router.Routes
 	Timeout    time.Duration // total deadline for the whole request
 	MaxRetries int           // additional attempts on the primary candidate
-	RetryWait  time.Duration
-	Now        func() time.Time
+	RetryWait  time.Duration // initial retry delay; grows exponentially, zero disables waits
 }
 
 // New builds a Service with defaults. providers maps provider names to
@@ -73,7 +74,7 @@ func New(catalog *policy.Catalog, providers map[string]provider.Provider, timeou
 	}
 	return &Service{
 		Catalog: catalog, Routes: routes, Timeout: timeout,
-		MaxRetries: maxRetries, RetryWait: 100 * time.Millisecond, Now: time.Now,
+		MaxRetries: maxRetries, RetryWait: 100 * time.Millisecond,
 	}
 }
 
@@ -84,9 +85,8 @@ func (s *Service) Resolve(_, publicModel string) (Plan, error) {
 	if _, ok := s.Catalog.Lookup(publicModel); !ok {
 		return Plan{}, ErrUnknownModel
 	}
-	now := s.now()
 	var cands []Candidate
-	for _, rt := range s.Routes.Available(publicModel, now) {
+	for _, rt := range s.Routes.Available(publicModel) {
 		cands = append(cands, Candidate{
 			Provider: rt.Provider, ProviderName: rt.ProviderName,
 			UpstreamModel: rt.UpstreamModel, Timeout: rt.Timeout,
@@ -98,11 +98,51 @@ func (s *Service) Resolve(_, publicModel string) (Plan, error) {
 	return Plan{PublicModel: publicModel, Candidates: cands}, nil
 }
 
-func (s *Service) now() time.Time {
-	if s.Now != nil {
-		return s.Now()
+// retryBackoffGrowth and retryBackoffJitter keep the mature library defaults
+// for exponential growth and randomization; they are declared here so the
+// retry timing contract has a single documented home.
+const (
+	retryBackoffGrowth = 1.5  // multiplier per attempt (cenkalti/backoff default)
+	retryBackoffJitter = 0.5  // ±50% full-jitter window (cenkalti/backoff default)
+	retryBackoffCap    = 10.0 // MaxInterval = RetryWait * cap, bounding each delay
+)
+
+// newBackoff returns the bounded exponential backoff delay generator used
+// between attempts. Delays grow from RetryWait by retryBackoffGrowth with
+// ±retryBackoffJitter randomization, capped at retryBackoffCap * RetryWait.
+// Total retry time is bounded by the request deadline, so the backoff itself
+// carries no elapsed-time stop. Returns nil when RetryWait is disabled.
+func (s *Service) newBackoff() backoff.BackOff {
+	if s.RetryWait <= 0 {
+		return nil
 	}
-	return time.Now()
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = s.RetryWait
+	b.RandomizationFactor = retryBackoffJitter
+	b.Multiplier = retryBackoffGrowth
+	b.MaxInterval = time.Duration(retryBackoffCap * float64(s.RetryWait))
+	b.Reset()
+	return b
+}
+
+// waitBackoff sleeps for the next backoff interval, returning early with the
+// context error when the total request deadline elapses first.
+func waitBackoff(ctx context.Context, bo backoff.BackOff) error {
+	if bo == nil {
+		return nil
+	}
+	d := bo.NextBackOff()
+	if d == backoff.Stop || d <= 0 {
+		return nil // nothing to wait for; the attempt loop bounds retries
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // withDeadline applies the configured total deadline on top of the caller's
@@ -124,13 +164,15 @@ func attemptTimeout(ctx context.Context, d time.Duration) (context.Context, cont
 
 // Complete performs a non-streaming completion. Attempts proceed through the
 // candidate order; only pre-output network/429/5xx/timeout failures advance
-// to the next candidate or retry, always within the total deadline. The
-// second return value names the provider that served (or last attempted) the
-// request for audit purposes.
+// to the next candidate or retry, always within the total deadline. Retry
+// delays follow bounded exponential backoff with jitter, starting at
+// RetryWait. The second return value names the provider that served (or last
+// attempted) the request for audit purposes.
 func (s *Service) Complete(ctx context.Context, plan Plan, req provider.ChatRequest) (provider.ChatResponse, string, error) {
 	ctx, cancel := s.withDeadline(ctx)
 	defer cancel()
 	var lastErr error
+	bo := s.newBackoff()
 	attempts := 0
 	for i, cand := range plan.Candidates {
 		creq := req
@@ -141,21 +183,19 @@ func (s *Service) Complete(ctx context.Context, plan Plan, req provider.ChatRequ
 		}
 		for try := 0; try < maxTries; try++ {
 			attempts++
-			if attempts > 1 && s.RetryWait > 0 {
-				select {
-				case <-time.After(s.RetryWait):
-				case <-ctx.Done():
-					return provider.ChatResponse{}, cand.ProviderName, ctx.Err()
+			if attempts > 1 {
+				if err := waitBackoff(ctx, bo); err != nil {
+					return provider.ChatResponse{}, cand.ProviderName, err
 				}
 			}
 			actx, acancel := attemptTimeout(ctx, cand.Timeout)
 			resp, err := cand.Provider.Complete(actx, creq)
 			acancel()
 			if err == nil {
-				s.Routes.Record(plan.PublicModel, cand.ProviderName, s.now(), true)
+				s.Routes.Record(plan.PublicModel, cand.ProviderName, true)
 				return resp, cand.ProviderName, nil
 			}
-			s.Routes.Record(plan.PublicModel, cand.ProviderName, s.now(), false)
+			s.Routes.Record(plan.PublicModel, cand.ProviderName, false)
 			lastErr = err
 			if ctx.Err() != nil {
 				return provider.ChatResponse{}, cand.ProviderName, ctx.Err()
@@ -186,16 +226,15 @@ func (s *Service) Stream(ctx context.Context, plan Plan, req provider.ChatReques
 		return nil
 	}
 	var lastErr error
+	bo := s.newBackoff()
 	attempts := 0
 	for _, cand := range plan.Candidates {
 		creq := req
 		creq.Model = cand.UpstreamModel
 		creq.Stream = true
-		if attempts > 0 && s.RetryWait > 0 {
-			select {
-			case <-time.After(s.RetryWait):
-			case <-ctx.Done():
-				return cand.ProviderName, ctx.Err()
+		if attempts > 0 {
+			if err := waitBackoff(ctx, bo); err != nil {
+				return cand.ProviderName, err
 			}
 		}
 		attempts++
@@ -203,10 +242,10 @@ func (s *Service) Stream(ctx context.Context, plan Plan, req provider.ChatReques
 		err := cand.Provider.Stream(actx, creq, wrapped)
 		acancel()
 		if err == nil {
-			s.Routes.Record(plan.PublicModel, cand.ProviderName, s.now(), true)
+			s.Routes.Record(plan.PublicModel, cand.ProviderName, true)
 			return cand.ProviderName, nil
 		}
-		s.Routes.Record(plan.PublicModel, cand.ProviderName, s.now(), false)
+		s.Routes.Record(plan.PublicModel, cand.ProviderName, false)
 		lastErr = err
 		if outputStarted || ctx.Err() != nil || !provider.RetryEligible(err) {
 			return cand.ProviderName, err

@@ -43,7 +43,7 @@ func (r *Routes) SetRoutes(publicModel string, routes []Route) {
 // Available returns the enabled, non-open routes for a public model in
 // priority order. An open breaker excludes a route unless it is the only one,
 // in which case a half-open probe is admitted so the route can recover.
-func (r *Routes) Available(publicModel string, now time.Time) []Route {
+func (r *Routes) Available(publicModel string) []Route {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	candidates := append([]Route(nil), r.byModel[publicModel]...)
@@ -52,7 +52,7 @@ func (r *Routes) Available(publicModel string, now time.Time) []Route {
 		if !rt.Enabled {
 			continue
 		}
-		if rt.Breaker.Allow(now) {
+		if rt.Breaker.Allow() {
 			healthy = append(healthy, rt)
 		}
 	}
@@ -70,12 +70,12 @@ func (r *Routes) Available(publicModel string, now time.Time) []Route {
 }
 
 // Record reports the outcome of a route attempt for breaker bookkeeping.
-func (r *Routes) Record(publicModel, providerName string, now time.Time, success bool) {
+func (r *Routes) Record(publicModel, providerName string, success bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, rt := range r.byModel[publicModel] {
 		if rt.ProviderName == providerName {
-			rt.Breaker.Record(now, success)
+			rt.Breaker.Record(success)
 		}
 	}
 }
