@@ -82,6 +82,11 @@ services:
   # limits/quotas in Redis. Development-only GATEWAY_API_KEYS /
   # GATEWAY_MODELS / GATEWAY_PROVIDER are deliberately absent; the seeded
   # fake provider registry needs no credentials.
+  #
+  # The admin token follows the throwaway-password policy: a deterministic
+  # default keeps the local stack self-contained (the smoke mints keys through
+  # it); production deployments set their own GATEWAY_ADMIN_TOKEN. The admin
+  # port is published to loopback only.
   gateway:
     <<: *app-image
     depends_on:
@@ -95,8 +100,10 @@ services:
       GATEWAY_DATABASE_URL: *database-url
       GATEWAY_LIMITS_MODE: redis
       GATEWAY_REDIS_ADDR: redis:6379
+      GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:-smoke-admin-throwaway}
     ports:
       - "127.0.0.1:${GATEWAY_HOST_PORT:-8091}:8080"
+      - "127.0.0.1:${GATEWAY_ADMIN_HOST_PORT:-8092}:8081"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 5s

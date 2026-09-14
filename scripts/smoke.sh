@@ -7,7 +7,10 @@
 #   3. /healthz answers 200 (liveness),
 #   4. /readyz answers 200 only while dependencies are ready — stopping
 #      PostgreSQL or Redis flips readiness to 503 while liveness stays 200,
-#   5. restarting the dependency restores readiness.
+#   5. restarting the dependency restores readiness,
+#   6. the chat path works end to end: a throwaway API key minted through the
+#      admin API completes a non-streaming chat completion against the seeded
+#      fake provider with an OpenAI-compatible envelope.
 #
 # On any failure the relevant service logs are printed to stderr and the
 # script exits with a distinct non-zero status:
@@ -22,18 +25,23 @@
 #   7  redis restart: /readyz did not return to 200
 #   8  postgres restart: /readyz did not return to 200
 #   9  liveness regression: /healthz stopped answering during an outage
+#  10  admin API: never became ready or the key could not be minted
+#  11  chat completion: request failed or the envelope was not a
+#      successful OpenAI-compatible completion
 #
 # Usage: scripts/smoke.sh [--skip-outage] [--down] [--timeout SECONDS]
 #
 # Logs printed on failure are structured gateway/migrate lines and standard
-# PostgreSQL/Redis service logs; none of them contain credentials — the DSN
-# is never echoed and the gateway never logs secrets.
+# PostgreSQL/Redis service logs; none of them contain credentials — the DSN,
+# the admin token, and minted API keys are never echoed.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE=(docker compose -f "$ROOT/docker-compose.yml")
 
 SMOKE_URL="${GATEWAY_SMOKE_URL:-http://127.0.0.1:${GATEWAY_HOST_PORT:-8091}}"
+ADMIN_URL="${GATEWAY_ADMIN_URL:-http://127.0.0.1:${GATEWAY_ADMIN_HOST_PORT:-8092}}"
+ADMIN_TOKEN="${GATEWAY_ADMIN_TOKEN:-smoke-admin-throwaway}"
 WAIT_SECONDS="${SMOKE_WAIT_SECONDS:-90}"
 OUTAGE_SECONDS="${SMOKE_OUTAGE_SECONDS:-30}"
 SKIP_OUTAGE=0
@@ -124,6 +132,93 @@ outage_and_recovery() {
   return 0
 }
 
+# --- Chat-path phase ----------------------------------------------------------
+# The compose gateway runs the admin API with the throwaway token from
+# docker-compose.yml (dev stack only). The minted key and the token are used
+# in request headers only and are never printed.
+
+# admin_code -> HTTP status of an authenticated admin probe ("000" when the
+# port is not accepting yet).
+admin_code() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+    "${ADMIN_URL}/admin/keys?subject=__smoke_probe__" 2>/dev/null || printf '000'
+}
+
+# json_string FIELD JSON -> value of a top-level string field (compact Go
+# encoder output), empty when absent.
+json_string() {
+  printf '%s' "$2" | sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"
+}
+
+chat_phase() {
+  local deadline=""
+
+  log "waiting for the admin API to answer an authenticated probe"
+  deadline=$(( $(date +%s) + WAIT_SECONDS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(admin_code)" = "200" ] && break
+    sleep 1
+  done
+  if [ "$(admin_code)" != "200" ]; then
+    log "admin API never answered 200 (is GATEWAY_ADMIN_TOKEN set the same on both sides?)"
+    return 10
+  fi
+  log "ok: admin API reachable"
+
+  log "minting a throwaway API key for the seeded subject"
+  local create_resp="" smoke_key="" smoke_key_id=""
+  create_resp="$(curl -s --max-time 5 -X POST \
+    -H "Authorization: Bearer ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+    -d '{"subject":"subject_default","expires_in_hours":1}' \
+    "${ADMIN_URL}/admin/keys" 2>/dev/null)" || create_resp=""
+  smoke_key="$(json_string key "$create_resp")"
+  smoke_key_id="$(json_string key_id "$create_resp")"
+  if [ -z "$smoke_key" ] || [ -z "$smoke_key_id" ]; then
+    # The response body holds the plaintext key, so it is never dumped.
+    log "admin key minting failed (status: $(admin_code); response withheld: it contains the plaintext key)"
+    return 10
+  fi
+  log "ok: key minted (id: ${smoke_key_id})"
+
+  log "requesting a non-streaming chat completion from the seeded fake provider"
+  local body_file chat_status=""
+  body_file="$(mktemp)"
+  chat_status="$(curl -s --max-time 15 -o "$body_file" -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${smoke_key}" -H 'Content-Type: application/json' \
+    -d '{"model":"gateway-echo","messages":[{"role":"user","content":"smoke-chat"}],"max_tokens":16}' \
+    "${SMOKE_URL}/v1/chat/completions" 2>/dev/null)" || chat_status="000"
+  if [ "$chat_status" != "200" ]; then
+    log "chat completion failed (HTTP ${chat_status:-none}); response body follows"
+    cat "$body_file" >&2 2>/dev/null || true
+    rm -f "$body_file"
+    return 11
+  fi
+  if ! grep -q '"object":"chat.completion"' "$body_file" \
+    || ! grep -q '"choices":\[' "$body_file" \
+    || ! grep -q '"finish_reason":"stop"' "$body_file" \
+    || ! grep -q '"content":"echo: smoke-chat"' "$body_file"; then
+    log "chat response is not a successful OpenAI-compatible completion; body follows"
+    cat "$body_file" >&2 2>/dev/null || true
+    rm -f "$body_file"
+    return 11
+  fi
+  rm -f "$body_file"
+  log "ok: chat completion returned the expected fake-provider envelope"
+
+  # Best-effort cleanup: the key is throwaway and the stack is disposable.
+  local revoke_code=""
+  revoke_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
+    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+    "${ADMIN_URL}/admin/keys/${smoke_key_id}/revoke" 2>/dev/null)" || revoke_code="000"
+  if [ "$revoke_code" = "200" ]; then
+    log "ok: throwaway key revoked"
+  else
+    log "warn: key revoke returned ${revoke_code:-none} (throwaway stack; not failing the smoke)"
+  fi
+  return 0
+}
+
 # --- Preflight ---------------------------------------------------------------
 for bin in docker curl; do
   command -v "$bin" >/dev/null 2>&1 || { log "preflight: '$bin' is required but not installed"; exit 1; }
@@ -163,7 +258,10 @@ else
   log "skipping dependency outage checks (--skip-outage)"
 fi
 
-log "PASS: migration completed, /healthz and /readyz verified, outage and recovery behavior confirmed"
+# --- Chat path: admin-minted key, non-streaming fake-provider completion ------
+chat_phase || exit $?
+
+log "PASS: migration completed, /healthz and /readyz verified, outage and recovery behavior confirmed, chat path verified"
 if [ "$TEARDOWN" -eq 1 ]; then
   log "tearing down stack and volumes (--down)"
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
