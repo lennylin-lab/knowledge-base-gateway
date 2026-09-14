@@ -29,5 +29,19 @@ defer cancel()
 
 **Why**: HTTP/provider logic is testable now; swapping in real repositories later is a drop-in change with no handler edits.
 
-**Boundary**: `/readyz` currently validates config only — it must gain store checks when real `store` implementations land.
+**Boundary**: `/readyz` currently validates config only — it must gain store checks when real `store` implementations land. As of v1.1, `/readyz` pings PostgreSQL and Redis when their modes are enabled; keep those checks mandatory when adding new backends.
+
+### Convention: Infra failure vs denial in boundary interfaces
+
+**What**: Interfaces with pass/fail semantics (e.g. `limiter.Gate.Allow`) return a distinguishable error (sentinel `limiter.ErrUnavailable`) for infrastructure failure, separate from a plain `false` denial.
+
+**Why**: A Redis outage that fails closed looked identical to a rate limit and was reported to clients as 429 — wrong status, wrong Retry-After semantics, wrong metrics.
+
+**Example**: `ok, retryAfter, release, err := gate.Allow(...)`; check `err` first, map to 503 `limiter_unavailable`; only `ok=false, err=nil` is a 429.
+
+### Convention: Failover routing stays behind interfaces
+
+**What**: Provider failover (primary/backup route table + circuit breaker in `internal/router`) is selected before any provider call; streaming never switches providers after output starts; retries stay bounded under the total request deadline.
+
+**Why**: Lets fault tests (`internal/gateway/failover_test.go`) pin the semantics and keeps vendor protocols isolated in `internal/provider`.
 
