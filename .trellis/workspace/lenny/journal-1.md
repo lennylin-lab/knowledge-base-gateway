@@ -115,3 +115,27 @@ Completed the gateway-production-readiness parent and all three children. (1) te
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: Startup hardening and chat-path smoke coverage
+<!-- trellis-session: v=2 fp=8dc2e01a98aad0ef -->
+
+**Date**: 2026-09-15
+**Task**: Startup hardening and chat-path smoke coverage
+**Branch**: `master`
+
+### Summary
+
+Closed the three deferred observations from production-readiness. (1) Database connect errors are now classified (credentials rejected / unreachable / invalid string / other) and never wrap the pgx error, so no DSN/password/host/user/db substring reaches logs — pinned by hermetic and real-credential tests, with live container runs verified by grep. Supporting fix: pgstore.Connect now pings eagerly (pgx pools are lazy, so the unsanitized error previously surfaced at first query); the lazy-pool lesson was captured in database-guidelines. (2) Listener goroutines no longer call os.Exit: both listeners bind synchronously and serve pre-bound sockets, a serve failure cancels runCtx and converges on one graceful shutdown, exiting non-zero through run() — test-pinned for the port-in-use case. (3) The container smoke now covers the full request path: probes the admin API with a throwaway token, mints a key, asserts a non-streaming chat.completion envelope from the seeded fake provider (gateway-echo), revokes the key; new exit codes 10/11; zero token/key leakage in output or logs. Enabling fix found en route: database mode never loaded access_policies grants, so every DB-mode chat returned 403 — LoadGrants added and pinned end-to-end. All gates green: -race suite, env-gated tests zero-skip against real PostgreSQL/Redis, full smoke exit 0. New deferred observation: cmd/migrate fatal() can echo DSN-derived connect-error text; recommend the same classification approach in a follow-up.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bb3816a` | fix: sanitize database connect errors and structure listener shutdown |
+| `25ea579` | feat: exercise admin key lifecycle and chat path in container smoke |
+| `821f36e` | docs: update smoke docs and capture lazy-pool lesson in backend specs |
+
+### Status
+
+[OK] **Completed**
