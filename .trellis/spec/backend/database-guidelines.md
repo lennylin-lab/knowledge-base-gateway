@@ -56,9 +56,12 @@ executes, bypassing any sanitization applied at the connect site.
 **Fix / Prevention**: `pgstore.Connect` pings eagerly with a bounded timeout
 (10s) and closes the pool on failure, so every connect failure is classified
 by one site (`describeDBConnectFailure`: credentials rejected / unreachable /
-invalid string / other) and never wraps the original error. When sanitizing
-library errors, verify where the library actually surfaces the failure —
-classification must cover the real error site, not the intended one.
+invalid string / other) and never wraps the original error. The classifier
+lives in `internal/dberr` and `cmd/migrate` follows the same pattern (eager
+ping in `newMigrator`, `dberr.DescribeConnectFailure` at the connect fatal).
+When sanitizing library errors, verify where the library actually surfaces
+the failure — classification must cover the real error site, not the intended
+one.
 
 ### Common Mistake: Down migration deletes seed parent rows before dependents
 

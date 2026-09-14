@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"flag"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	// The pgx5 driver registers itself for file:// -> PostgreSQL migrations
@@ -29,6 +31,8 @@ import (
 	// driver used below.
 	pgx5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+
+	"github.com/knowledge-base/knowledge-base-gateway/internal/dberr"
 )
 
 func main() {
@@ -47,7 +51,9 @@ func main() {
 
 	m, closeDB, err := newMigrator(*dsn, *dir)
 	if err != nil {
-		fatal("connect: %v", err)
+		// pgx embeds DSN components (host, user, database, password-redacted
+		// URL) in its connect errors; classify instead of echoing.
+		fatal("connect: %s", dberr.DescribeConnectFailure(err))
 	}
 	defer closeDB()
 
@@ -92,6 +98,14 @@ func newMigrator(dsn, dir string) (*migrate.Migrate, func(), error) {
 	}
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
+		return nil, nil, err
+	}
+	// database/sql is lazy: without an eager ping, bad-host and bad-credential
+	// failures surface from Up/Version with DSN-bearing text instead of here.
+	pingCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		db.Close()
 		return nil, nil, err
 	}
 	driver, err := pgx5.WithInstance(db, &pgx5.Config{})
