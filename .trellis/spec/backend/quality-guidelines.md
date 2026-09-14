@@ -38,6 +38,22 @@ no-switch rule remain owned by `internal/gateway`.
 
 **Fix / Prevention**: When refactoring config construction, assert every field with a meaningful default is non-zero in the happy-path test (see `TestFromEnvValid`); zero values that mean "deny all" or "unbounded" must never be reachable from `FromEnv`.
 
+### Convention: CI migration and env-gated test contract
+
+**What**: `.github/workflows/ci.yml` runs quality gates, a migration
+lifecycle (up → version → down → up) against a per-run disposable database
+(`kb_gateway_ci_test`, never shared/developer/production), and the env-gated
+integration tests with a hard gate: any `--- SKIP` in the integration step
+fails the job.
+
+**Why**: Destructive `down` must never reach a shared database; the skip-gate
+prevents env-gated tests from silently rotting into always-skipped.
+
+**Boundary**: Adding a migration changes the expected version asserted in the
+lifecycle step; adding a new env-gated test requires adding its package to the
+integration step's package list. Provider secrets are masked (`add-mask` runs
+first) and never echoed; service credentials are job-local.
+
 ### Convention: Provider URL validation skips the fake provider
 
 **What**: `provider.ValidateBaseURL` (https-only, no userinfo) applies to `openai`/`anthropic` base URLs in both modes, but `fake` rows are exempt — the migration seed data uses `internal://` URLs and the fake provider never dials its base URL.
