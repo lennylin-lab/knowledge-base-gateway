@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer data-flow guidance for policy, limiter, HTTP, audit, and metrics changes."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Normalized quota denial and infrastructure-failure error mapping, including 429 versus 503."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "PostgreSQL/Redis persistence, atomic updates, migrations, and unknown token usage rules for quota state."}
