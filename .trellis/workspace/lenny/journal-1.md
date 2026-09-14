@@ -83,3 +83,35 @@ Ran the previously-skipped integration tests against the real PostgreSQL/Redis f
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: Gateway production readiness: config boundary, CI, container smoke
+<!-- trellis-session: v=2 fp=2915f9730b0d027e -->
+
+**Date**: 2026-09-15
+**Task**: Gateway production readiness: config boundary, CI, container smoke
+**Branch**: `master`
+
+### Summary
+
+Completed the gateway-production-readiness parent and all three children. (1) test fix: real-Redis limiter test now uses a per-run namespace and releases its lease, verified with -count=2 back-to-back runs. (2) gateway-production-config: GATEWAY_DATABASE_URL is the config-mode boundary (database mode no longer requires dev GATEWAY_API_KEYS/GATEWAY_MODELS, local mode unchanged); provider secrets load before validation (fixes Anthropic validate-before-load bug); per-kind registry credential checks run pre-listener with non-leaky errors; also fixed fake-provider internal:// URLs being rejected against seed data. Check caught a critical dropped-default regression (MaxConcurrent=0 would 429 all traffic) with regression test added. (3) gateway-ci-real-services: single verify workflow with postgres:17/redis:7.4 health-gated services, add-mask, gofmt/build/vet/test -race, disposable-database migration up/version/down/up with output assertions, env-gated integration tests with a hard skip gate; every run block executed locally against real services. (4) gateway-container-smoke: multi-stage non-root image (USER 10001, empty Env), one-shot migrate service with service_completed_successfully, loopback-only ports, bounded smoke script with outage/recovery phases — full smoke ran green including dependency outage. Parent integration review passed all six acceptance criteria. Deferred observations: database connect error may echo non-password DSN parts; listener goroutine still uses os.Exit(1); smoke does not exercise the chat path.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1a51a0f` | test: namespace real-Redis limiter test per run |
+| `df7d03a` | fix: make database mode the config boundary and validate provider credentials at startup |
+| `a1b2222` | test: serialize pg migration test with advisory lock |
+| `2c194f7` | docs: document config mode boundary and provider credential rules |
+| `446db0a` | docs: capture dropped-default and fake-URL validation lessons in backend specs |
+| `d954053` | ci: add real-service workflow with migration lifecycle and skip gate |
+| `c84d150` | docs: capture CI migration and env-gated test contract in backend specs |
+| `5a663f1` | feat: add non-root container stack with one-shot migration and smoke script |
+| `f497ae8` | docs: document container stack and smoke path in README |
+| `606be25` | docs: capture container migration conventions in backend specs |
+| `d30c51a` | docs: qualify GATEWAY_PROVIDER as local-mode-only in v1.1 table |
+
+### Status
+
+[OK] **Completed**
