@@ -54,6 +54,24 @@ lifecycle step; adding a new env-gated test requires adding its package to the
 integration step's package list. Provider secrets are masked (`add-mask` runs
 first) and never echoed; service credentials are job-local.
 
+### Convention: Container stack runs migrations one-shot, never the process
+
+**What**: `docker-compose.yml` runs the schema migration as a dedicated
+one-shot `migrate` service (`cmd/migrate up`, gated by
+`service_completed_successfully`) before the gateway starts; the gateway
+container never touches schema. Host ports bind to `127.0.0.1` only; the
+runtime image is non-root with a numeric `USER` and an empty `Env` (DSN and
+credentials are compose-run config only, never baked into layers).
+
+**Why**: Startup schema mutation hides drift (see database guidelines); baked
+DSNs leak into image history; loopback binding keeps dev stacks off shared
+networks.
+
+**Boundary**: `scripts/smoke.sh` is the acceptance path — keep per-phase
+`--timeout` budgets separate (a shared deadline lets a slow migration starve
+the health-check phase into a false failure) and keep exit codes documented.
+The smoke never echoes the DSN, including in failure log dumps.
+
 ### Convention: Provider URL validation skips the fake provider
 
 **What**: `provider.ValidateBaseURL` (https-only, no userinfo) applies to `openai`/`anthropic` base URLs in both modes, but `fake` rows are exempt — the migration seed data uses `internal://` URLs and the fake provider never dials its base URL.
