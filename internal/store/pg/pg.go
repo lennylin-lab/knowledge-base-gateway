@@ -5,6 +5,7 @@ package pg
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -191,7 +192,7 @@ func (d *DB) ResolveAuth(ctx context.Context, key string, now time.Time) (auth.P
 		if err := rows.Scan(&id, &tenant, &subject, &salt, &hash, &status, &expires); err != nil {
 			return auth.Principal{}, err
 		}
-		if !equalDigest(auth.HashAPIKey(salt, key), hash) {
+		if subtle.ConstantTimeCompare(auth.HashAPIKey(salt, key), hash) != 1 {
 			continue
 		}
 		if expires != nil && now.After(*expires) {
@@ -203,19 +204,10 @@ func (d *DB) ResolveAuth(ctx context.Context, key string, now time.Time) (auth.P
 		}
 		return auth.Principal{SubjectID: subject, TenantID: tenantID, KeyID: id}, nil
 	}
-	return auth.Principal{}, rows.Err()
-}
-
-func equalDigest(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+	if err := rows.Err(); err != nil {
+		return auth.Principal{}, err
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return auth.Principal{}, auth.ErrInvalid
 }
 
 func scanKey(scan func(dest ...any) error, r *keyRow) error {
