@@ -53,6 +53,14 @@ defer cancel()
 
 **Boundary**: `/readyz` currently validates config only — it must gain store checks when real `store` implementations land. As of v1.1, `/readyz` pings PostgreSQL and Redis when their modes are enabled; keep those checks mandatory when adding new backends.
 
+### Common Mistake: Zero-match query loop falls through to nil error
+
+**Symptom**: An unknown API key authenticates "successfully" — the handler gets a zero `Principal` with no error and rejects with 403 instead of 401.
+
+**Cause**: `DB.ResolveAuth` returned `rows.Err()` after the scan loop; with zero matching rows `rows.Err()` is `nil`, so not-found returned `(Principal{}, nil)`. Hidden until the env-gated test first ran against real PostgreSQL.
+
+**Fix / Prevention**: After a search loop, return the explicit domain error (`auth.ErrInvalid`) on fall-through and check `rows.Err()` separately. DB-backed authenticators must be exercised against a real database (tests gated on `TEST_DATABASE_URL`/`TEST_REDIS_ADDR` that always skip hide this class of bug), and digest comparisons must use `subtle.ConstantTimeCompare`, not hand-rolled byte loops.
+
 ### Convention: Infra failure vs denial in boundary interfaces
 
 **What**: Interfaces with pass/fail semantics (e.g. `limiter.Gate.Allow`) return a distinguishable error (sentinel `limiter.ErrUnavailable`) for infrastructure failure, separate from a plain `false` denial.

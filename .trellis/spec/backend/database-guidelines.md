@@ -43,3 +43,20 @@ while the test skips.
 `migrations_source_test.go`) so a bad path fails even when the DB-gated test
 skips.
 
+### Common Mistake: Down migration deletes seed parent rows before dependents
+
+**Symptom**: `Steps(-1)` fails with `SQLSTATE 23503` (foreign key violation)
+when any rows were created against seed data after migration — e.g.
+`api_keys` referencing the seed `subjects` row.
+
+**Cause**: The 0002 down script deleted only seed rows and filtered
+`llm_requests` by new-column values; rows written later that didn't match the
+filter (or keys referencing the seed subject) survived and blocked the parent
+deletes.
+
+**Fix / Prevention**: A down script must delete dependents before the seed
+parents they reference (`llm_requests` → `api_keys` → `access_policies` →
+`subjects`/`model_catalog`), scoped to the seed subject so non-seed audit data
+survives. Verify with the env-gated up/down test against real PostgreSQL
+(`TEST_DATABASE_URL=... go test ./internal/store/pg/`).
+
