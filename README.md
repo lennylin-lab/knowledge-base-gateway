@@ -58,7 +58,8 @@ Request size limits: 1 MiB body, 64 messages, 32k characters per message
 - `POST /v1/chat/completions` — OpenAI-compatible chat completions (streaming and non-streaming)
 - `GET /healthz` — liveness, no dependency checks
 - `GET /readyz` — configuration and wiring validated
-- `GET /metrics` — Prometheus text format (`gateway_requests_total{model,status}`)
+- `GET /metrics` — Prometheus text format emitted by the official
+  `prometheus/client_golang` (label values are escaped safely)
 
 ## Error envelope
 
@@ -83,8 +84,9 @@ codes are never passed through raw.
 
 Set `GATEWAY_DATABASE_URL` to enable PostgreSQL persistence (keys, catalog,
 providers, primary/backup routes, policies, audit records). Migrations live in
-`migrations/` and are applied out of band; there is no auto-migration at
-startup. Set `GATEWAY_LIMITS_MODE=redis` (+ `GATEWAY_REDIS_ADDR`) for the
+`migrations/` and are applied with `go run ./cmd/migrate` (see "Schema
+migrations" below); there is no auto-migration at startup. Set
+`GATEWAY_LIMITS_MODE=redis` (+ `GATEWAY_REDIS_ADDR`) for the
 distributed rate/concurrency limiter — readiness fails until Redis answers.
 Set `GATEWAY_ADMIN_TOKEN` to enable the admin API on `GATEWAY_ADMIN_ADDR`
 (default `:8081`, internal network only).
@@ -112,19 +114,44 @@ Token-gated (`Authorization: Bearer $GATEWAY_ADMIN_TOKEN`):
 ### Routing and reliability
 
 Public models route through `model_routes` (priority order) to a primary and
-a backup provider. Circuit breakers track consecutive failures per route and
-recover via half-open probes. Retries remain finite, deadline-bounded, and
-only for pre-output network/429/5xx/timeout failures; streaming never switches
+a backup provider. Circuit breakers (failsafe-go) track consecutive failures
+per route, admit exactly one half-open probe after a cool-down, and recover
+via successful probes. Retries remain finite and deadline-bounded with
+exponential backoff and jitter between attempts (cenkalti/backoff), only for
+pre-output network/429/5xx/timeout failures; streaming never switches
 providers once output has reached the client. Provider base URLs are validated
 at startup against SSRF rules (https only unless explicitly allowed).
 
 ### Metrics
 
-`/metrics` exposes `gateway_requests_total{model,status}`,
-`gateway_upstream_errors_total{model,provider,class}`,
-`gateway_tokens_total{model,kind}`, and
-`gateway_rate_limit_total{model}`. `X-Trace-ID` is honored (or derived from
-the request ID) and echoed for log/trace/audit correlation.
+`/metrics` is served by the official Prometheus Go client and exposes:
+
+- `gateway_requests_total{model,status}`
+- `gateway_request_duration_seconds{model,status}` (histogram)
+- `gateway_upstream_errors_total{model,provider,class}`
+- `gateway_tokens_total{model,kind}`
+- `gateway_rate_limit_total{model}`
+
+Plus the standard Go runtime and process collectors. `X-Trace-ID` is honored
+(or derived from the request ID) and echoed for log/trace/audit correlation.
+
+### Schema migrations
+
+Schema changes are versioned in `migrations/` (`<version>_<name>.up.sql` /
+`.down.sql`) and applied with the operational CLI — the gateway process never
+mutates the schema at startup:
+
+```bash
+go run ./cmd/migrate -dsn "$GATEWAY_DATABASE_URL" up      # apply all pending
+go run ./cmd/migrate -dsn "$GATEWAY_DATABASE_URL" steps -1 # roll back one version
+go run ./cmd/migrate -dsn "$GATEWAY_DATABASE_URL" down     # roll back everything (destructive)
+go run ./cmd/migrate -dsn "$GATEWAY_DATABASE_URL" version  # current schema version
+```
+
+The tool (golang-migrate on the pgx/v5 driver) tracks the applied version in
+`schema_migrations` and takes a PostgreSQL advisory lock, so concurrent
+invocations are safe. New schema changes must ship as a new forward migration
+plus a real down path; never edit an applied migration.
 
 See `docs/gateway-client-contract.md` for the knowledge-base-server client
 contract.

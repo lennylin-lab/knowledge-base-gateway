@@ -8,6 +8,28 @@ Do not add heavyweight frameworks without a documented need, expose provider SDK
 
 Review auth-before-provider ordering, stable error envelopes, IDs, bounded resources, stream cancellation, migration coverage, and provider failure paths.
 
+### Convention: Mature infrastructure behind local interfaces
+
+**What**: Standard infrastructure behavior is delegated to small, pinned
+libraries — Prometheus exposition to `prometheus/client_golang` (custom
+registry in `internal/metrics`), retry delay generation to
+`cenkalti/backoff/v5` (bounded exponential + jitter), and breaker state
+transitions to `failsafe-go/circuitbreaker` (`TryAcquirePermit` /
+`RecordSuccess` / `RecordFailure` in `internal/router`). Redis limiter tests
+use `alicebob/miniredis/v2` (hermetic, supports EVAL/Lua) for fault injection.
+Domain boundaries (provider adapters, repositories, route ordering, error
+classification) stay hand-written in this repo behind local interfaces.
+
+**Why**: Hand-written infrastructure accrues subtle bugs (label escaping,
+backoff timing, half-open races); swapping adapters behind local interfaces
+keeps domain semantics pinned by tests while letting implementations revert
+independently.
+
+**Boundary**: Never expose library types through HTTP handlers or provider
+interfaces; adapters translate at package edges. Retry classification
+(`provider.RetryEligible`), the total request deadline, and the streaming
+no-switch rule remain owned by `internal/gateway`.
+
 ### Common Mistake: Config timeout loaded but never applied
 
 **Symptom**: `go vet` and tests pass, but a hanging upstream request never returns — the client's context is the only deadline.
