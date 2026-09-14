@@ -29,3 +29,33 @@ Implemented the first-phase Go LLM gateway MVP per docs/agent-start.md: OpenAI-c
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: V1.1 production hardening and infra library adoption
+<!-- trellis-session: v=2 fp=e28594fa8820c8e1 -->
+
+**Date**: 2026-09-15
+**Task**: V1.1 production hardening and infra library adoption
+**Branch**: `master`
+
+### Summary
+
+Two tasks completed. (1) gateway-v1-1-production: PostgreSQL key/catalog/policy/audit persistence with admin key lifecycle API, Anthropic adapter with SSRF-validated base URLs, primary/backup routing with circuit breaker and pre-output failover, Redis rate/concurrency leases with readiness gating, trace-ID propagation, e2e client contract tests; check pass fixed Redis-outage-mapped-to-429 by widening limiter.Gate with ErrUnavailable -> 503 limiter_unavailable. (2) replace-duplicated-infrastructure: adopted prometheus/client_golang (custom registry + duration histogram), cenkalti/backoff v5 (bounded exponential + jitter), failsafe-go behind the router breaker adapter, atomic ZREMRANGEBYSCALE stale-lease pruning in the Redis Lua script, and golang-migrate v4 via cmd/migrate CLI with versioned up/down files and advisory locking; also fixed latent migration-test path bug. Deferred: CI run of migration/Redis tests against real services (TEST_DATABASE_URL/TEST_REDIS_ADDR), docker container smoke test, daily/monthly token quota enforcement.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `74814da` | feat: add v1.1 production persistence, failover, and admin lifecycle |
+| `3b58d9f` | feat: wire v1.1 routing, limits, and config into gateway core |
+| `1edd313` | docs: capture limiter outage and failover conventions in backend specs |
+| `8804840` | chore: add gateway-v1-1-production task artifacts |
+| `822a4ba` | refactor: adopt prometheus client, backoff, failsafe breaker, and redis lease pruning |
+| `9c0c3f1` | feat: add golang-migrate CLI and versioned migration files |
+| `16d3339` | docs: document adopted infrastructure dependencies in specs and README |
+| `d990d7e` | chore: add replace-duplicated-infrastructure task artifacts |
+| `016f396` | test: add metrics registry and histogram tests |
+
+### Status
+
+[OK] **Completed**
