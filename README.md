@@ -211,8 +211,10 @@ environment.
 with health checks, a one-shot migration job (`cmd/migrate up`, idempotent for
 a fully-applied schema), and the gateway in database-backed Redis mode
 (catalog/routes/policies/keys come from PostgreSQL; the dev-only
-`GATEWAY_API_KEYS` / `GATEWAY_MODELS` variables are not used). Destructive
-rollback is never part of startup.
+`GATEWAY_API_KEYS` / `GATEWAY_MODELS` variables are not used). The gateway
+also runs the admin API with a deterministic throwaway token (loopback-only
+host port; override `GATEWAY_ADMIN_TOKEN` for anything non-disposable).
+Destructive rollback is never part of startup.
 
 ```bash
 docker compose build            # build kb-gateway:local
@@ -231,10 +233,33 @@ scripts/smoke.sh                # bounded end-to-end smoke (see below)
 timeouts, verifies the migration job completed successfully, asserts
 `/healthz` is 200 and `/readyz` becomes 200, then stops and restarts Redis
 and PostgreSQL to prove `/readyz` fails (503) while `/healthz` stays 200 and
-readiness recovers afterwards. On any failure it prints the relevant service
-logs and exits with a distinct non-zero status (the full map is documented in
-the script header). Flags: `--skip-outage`, `--down` (tear the stack down
-after success), `--timeout N` (per-phase wait budget, default 90s).
+readiness recovers afterwards. It then exercises the chat path end to end:
+using the throwaway admin token configured in `docker-compose.yml` (dev stack
+only), it mints a throwaway API key for the seeded subject through the admin
+API, completes a non-streaming chat request against the seeded fake provider
+(`gateway-echo`), and asserts an OpenAI-compatible success envelope before
+revoking the key. On any failure it prints the relevant service logs and
+exits with a distinct non-zero status:
+
+| Exit | Meaning |
+|---|---|
+| `0` | success |
+| `1` | preflight error (docker/curl missing, bad arguments) |
+| `2` | stack failed to build/start or the migration job did not complete |
+| `3` | `/healthz` never returned 200 |
+| `4` | `/readyz` never returned 200 |
+| `5` | Redis outage: `/readyz` did not fail while Redis was down |
+| `6` | PostgreSQL outage: `/readyz` did not fail while PostgreSQL was down |
+| `7` | Redis restart: `/readyz` did not return to 200 |
+| `8` | PostgreSQL restart: `/readyz` did not return to 200 |
+| `9` | liveness regression: `/healthz` stopped answering during an outage |
+| `10` | admin API: never became ready or the API key could not be minted |
+| `11` | chat completion failed or the envelope was not a successful OpenAI-compatible completion |
+
+The admin token and minted API keys are sent in request headers only and are
+never echoed — not in smoke output and not in gateway logs. Flags:
+`--skip-outage`, `--down` (tear the stack down after success), `--timeout N`
+(per-phase wait budget, default 90s; every phase above gets its own budget).
 
 ### Environment overrides
 
@@ -244,11 +269,14 @@ knowledge-base-server stack (which uses 5432/6379):
 | Variable | Default | Meaning |
 |---|---|---|
 | `GATEWAY_HOST_PORT` | `8091` | Host port for the gateway (`/healthz`, `/readyz`, `/v1/...`) |
+| `GATEWAY_ADMIN_HOST_PORT` | `8092` | Host port for the admin API (`/admin/...`, loopback only) |
+| `GATEWAY_ADMIN_TOKEN` | `smoke-admin-throwaway` | Admin API bearer token for the local stack; deterministic throwaway (same policy as the PostgreSQL password) — set your own for anything non-disposable |
 | `POSTGRES_HOST_PORT` | `5433` | Host port for PostgreSQL |
 | `REDIS_HOST_PORT` | `6381` | Host port for Redis |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `gateway` / `gateway-local-throwaway` / `gateway` | Local PostgreSQL credentials; the default password is a deterministic throwaway (same policy as CI) — override it for anything non-disposable |
 | `GATEWAY_IMAGE` | `kb-gateway:local` | Image tag built and used by the gateway and migrate services |
 | `GATEWAY_SMOKE_URL` | `http://127.0.0.1:${GATEWAY_HOST_PORT:-8091}` | Base URL the smoke script targets |
+| `GATEWAY_ADMIN_URL` | `http://127.0.0.1:${GATEWAY_ADMIN_HOST_PORT:-8092}` | Admin API base URL the smoke script targets |
 
 To run operational migration commands against the Compose database, reuse the
 one-shot service (the image entrypoint is the gateway binary, the migrate

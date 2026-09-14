@@ -43,6 +43,23 @@ while the test skips.
 `migrations_source_test.go`) so a bad path fails even when the DB-gated test
 skips.
 
+### Common Mistake: Lazy pool defers connect errors past sanitization
+
+**Symptom**: A bad `GATEWAY_DATABASE_URL` fails at "load providers" (or the
+first query) with a pgx error that embeds DSN details — the sanitized connect
+path never runs.
+
+**Cause**: pgx v5 pools are lazy (`MinConns=0` default): `pgxpool.New` succeeds
+without dialing, so the first real error surfaces wherever the first query
+executes, bypassing any sanitization applied at the connect site.
+
+**Fix / Prevention**: `pgstore.Connect` pings eagerly with a bounded timeout
+(10s) and closes the pool on failure, so every connect failure is classified
+by one site (`describeDBConnectFailure`: credentials rejected / unreachable /
+invalid string / other) and never wraps the original error. When sanitizing
+library errors, verify where the library actually surfaces the failure —
+classification must cover the real error site, not the intended one.
+
 ### Common Mistake: Down migration deletes seed parent rows before dependents
 
 **Symptom**: `Steps(-1)` fails with `SQLSTATE 23503` (foreign key violation)
