@@ -41,6 +41,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if err := run(ctx, cfg, logger); err != nil {
+		logger.Error("startup failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+// run assembles the gateway from the validated configuration and serves until
+// ctx is cancelled. Every wiring failure — database connect, provider
+// registry validation, catalog and route loading — is returned before the
+// HTTP listener starts, so an invalid provider registry can never reach a
+// state where /readyz could report ready.
+func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	// Optional PostgreSQL persistence. When configured, catalog, routes,
 	// policies, keys, and audit records live in the database.
 	var (
@@ -50,10 +62,10 @@ func main() {
 		auditSink      audit.Sink
 	)
 	if cfg.DatabaseURL != "" {
+		var err error
 		dbw, err = pgstore.Connect(ctx, cfg.DatabaseURL)
 		if err != nil {
-			logger.Error("database connect failed", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("database connect: %w", err)
 		}
 		defer dbw.Close()
 		authenticator = &pgstore.Authenticator{DB: dbw, Now: time.Now}
@@ -62,51 +74,43 @@ func main() {
 	}
 
 	// Provider registry. Secrets come only from the environment; base URLs
-	// are validated against SSRF rules at startup.
-	newProvider := func(kind, name, baseURL string) (provider.Provider, error) {
-		if err := provider.ValidateBaseURL(baseURL, cfg.AllowInsecure); err != nil {
-			return nil, fmt.Errorf("provider %s: %w", name, err)
-		}
-		switch kind {
-		case "openai":
-			return provider.NewOpenAI(baseURL, cfg.OpenAIKey), nil
-		case "anthropic":
-			return provider.NewAnthropic(baseURL, cfg.AnthropicKey), nil
-		case "fake":
-			return provider.Fake{}, nil
-		default:
-			return nil, fmt.Errorf("provider %s: unsupported kind %q", name, kind)
-		}
-	}
-
+	// are validated against SSRF rules and every enabled provider's
+	// credential is checked before the server can start.
 	providers := map[string]provider.Provider{}
 	var catalog *policy.Catalog
 	if dbw != nil {
+		// Database mode: the persisted registry is authoritative for kind
+		// and base URL; the legacy GATEWAY_PROVIDER selector is ignored.
 		pcfgs, err := dbw.LoadProviders(ctx)
 		if err != nil {
-			logger.Error("load providers", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("load providers: %w", err)
 		}
 		for _, pc := range pcfgs {
-			p, err := newProvider(pc.Kind, pc.Name, pc.BaseURL)
+			p, err := newProviderFromRegistry(cfg, pc.Kind, pc.Name, pc.BaseURL)
 			if err != nil {
-				logger.Error("provider configuration invalid", "error", err)
-				os.Exit(1)
+				return err
 			}
 			providers[pc.Name] = p
 		}
 		entries, err := dbw.LoadCatalog(ctx)
 		if err != nil {
-			logger.Error("load catalog", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("load catalog: %w", err)
 		}
 		catalog = policy.NewCatalog(entries)
 	} else {
 		switch cfg.Provider {
 		case "openai":
-			providers["openai"] = provider.NewOpenAI(cfg.OpenAIURL, cfg.OpenAIKey)
+			p, err := newProviderFromRegistry(cfg, "openai", "openai", cfg.OpenAIURL)
+			if err != nil {
+				return err
+			}
+			providers["openai"] = p
 		case "anthropic":
-			providers["anthropic"] = provider.NewAnthropic(cfg.AnthropicURL, cfg.AnthropicKey)
+			p, err := newProviderFromRegistry(cfg, "anthropic", "anthropic", cfg.AnthropicURL)
+			if err != nil {
+				return err
+			}
+			providers["anthropic"] = p
 		default:
 			providers["fake"] = provider.Fake{}
 		}
@@ -125,15 +129,13 @@ func main() {
 	if dbw != nil {
 		routeCfgs, err := dbw.LoadRoutes(ctx)
 		if err != nil {
-			logger.Error("load routes", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("load routes: %w", err)
 		}
 		byModel := map[string][]router.Route{}
 		for _, rc := range routeCfgs {
 			p, ok := providers[rc.ProviderName]
 			if !ok {
-				logger.Error("route references unknown provider", "provider", rc.ProviderName)
-				os.Exit(1)
+				return fmt.Errorf("model %s: route references unknown provider %q", rc.PublicModel, rc.ProviderName)
 			}
 			byModel[rc.PublicModel] = append(byModel[rc.PublicModel], router.Route{
 				ProviderName: rc.ProviderName, Provider: p,
@@ -153,8 +155,7 @@ func main() {
 	if dbw != nil {
 		limits, err := dbw.LoadLimits(ctx)
 		if err != nil {
-			logger.Error("load policies", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("load policies: %w", err)
 		}
 		for subject, l := range limits {
 			pol.SetLimits(subject, l)
@@ -178,8 +179,7 @@ func main() {
 		for _, k := range cfg.Keys {
 			salt, err := auth.NewSalt()
 			if err != nil {
-				logger.Error("generate salt", "error", err)
-				os.Exit(1)
+				return fmt.Errorf("generate salt: %w", err)
 			}
 			store.Put(auth.KeyRecord{
 				ID: k.ID, Subject: k.Subject, Salt: salt,
@@ -285,6 +285,40 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
+	}
+	return nil
+}
+
+// newProviderFromRegistry builds one provider from a registry entry: kind and
+// base URL come from the database (or, in local mode, the legacy
+// GATEWAY_PROVIDER settings), while the credential comes from the process
+// environment. Every enabled provider is validated before the gateway serves
+// traffic; errors name the missing configuration kind and never include the
+// secret value or the database DSN.
+func newProviderFromRegistry(cfg config.Config, kind, name, baseURL string) (provider.Provider, error) {
+	// The fake provider never dials its base URL — seeded registries use
+	// internal:// pseudo URLs for it — so SSRF validation applies only to
+	// network-backed kinds.
+	if kind != "fake" {
+		if err := provider.ValidateBaseURL(baseURL, cfg.AllowInsecure); err != nil {
+			return nil, fmt.Errorf("provider %s: %w", name, err)
+		}
+	}
+	switch kind {
+	case "openai":
+		if cfg.OpenAIKey == "" {
+			return nil, fmt.Errorf("provider %s: OPENAI_API_KEY must be set for openai kind", name)
+		}
+		return provider.NewOpenAI(baseURL, cfg.OpenAIKey), nil
+	case "anthropic":
+		if cfg.AnthropicKey == "" {
+			return nil, fmt.Errorf("provider %s: ANTHROPIC_API_KEY must be set for anthropic kind", name)
+		}
+		return provider.NewAnthropic(baseURL, cfg.AnthropicKey), nil
+	case "fake":
+		return provider.Fake{}, nil
+	default:
+		return nil, fmt.Errorf("provider %s: unsupported kind %q", name, kind)
 	}
 }
 

@@ -37,7 +37,7 @@ type Config struct {
 	RatePerMinute   int
 	MaxConcurrent   int
 
-	Provider  string // "openai" or "fake"
+	Provider  string // "openai", "anthropic", or "fake"
 	OpenAIKey string
 	OpenAIURL string
 
@@ -58,6 +58,15 @@ type Config struct {
 }
 
 // FromEnv builds a Config from environment variables and validates it.
+//
+// GATEWAY_DATABASE_URL is the configuration-mode boundary. When it is set,
+// the database is authoritative for keys, catalog, routes, policies, and the
+// provider registry, so the development-only GATEWAY_API_KEYS and
+// GATEWAY_MODELS lists are optional (a supplied value is still parsed so a
+// typo fails startup instead of being silently ignored). When it is unset,
+// local development mode requires both. Provider secrets are loaded before
+// any validation so every provider kind is checked against its own
+// credential.
 func FromEnv() (Config, error) {
 	c := Config{
 		Addr:            env("GATEWAY_ADDR", ":8080"),
@@ -69,8 +78,20 @@ func FromEnv() (Config, error) {
 		RatePerMinute:   120,
 		MaxConcurrent:   8,
 		Provider:        env("GATEWAY_PROVIDER", "fake"),
-		OpenAIKey:       os.Getenv("OPENAI_API_KEY"),
-		OpenAIURL:       env("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+
+		// Provider secrets and endpoints are loaded before any validation
+		// runs, so the switch below always sees the credential of the kind
+		// it is checking.
+		OpenAIKey:    os.Getenv("OPENAI_API_KEY"),
+		OpenAIURL:    env("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
+		AnthropicURL: env("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+
+		// Configuration-mode boundary and admin/SSRF settings.
+		DatabaseURL:   os.Getenv("GATEWAY_DATABASE_URL"),
+		AdminToken:    os.Getenv("GATEWAY_ADMIN_TOKEN"),
+		AdminAddr:     env("GATEWAY_ADMIN_ADDR", ":8081"),
+		AllowInsecure: os.Getenv("GATEWAY_ALLOW_INSECURE_BASE_URLS") == "true",
 	}
 	if v := os.Getenv("GATEWAY_MAX_RETRIES"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -88,63 +109,69 @@ func FromEnv() (Config, error) {
 	}
 
 	// Keys: GATEWAY_API_KEYS="id1:subject1:secret1,id2:subject2:secret2"
-	// Dev-only convenience; production must load keys from the database store.
-	for _, part := range strings.Split(os.Getenv("GATEWAY_API_KEYS"), ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
+	// Dev-only convenience; in database mode the PostgreSQL store is
+	// authoritative, but an explicitly supplied value is still parsed and
+	// validated.
+	if raw := os.Getenv("GATEWAY_API_KEYS"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			fields := strings.SplitN(part, ":", 3)
+			if len(fields) != 3 {
+				return c, fmt.Errorf("GATEWAY_API_KEYS entry %q must be <id>:<subject>:<key>", part)
+			}
+			c.Keys = append(c.Keys, KeyEntry{ID: fields[0], Subject: fields[1], PlaintextKey: fields[2]})
 		}
-		fields := strings.SplitN(part, ":", 3)
-		if len(fields) != 3 {
-			return c, fmt.Errorf("GATEWAY_API_KEYS entry %q must be <id>:<subject>:<key>", part)
+		if len(c.Keys) == 0 {
+			return c, fmt.Errorf("GATEWAY_API_KEYS: at least one key is required")
 		}
-		c.Keys = append(c.Keys, KeyEntry{ID: fields[0], Subject: fields[1], PlaintextKey: fields[2]})
 	}
-	if len(c.Keys) == 0 {
+	if c.DatabaseURL == "" && len(c.Keys) == 0 {
 		return c, fmt.Errorf("GATEWAY_API_KEYS: at least one key is required")
 	}
 
 	// Models: GATEWAY_MODELS="<public>:<provider>:<upstream>[,<public>:...]"
-	for _, part := range strings.Split(os.Getenv("GATEWAY_MODELS"), ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
+	if raw := os.Getenv("GATEWAY_MODELS"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			fields := strings.SplitN(part, ":", 3)
+			if len(fields) != 3 {
+				return c, fmt.Errorf("GATEWAY_MODELS entry %q must be <public-name>:<provider>:<upstream-model>", part)
+			}
+			c.Models = append(c.Models, ModelEntry{PublicName: fields[0], Provider: fields[1], UpstreamModel: fields[2], Enabled: true})
 		}
-		fields := strings.SplitN(part, ":", 3)
-		if len(fields) != 3 {
-			return c, fmt.Errorf("GATEWAY_MODELS entry %q must be <public-name>:<provider>:<upstream-model>", part)
+		if len(c.Models) == 0 {
+			return c, fmt.Errorf("GATEWAY_MODELS: at least one model is required")
 		}
-		c.Models = append(c.Models, ModelEntry{PublicName: fields[0], Provider: fields[1], UpstreamModel: fields[2], Enabled: true})
 	}
-	if len(c.Models) == 0 {
+	if c.DatabaseURL == "" && len(c.Models) == 0 {
 		return c, fmt.Errorf("GATEWAY_MODELS: at least one model is required")
 	}
 
-	if c.Provider == "openai" && c.OpenAIKey == "" {
-		return c, fmt.Errorf("OPENAI_API_KEY must be set when GATEWAY_PROVIDER=openai")
-	}
+	// GATEWAY_PROVIDER stays authoritative for local development mode; its
+	// value is validated in both modes so a typo fails fast. The credential
+	// requirement is local-mode-only: in database mode the persisted
+	// provider registry is authoritative and every enabled row is
+	// credential-checked at startup (cmd/gateway), so the legacy selector
+	// must not demand secrets the registry does not need.
 	switch c.Provider {
 	case "openai":
-		if c.OpenAIKey == "" {
+		if c.DatabaseURL == "" && c.OpenAIKey == "" {
 			return c, fmt.Errorf("OPENAI_API_KEY must be set when GATEWAY_PROVIDER=openai")
 		}
 	case "anthropic":
-		if c.AnthropicKey == "" {
+		if c.DatabaseURL == "" && c.AnthropicKey == "" {
 			return c, fmt.Errorf("ANTHROPIC_API_KEY must be set when GATEWAY_PROVIDER=anthropic")
 		}
 	case "fake":
 	default:
 		return c, fmt.Errorf("GATEWAY_PROVIDER: unsupported provider %q", c.Provider)
 	}
-
-	if v := os.Getenv("GATEWAY_DATABASE_URL"); v != "" {
-		c.DatabaseURL = v
-	}
-	c.AdminToken = os.Getenv("GATEWAY_ADMIN_TOKEN")
-	c.AdminAddr = env("GATEWAY_ADMIN_ADDR", ":8081")
-	c.AnthropicKey = os.Getenv("ANTHROPIC_API_KEY")
-	c.AnthropicURL = env("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-	c.AllowInsecure = os.Getenv("GATEWAY_ALLOW_INSECURE_BASE_URLS") == "true"
 
 	c.LimitsMode = env("GATEWAY_LIMITS_MODE", "local")
 	switch c.LimitsMode {
