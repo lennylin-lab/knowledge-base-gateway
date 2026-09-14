@@ -1,0 +1,4 @@
+{"file": "docs/v1.1-production-roadmap.md", "reason": "Authoritative V1.1 scope, architecture, rollout, and acceptance criteria"}
+{"file": "docs/agent-start.md", "reason": "V1 contract, security, and provider boundary baseline"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Persistence, migration, and Redis boundaries"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Stable error mapping and failure semantics"}

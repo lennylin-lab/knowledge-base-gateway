@@ -1,0 +1,3 @@
+{"file": "docs/v1.1-production-roadmap.md", "reason": "V1.1 acceptance and fault-mode checks"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Quality and verification requirements"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Redaction and observability checks"}
