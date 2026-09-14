@@ -199,6 +199,68 @@ plus a real down path; never edit an applied migration.
 See `docs/gateway-client-contract.md` for the knowledge-base-server client
 contract.
 
+## Container stack and smoke test
+
+`Dockerfile` is a multi-stage build pinned to the Go version declared by
+`go.mod`; the runtime stage is a minimal Alpine image running as non-root
+(uid/gid 10001). No provider secret, API key, or DSN is baked into the image —
+all configuration is injected at run time by Compose or the deployment
+environment.
+
+`docker-compose.yml` owns the deployment-shaped stack: PostgreSQL and Redis
+with health checks, a one-shot migration job (`cmd/migrate up`, idempotent for
+a fully-applied schema), and the gateway in database-backed Redis mode
+(catalog/routes/policies/keys come from PostgreSQL; the dev-only
+`GATEWAY_API_KEYS` / `GATEWAY_MODELS` variables are not used). Destructive
+rollback is never part of startup.
+
+```bash
+docker compose build            # build kb-gateway:local
+docker compose up -d            # postgres + redis + migrate + gateway
+docker compose ps               # migrate shows Exited (0); gateway healthy
+docker compose logs -f gateway  # follow gateway logs
+docker compose stop             # stop everything (keep the data volume)
+docker compose down             # remove containers + network
+docker compose down -v          # also remove the PostgreSQL data volume
+scripts/smoke.sh                # bounded end-to-end smoke (see below)
+```
+
+### Smoke test
+
+`scripts/smoke.sh` builds and starts the stack, waits within bounded
+timeouts, verifies the migration job completed successfully, asserts
+`/healthz` is 200 and `/readyz` becomes 200, then stops and restarts Redis
+and PostgreSQL to prove `/readyz` fails (503) while `/healthz` stays 200 and
+readiness recovers afterwards. On any failure it prints the relevant service
+logs and exits with a distinct non-zero status (the full map is documented in
+the script header). Flags: `--skip-outage`, `--down` (tear the stack down
+after success), `--timeout N` (per-phase wait budget, default 90s).
+
+### Environment overrides
+
+Host ports default to values chosen not to collide with a co-existing
+knowledge-base-server stack (which uses 5432/6379):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GATEWAY_HOST_PORT` | `8091` | Host port for the gateway (`/healthz`, `/readyz`, `/v1/...`) |
+| `POSTGRES_HOST_PORT` | `5433` | Host port for PostgreSQL |
+| `REDIS_HOST_PORT` | `6381` | Host port for Redis |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `gateway` / `gateway-local-throwaway` / `gateway` | Local PostgreSQL credentials; the default password is a deterministic throwaway (same policy as CI) — override it for anything non-disposable |
+| `GATEWAY_IMAGE` | `kb-gateway:local` | Image tag built and used by the gateway and migrate services |
+| `GATEWAY_SMOKE_URL` | `http://127.0.0.1:${GATEWAY_HOST_PORT:-8091}` | Base URL the smoke script targets |
+
+To run operational migration commands against the Compose database, reuse the
+one-shot service (the image entrypoint is the gateway binary, the migrate
+service resets it):
+
+```bash
+docker compose run --rm --no-deps migrate            # idempotent `up`
+```
+
+`down`-style rollbacks stay operational-only (`cmd/migrate down` against a
+database you own); the Compose stack never executes them.
+
 ## Design notes and known limitations
 
 - **Audit is metadata-only** (subject, model, provider, status, latency, token
