@@ -45,7 +45,7 @@ Stable envelope, never provider-raw:
 | 401 | `invalid_api_key`, `api_key_expired`, `api_key_revoked` | rotate key (admin API), fail fast |
 | 403 | `model_not_allowed` | unknown and disallowed models are indistinguishable; check model name against configured list |
 | 400 | `invalid_request`, `upstream_rejected_request` | fix payload |
-| 429 | `rate_limit_exceeded` (with `Retry-After` when computable) | back off and retry |
+| 429 | `rate_limit_exceeded`, `quota_exceeded` (with `Retry-After` when computable) | back off and retry; `quota_exceeded` clears at the next UTC day/month boundary |
 | 503 | `upstream_unavailable`, `upstream_rate_limited`, `no_route_available`, `limiter_unavailable` | retry with backoff; `limiter_unavailable` has no `Retry-After` |
 | 504 | `upstream_timeout` | retry allowed; gateway never retries past its own total deadline |
 

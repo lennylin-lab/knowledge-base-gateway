@@ -76,9 +76,42 @@ Request size limits: 1 MiB body, 64 messages, 32k characters per message
 
 Mapping: invalid/expired/revoked key -> 401; unknown or disallowed model ->
 403 (indistinguishable on purpose); invalid input -> 400; rate limit -> 429;
-upstream rejected request -> 400; upstream timeout -> 504; upstream
+daily/monthly token quota exhausted -> 429 `quota_exceeded`; upstream
+rejected request -> 400; upstream timeout -> 504; upstream
 unavailable/rate-limited -> 503; unknown internal -> 500. Provider status
-codes are never passed through raw.
+codes are never passed through raw. Limiter/quota infrastructure failures
+are always 503 `limiter_unavailable` with no `Retry-After` and never
+masquerade as a 429.
+
+## Token quotas (`daily_tokens` / `monthly_tokens`)
+
+Per-subject budgets configured in `access_policies` are enforced before any
+provider invocation:
+
+- **Periods**: UTC calendar day and UTC calendar month, tracked
+  independently. `NULL` or `0` means that period is unlimited; subjects with
+  no budget configured keep the pre-quota behavior. Counters are keyed by
+  subject and UTC period and expire at the boundary (plus a grace window for
+  settlements of requests that straddle it), so periods reset without manual
+  cleanup.
+- **Reserve**: a deterministic bounded estimate is charged atomically before
+  the provider is called: declared `max_tokens` (already capped by the
+  policy output ceiling), otherwise the policy `max_output_tokens`,
+  otherwise a conservative default of 4096 output tokens, plus roughly
+  `message content chars / 4` input tokens. Provider-specific tokenizers are
+  not used.
+- **Settle**: after a successful non-streaming response the reservation is
+  adjusted exactly once to the upstream-reported total token usage. If the
+  upstream reports no usage, the conservative reservation stays charged —
+  unknown usage is never fabricated as zero in enforcement, audit, or
+  metrics.
+- **Release**: requests that fail before any provider output (including
+  client cancellation) get the reservation back idempotently.
+- **Atomicity**: multi-instance deployments (`GATEWAY_LIMITS_MODE=redis`)
+  check and charge both periods in one Redis Lua script, so concurrent
+  instances cannot oversubscribe a budget; Redis unavailability fails closed
+  as 503 `limiter_unavailable`. Single-process development mode uses the
+  same semantics in memory.
 
 ## V1.1 production mode
 
@@ -94,7 +127,7 @@ Set `GATEWAY_ADMIN_TOKEN` to enable the admin API on `GATEWAY_ADMIN_ADDR`
 | Variable | Default | Meaning |
 |---|---|---|
 | `GATEWAY_DATABASE_URL` | – | PostgreSQL DSN; enables persistent keys/catalog/routes/policies/audit |
-| `GATEWAY_LIMITS_MODE` | `local` | `local` (dev-only, single instance) or `redis` |
+| `GATEWAY_LIMITS_MODE` | `local` | `local` (dev-only, single instance) or `redis`; selects the backing store for rate/concurrency limits and token quotas |
 | `GATEWAY_REDIS_ADDR` | `127.0.0.1:6379` | Redis address for distributed limits |
 | `GATEWAY_ADMIN_TOKEN` | – | Bearer token for the admin API (admin API disabled when unset) |
 | `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
@@ -161,11 +194,15 @@ contract.
 - **Audit is metadata-only** (subject, model, provider, status, latency, token
   usage when reported, request/trace id). Prompts/completions are never logged
   or stored; unknown token usage is recorded as unknown, never zero.
-- **Token ceilings** cap `max_tokens` from policy; upstream-reported usage is
-  required for accounting, and daily/monthly quota enforcement beyond policy
-  storage is not yet implemented.
+- **Token ceilings** cap `max_tokens` from policy; daily/monthly token
+  quotas are enforced via reserve-before-call / settle-after-response (see
+  "Token quotas" above). A reservation whose outcome was never finalized
+  (e.g. a crashed process) stays charged until the UTC period rolls over.
+  Streaming usage is not parsed today, so admitted streams keep their
+  conservative reservation.
 - **Local limiter** is development-only and per-process; multi-instance
   deployments must use `GATEWAY_LIMITS_MODE=redis` (readiness gates this).
+  The token-quota gate follows the same mode.
 - The `Known` flag on usage is internal; token usage absent from an upstream
   response is not fabricated.
 
