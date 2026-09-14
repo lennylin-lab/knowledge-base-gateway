@@ -30,6 +30,20 @@ interfaces; adapters translate at package edges. Retry classification
 (`provider.RetryEligible`), the total request deadline, and the streaming
 no-switch rule remain owned by `internal/gateway`.
 
+### Common Mistake: Struct-literal refactor drops a config default
+
+**Symptom**: Everything returns 429 from the first request after an unrelated config refactor; unit tests that never assert the default don't catch it.
+
+**Cause**: Rewriting `FromEnv` to a struct literal silently deleted `MaxConcurrent: 8`; the zero value made the concurrency check deny on first admission. Found only by the check pass, not by tests.
+
+**Fix / Prevention**: When refactoring config construction, assert every field with a meaningful default is non-zero in the happy-path test (see `TestFromEnvValid`); zero values that mean "deny all" or "unbounded" must never be reachable from `FromEnv`.
+
+### Convention: Provider URL validation skips the fake provider
+
+**What**: `provider.ValidateBaseURL` (https-only, no userinfo) applies to `openai`/`anthropic` base URLs in both modes, but `fake` rows are exempt — the migration seed data uses `internal://` URLs and the fake provider never dials its base URL.
+
+**Why**: Startup would otherwise reject the seeded database (config incompatible with its own seed data); the exemption is safe because fake never opens a connection.
+
 ### Common Mistake: Config timeout loaded but never applied
 
 **Symptom**: `go vet` and tests pass, but a hanging upstream request never returns — the client's context is the only deadline.
