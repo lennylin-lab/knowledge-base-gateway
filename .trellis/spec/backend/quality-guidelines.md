@@ -69,6 +69,40 @@ defer cancel()
 
 **Example**: `ok, retryAfter, release, err := gate.Allow(...)`; check `err` first, map to 503 `limiter_unavailable`; only `ok=false, err=nil` is a 429.
 
+### Convention: Quota reservation/settlement behind quota.Gate
+
+**What**: Daily/monthly token quotas (`internal/quota`) reserve a deterministic
+bounded estimate before provider invocation (declared `max_tokens`, then policy
+ceiling, then 4096; input ≈ chars/4) and finalize exactly once after the
+response: settle to reported total, or keep the conservative reservation when
+usage is unknown — never fabricate zero. Release on pre-output failure is
+idempotent (Redis: `SET NX` finalize marker; both period counters adjusted in
+one atomic Lua script).
+
+**Why**: Prevents concurrent instances from oversubscribing a period budget
+without needing provider tokenizers; exactly-once finalization prevents double
+adjustment across settle/release races.
+
+**Boundary**: Settlement runs on a detached context on purpose — a post-response
+client disconnect must not lose accounting. Streaming usage is not parsed yet,
+so successful streams keep the conservative reservation until stream usage is
+surfaced. A crash between reserve and finalize leaves the reservation charged
+until period rollover (accepted, documented in README).
+
+### Common Mistake: Env-gated tests sharing persistent service state
+
+**Symptom**: `TestRedisAllow` fails on the second run against the same Redis
+within the lease TTL, passes in isolation.
+
+**Cause**: The test intentionally abandons one concurrency lease; in a
+persistent Redis (not miniredis) the abandoned lease occupies capacity for
+`DefaultLeaseTTL` (5 min), so cross-run state breaks the next run's
+expectations.
+
+**Fix / Prevention**: Env-gated integration tests that write state to a shared
+persistent service must namespace keys per run (random prefix) or clean up in
+defer; never rely on the service being empty.
+
 ### Convention: Failover routing stays behind interfaces
 
 **What**: Provider failover (primary/backup route table + circuit breaker in `internal/router`) is selected before any provider call; streaming never switches providers after output starts; retries stay bounded under the total request deadline.
