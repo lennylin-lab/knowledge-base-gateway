@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verify redaction, smoke exit-code/timeout contract, and no-regression gates."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify connect errors carry no DSN and envelopes stay stable."}
