@@ -16,6 +16,36 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 )
 
+// testDatabaseLockKey serializes this package's env-gated integration test
+// against the cmd/gateway database-backed startup test, which runs under the
+// same PostgreSQL advisory lock so concurrent `go test ./...` package runs
+// cannot race on the shared TEST_DATABASE_URL schema. Keep both constants
+// identical.
+const testDatabaseLockKey int64 = 721534891
+
+// lockTestDatabase takes a session-level advisory lock on one pinned
+// connection for the duration of the test.
+func lockTestDatabase(t *testing.T, dsn string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("lock connect: %v", err)
+	}
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("lock connection: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", testDatabaseLockKey); err != nil {
+		t.Fatalf("advisory lock: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", testDatabaseLockKey)
+		_ = conn.Close()
+		_ = db.Close()
+	})
+}
+
 // newTestMigrator builds the same golang-migrate instance the cmd/migrate CLI
 // uses, pointed at the repository's migrations directory.
 func newTestMigrator(t *testing.T, db *sql.DB) *migrate.Migrate {
@@ -55,6 +85,7 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Skip("TEST_DATABASE_URL not set; skipping PostgreSQL migration test")
 	}
 	ctx := context.Background()
+	lockTestDatabase(t, dsn)
 
 	// The migration tool owns schema changes: clean slate including its
 	// bookkeeping table, then drive it like cmd/migrate does.
