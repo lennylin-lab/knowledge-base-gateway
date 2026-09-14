@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Parent quality gates, security boundaries, and test expectations."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "PostgreSQL/Redis persistence, migration, and real-service constraints."}

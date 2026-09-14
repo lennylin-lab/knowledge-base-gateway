@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Startup failure classification and secret-safe error behavior."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Focused config/startup test and static-check requirements."}

@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Container migration job and PostgreSQL/Redis startup boundaries."}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Operational logs, health probes, and secret-safe failure output."}

@@ -1,0 +1,30 @@
+{
+  "id": "gateway-production-readiness",
+  "name": "gateway-production-readiness",
+  "title": "Gateway production readiness",
+  "description": "Make production configuration startup-safe and add CI plus container smoke verification for PostgreSQL and Redis deployments.",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "lenny",
+  "assignee": "lenny",
+  "createdAt": "2026-09-15",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "09-15-gateway-ci-real-services",
+    "09-15-gateway-production-config",
+    "09-15-gateway-container-smoke"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

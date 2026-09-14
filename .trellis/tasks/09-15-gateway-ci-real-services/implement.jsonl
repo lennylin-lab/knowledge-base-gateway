@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Migration and real PostgreSQL/Redis integration constraints."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "CI quality gates and integration test expectations."}

@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Config validation, startup ordering, and regression test conventions."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Database-backed configuration and provider secret boundary."}
