@@ -59,3 +59,27 @@ Two tasks completed. (1) gateway-v1-1-production: PostgreSQL key/catalog/policy/
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Real-service integration verification
+<!-- trellis-session: v=2 fp=36e04055a300646f -->
+
+**Date**: 2026-09-15
+**Task**: Real-service integration verification
+**Branch**: `master`
+
+### Summary
+
+Ran the previously-skipped integration tests against the real PostgreSQL/Redis from ../knowledge-base-server docker compose (dedicated kb_gateway_test database, app data untouched). Found and fixed two latent bugs: (1) pg ResolveAuth returned a zero Principal with nil error for unknown keys (rows.Err() is nil on zero matches) — now returns auth.ErrInvalid, and digest comparison switched to subtle.ConstantTimeCompare; (2) the 0002 down migration hit FK violations rolling back because api_keys/llm_requests created against the seed subject outlived the filtered deletes — down script now removes dependents before seed parents, preserving non-seed audit data. Verified: pg up/down/store test, real-Redis limiter test, cmd/migrate CLI up/version/steps/up, full go build/vet/test green. Lessons captured in backend specs; kb_gateway_test database left in place for future env-gated runs.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c1abae4` | fix: return ErrInvalid for unknown keys in pg authenticator |
+| `2688f0c` | fix: remove dependent rows before seed parents in 0002 down migration |
+| `4f78361` | docs: capture real-service integration test lessons in backend specs |
+
+### Status
+
+[OK] **Completed**

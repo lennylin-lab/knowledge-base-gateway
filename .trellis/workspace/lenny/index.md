@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 2
+- **Total Sessions**: 3
 - **Last Active**: 2026-09-15
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~61 | Active |
+| `journal-1.md` | ~85 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 3 | 2026-09-15 | Real-service integration verification | `c1abae4`, `2688f0c`, `4f78361` | `master` |
 | 2 | 2026-09-15 | V1.1 production hardening and infra library adoption | `74814da`, `3b58d9f`, `1edd313`, `8804840`, `822a4ba`, `9c0c3f1`, `16d3339`, `d990d7e`, `016f396` | `master` |
 | 1 | 2026-09-14 | Implement Go LLM gateway MVP | `3810cf5`, `833f5ab`, `fcb36ae` | `master` |
 <!-- @@@/auto:session-history -->
