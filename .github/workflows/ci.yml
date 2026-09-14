@@ -1,0 +1,219 @@
+# Continuous integration for the knowledge-base gateway.
+#
+# One job provisions real PostgreSQL and Redis service containers, runs the Go
+# quality gates, verifies the full migration lifecycle (up -> version ->
+# down -> up) against a disposable database, and runs the env-gated
+# integration tests with TEST_DATABASE_URL / TEST_REDIS_ADDR exported for that
+# step only.
+#
+# Credential rules: the PostgreSQL password below is a deterministic
+# throwaway value that only ever reaches the ephemeral CI service container.
+# It is masked in job logs, never echoed, and no step prints a connection
+# string. Redis is intentionally passwordless: the real-Redis tests
+# authenticate by TEST_REDIS_ADDR alone and the service is reachable only from
+# this job.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the POSTGRES_* values in sync with the postgres service env below:
+  # the env context is not available inside services.<id>.env.
+  POSTGRES_HOST: 127.0.0.1
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: gateway_ci
+  POSTGRES_PASSWORD: gateway-ci-throwaway
+  POSTGRES_DB: gateway_ci_admin
+  TEST_DATABASE_NAME: kb_gateway_ci_test
+  REDIS_HOST: 127.0.0.1
+  REDIS_PORT: "6379"
+
+jobs:
+  verify:
+    name: Go checks, migrations, real-service tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: gateway_ci
+          POSTGRES_PASSWORD: gateway-ci-throwaway
+          POSTGRES_DB: gateway_ci_admin
+        ports:
+          - "5432:5432"
+        # Bounded startup gate: if the service never turns healthy, the job
+        # fails here with the service logs instead of racing the tests.
+        options: >-
+          --health-cmd "pg_isready -U gateway_ci -d gateway_ci_admin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7.4
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      # Runs before anything else might print a credential-bearing value.
+      - name: Mask service credentials in job logs
+        run: echo "::add-mask::${{ env.POSTGRES_PASSWORD }}"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go (version declared by go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Second, explicit bounded wait over the exact TCP path the tests use,
+      # so a slow or failed service boot is a diagnostic failure, not a
+      # flaky connection race in a later step.
+      - name: Wait for PostgreSQL and Redis (bounded)
+        run: |
+          set -euo pipefail
+          wait_for_port() {
+            local name="$1" host="$2" port="$3" attempts="$4" i=1
+            while [ "$i" -le "$attempts" ]; do
+              if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+                echo "$name is accepting connections on $host:$port"
+                return 0
+              fi
+              sleep 2
+              i=$((i + 1))
+            done
+            echo "::error::$name did not accept TCP connections at $host:$port within $((attempts * 2))s"
+            return 1
+          }
+          wait_for_port PostgreSQL "$POSTGRES_HOST" "$POSTGRES_PORT" 30
+          wait_for_port Redis "$REDIS_HOST" "$REDIS_PORT" 30
+
+      - name: Verify formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::the following files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Build (go build)
+        run: go build ./...
+
+      - name: Vet (go vet)
+        run: go vet ./...
+
+      # Full suite without TEST_* exports: the four env-gated tests skip here
+      # by design and are re-run against real services below, where skips
+      # fail the job.
+      - name: Test (go test -race)
+        run: go test -race ./...
+
+      # Disposable per run; WITH (FORCE) evicts lingering connections so a
+      # re-run cannot inherit state. The service's admin database
+      # (gateway_ci_admin) is never touched by tests or migrations.
+      - name: Create isolated test database
+        env:
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        run: |
+          set -euo pipefail
+          psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" \
+            -d "$POSTGRES_DB" -X -q -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS ${TEST_DATABASE_NAME} WITH (FORCE)" \
+            -c "CREATE DATABASE ${TEST_DATABASE_NAME}"
+          echo "Created disposable database ${TEST_DATABASE_NAME}"
+
+      # The rollback step points exclusively at the disposable database
+      # created above via GATEWAY_DATABASE_URL; it must never run against a
+      # shared or developer database.
+      - name: Verify migration lifecycle (up -> version -> down -> up)
+        env:
+          GATEWAY_DATABASE_URL: postgres://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@${{ env.POSTGRES_HOST }}:${{ env.POSTGRES_PORT }}/${{ env.TEST_DATABASE_NAME }}?sslmode=disable
+        run: |
+          set -euo pipefail
+          expected=$((10#$(find migrations -maxdepth 1 -name '*.up.sql' \
+            | sed -E 's|.*/([0-9]+)_.*|\1|' | sort -n | tail -1)))
+          echo "Latest migration file version: ${expected}"
+          assert_version() {
+            local phase="$1" want="$2" out="$3"
+            if [ "$out" != "$want" ]; then
+              echo "::error::schema version after ${phase} must be \"${want}\", got \"${out}\""
+              exit 1
+            fi
+          }
+          go run ./cmd/migrate up
+          out=$(go run ./cmd/migrate version)
+          echo "after up: ${out}"
+          assert_version up "version ${expected} (dirty=false)" "$out"
+
+          go run ./cmd/migrate down
+          out=$(go run ./cmd/migrate version)
+          echo "after down: ${out}"
+          assert_version down "no migrations applied (version 0)" "$out"
+
+          go run ./cmd/migrate up
+          out=$(go run ./cmd/migrate version)
+          echo "after re-up: ${out}"
+          assert_version re-up "version ${expected} (dirty=false)" "$out"
+
+      # TEST_DATABASE_URL / TEST_REDIS_ADDR are exported for this step only.
+      # Env-gated tests must run and must not skip: services are guaranteed
+      # available here, so any SKIP line is an unexpected (failing) state.
+      - name: Run real-service integration tests
+        env:
+          TEST_DATABASE_URL: postgres://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@${{ env.POSTGRES_HOST }}:${{ env.POSTGRES_PORT }}/${{ env.TEST_DATABASE_NAME }}?sslmode=disable
+          TEST_REDIS_ADDR: ${{ env.REDIS_HOST }}:${{ env.REDIS_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          go test -race -count=1 -v \
+            ./cmd/gateway/ ./internal/limiter/ ./internal/quota/ ./internal/store/pg/ \
+            2>&1 | tee artifacts/integration-test.log
+          skips=$(grep -c -- '--- SKIP' artifacts/integration-test.log || true)
+          if [ "$skips" -ne 0 ]; then
+            echo "::error::${skips} integration test(s) skipped although PostgreSQL and Redis are available in CI:"
+            grep -n -- '--- SKIP' artifacts/integration-test.log || true
+            exit 1
+          fi
+          echo "Integration tests passed with no skips."
+
+      # Failure diagnostics only: service container logs and the integration
+      # test log. None of them contain passwords (pgx redacts them and no
+      # step echoes the DSN) or provider secrets / API keys / request bodies.
+      - name: Collect service diagnostics
+        if: failure()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          docker ps -a > artifacts/containers.txt 2>&1 || true
+          for id in $(docker ps -a --format '{{.ID}} {{.Image}}' \
+              | awk '$2 ~ /postgres|redis/ {print $1}'); do
+            docker logs "$id" > "artifacts/service-${id}.log" 2>&1 || true
+          done
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-diagnostics
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 5
