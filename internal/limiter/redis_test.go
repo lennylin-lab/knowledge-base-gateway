@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -22,7 +23,10 @@ func TestRedisAllow(t *testing.T) {
 		t.Fatalf("redis ping: %v", err)
 	}
 
-	rl := NewRedis(client, "gwtest", 2, 1)
+	// Unique namespace per run: real Redis keeps state across runs, and this
+	// test deliberately abandons one lease, which would occupy capacity for
+	// DefaultLeaseTTL and break the next run against the same Redis.
+	rl := NewRedis(client, fmt.Sprintf("gwtest-%d", time.Now().UnixNano()), 2, 1)
 	now := time.Now()
 
 	ok, _, release, err := rl.Allow(context.Background(), "s", now)
@@ -57,8 +61,10 @@ func TestRedisAllow(t *testing.T) {
 	release3()
 
 	// Namespace isolation.
-	if ok, _, _, _ := rl.Allow(context.Background(), "other", now); !ok {
+	okOther, _, releaseOther, _ := rl.Allow(context.Background(), "other", now)
+	if !okOther {
 		t.Fatal("other subject must have its own counters")
 	}
+	releaseOther()
 	_ = release2
 }
