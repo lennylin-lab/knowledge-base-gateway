@@ -39,18 +39,73 @@ type ResponsesHandler struct {
 	MaxChars int
 }
 
+// responsesWireTool accepts both function-tool dialects on /v1/responses:
+// the flat Responses-native shape (`{"type":"function","name":...}`,
+// what the openai SDK sends for its typed `tools` parameter) and the nested
+// chat-completions shape (`{"type":"function","function":{...}}`, the
+// gateway MVP dialect). Unknown fields are rejected inside either shape, so
+// the accepted contract stays explicit.
+type responsesWireTool struct {
+	chatWireTool
+}
+
+func (t *responsesWireTool) UnmarshalJSON(data []byte) error {
+	var nested chatWireTool
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&nested); err == nil {
+		*t = responsesWireTool{chatWireTool: nested}
+		return nil
+	}
+	var flat struct {
+		Type        string          `json:"type"`
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  json.RawMessage `json:"parameters"`
+	}
+	dec = json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&flat); err != nil {
+		return fmt.Errorf("tool must be a function tool object (nested chat shape or flat Responses shape)")
+	}
+	t.Type = flat.Type
+	t.Function.Name = flat.Name
+	t.Function.Description = flat.Description
+	t.Function.Parameters = flat.Parameters
+	return nil
+}
+
+// responsesWireText is the Responses-native output configuration
+// (`text.format`), the parameter the openai SDK uses for structured output
+// and plain-text selection. The gateway MVP dialect (`response_format`)
+// stays accepted; the two are mutually exclusive.
+type responsesWireText struct {
+	Format *responsesWireFormat `json:"format"`
+}
+
+// responsesWireFormat is the flat Responses format object: `{"type":"text"}`
+// for plain text, or `json_object` / `json_schema` mirroring the nested MVP
+// dialect's schema fields.
+type responsesWireFormat struct {
+	Type   string          `json:"type"`
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict"`
+}
+
 // responsesRequest is the documented MVP request subset.
 type responsesRequest struct {
-	Model           string          `json:"model"`
-	Input           json.RawMessage `json:"input"`
-	Instructions    string          `json:"instructions"`
-	Temperature     *float64        `json:"temperature"`
-	MaxOutputTokens *int            `json:"max_output_tokens"`
-	Stream          bool            `json:"stream"`
-	Tools           []chatWireTool  `json:"tools"`
-	ToolChoice      string          `json:"tool_choice"`
-	ResponseFormat  *chatWireFormat `json:"response_format"`
-	Metadata        json.RawMessage `json:"metadata"`
+	Model           string              `json:"model"`
+	Input           json.RawMessage     `json:"input"`
+	Instructions    string              `json:"instructions"`
+	Temperature     *float64            `json:"temperature"`
+	MaxOutputTokens *int                `json:"max_output_tokens"`
+	Stream          bool                `json:"stream"`
+	Tools           []responsesWireTool `json:"tools"`
+	ToolChoice      string              `json:"tool_choice"`
+	ResponseFormat  *chatWireFormat     `json:"response_format"`
+	Text            *responsesWireText  `json:"text"`
+	Metadata        json.RawMessage     `json:"metadata"`
 }
 
 // toDomain translates the Responses request into the domain request.
@@ -96,6 +151,9 @@ func (req *responsesRequest) toDomain(requestID string, maxItems, maxChars int) 
 			Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters,
 		})
 	}
+	if req.ResponseFormat != nil && req.Text != nil && req.Text.Format != nil {
+		return mreq, fmt.Errorf("%w: text and response_format are mutually exclusive", errValidation)
+	}
 	if req.ResponseFormat != nil {
 		spec := &model.ResponseSpec{Mode: model.ResponseMode(req.ResponseFormat.Type)}
 		switch spec.Mode {
@@ -108,6 +166,21 @@ func (req *responsesRequest) toDomain(requestID string, maxItems, maxChars int) 
 			return mreq, fmt.Errorf("%w: unsupported response_format type", errValidation)
 		}
 		mreq.ResponseSpec = spec
+	}
+	if req.Text != nil && req.Text.Format != nil {
+		f := req.Text.Format
+		switch model.ResponseMode(f.Type) {
+		case model.ModeJSON:
+			mreq.ResponseSpec = &model.ResponseSpec{Mode: model.ModeJSON}
+		case model.ModeJSONSchema:
+			mreq.ResponseSpec = &model.ResponseSpec{
+				Mode: model.ModeJSONSchema, Name: f.Name, Schema: f.Schema, Strict: f.Strict,
+			}
+		case "text":
+			// Plain-text selection: no output spec.
+		default:
+			return mreq, fmt.Errorf("%w: unsupported text format type", errValidation)
+		}
 	}
 
 	// Input: a plain string or an array of typed items.

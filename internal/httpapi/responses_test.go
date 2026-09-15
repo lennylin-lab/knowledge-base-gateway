@@ -216,6 +216,91 @@ func TestResponsesValidationBounds(t *testing.T) {
 	}
 }
 
+// TestResponsesAcceptsOpenAISDKNativeShapes pins the openai-python SDK
+// compatibility pass: the SDK's typed parameters use the flat Responses
+// function-tool shape and the `text.format` output configuration, so strict
+// decoding must accept both alongside the gateway MVP dialects. The narrowing
+// is bounded: unknown fields, unknown format types, and the combined
+// text+response_format form stay rejected before any provider invocation
+// (single-document decoding is pinned by TestResponsesSingleDocumentDecode).
+func TestResponsesAcceptsOpenAISDKNativeShapes(t *testing.T) {
+	f := newResponsesFixture(t, fullCaps, provider.Fake{})
+
+	// Flat Responses-native function tool (the SDK `tools` parameter): must
+	// reach the provider and produce the same function_call output as the
+	// nested MVP shape.
+	flatToolDecl := `{"type":"function","name":"get_weather","description":"Look up weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}`
+	rec := doResponses(t, f, `{"model":"full-model","input":"paris?","tools":[`+flatToolDecl+`]}`, testKey, "req-sdk-tool")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("flat tool: status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var resp responseObject
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Output) != 1 || resp.Output[0].Type != "function_call" || resp.Output[0].Name != "get_weather" {
+		t.Fatalf("flat tool output = %+v", resp.Output)
+	}
+	callID := resp.Output[0].CallID
+
+	// Round trip with the flat declaration, exactly as the SDK sends it.
+	roundTrip := `{"model":"full-model","input":[{"role":"user","content":"paris?"},{"type":"function_call","call_id":"` + callID + `","name":"get_weather","arguments":"{\"city\":\"paris\"}"},{"type":"function_call_output","call_id":"` + callID + `","output":"sunny 22C"}],"tools":[` + flatToolDecl + `]}`
+	rec = doResponses(t, f, roundTrip, testKey, "req-sdk-tool-rt")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("flat tool round trip: status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	// text.format json_schema (the SDK `text` parameter): structured output
+	// with the same validation as the response_format dialect.
+	schema := `{"type":"object","properties":{"echo":{"type":"string"}},"required":["echo"],"additionalProperties":false}`
+	rec = doResponses(t, f, `{"model":"full-model","input":"hello","text":{"format":{"type":"json_schema","name":"echo_answer","strict":true,"schema":`+schema+`}}}`, testKey, "req-sdk-schema")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("text.format json_schema: status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var structured responseObject
+	if err := json.Unmarshal(rec.Body.Bytes(), &structured); err != nil {
+		t.Fatal(err)
+	}
+	if len(structured.Output) == 0 || structured.Output[0].Content[0].Text != `{"echo":"hello"}` {
+		t.Fatalf("structured output wrong: %+v", structured.Output)
+	}
+
+	// text.format plain text: explicit no-spec selection.
+	rec = doResponses(t, f, `{"model":"full-model","input":"hello","text":{"format":{"type":"text"}}}`, testKey, "req-sdk-text")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("text.format text: status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	if *f.calls != 4 {
+		t.Fatalf("expected 4 successful provider calls, got %d", *f.calls)
+	}
+
+	// The narrowing stops at standard SDK shapes: everything else stays a
+	// 400 invalid_request that never reaches the provider.
+	rejections := map[string]string{
+		"unknown field in flat tool":  `{"model":"full-model","input":"x","tools":[{"type":"function","name":"w","strict":true}]}`,
+		"unknown field inside text":   `{"model":"full-model","input":"x","text":{"verbosity":"low"}}`,
+		"unknown text format type":    `{"model":"full-model","input":"x","text":{"format":{"type":"xml"}}}`,
+		"text plus response_format":   `{"model":"full-model","input":"x","text":{"format":{"type":"text"}},"response_format":{"type":"json_object"}}`,
+		"flat tool with empty name":   `{"model":"full-model","input":"x","tools":[{"type":"function","name":"","parameters":{"type":"object"}}]}`,
+		"flat tool unknown tool type": `{"model":"full-model","input":"x","tools":[{"type":"web_search"}]}`,
+	}
+	before := *f.calls
+	for name, body := range rejections {
+		rec := doResponses(t, f, body, testKey, "req-sdk-reject")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d want 400: %s", name, rec.Code, rec.Body.String())
+			continue
+		}
+		if !strings.Contains(rec.Body.String(), "invalid_request") {
+			t.Errorf("%s: envelope must be invalid_request: %s", name, rec.Body.String())
+		}
+	}
+	if *f.calls != before {
+		t.Errorf("rejected SDK-shape requests reached the provider (%d extra calls)", *f.calls-before)
+	}
+}
+
 // --- A3: streaming ----------------------------------------------------------
 
 type sseEvent struct {
