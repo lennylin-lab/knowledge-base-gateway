@@ -183,10 +183,24 @@ without needing provider tokenizers; exactly-once finalization prevents double
 adjustment across settle/release races.
 
 **Boundary**: Settlement runs on a detached context on purpose — a post-response
-client disconnect must not lose accounting. Streaming usage is not parsed yet,
-so successful streams keep the conservative reservation until stream usage is
-surfaced. A crash between reserve and finalize leaves the reservation charged
-until period rollover (accepted, documented in README).
+client disconnect must not lose accounting. Streaming requests now settle too:
+encoders attach upstream-reported usage to the terminal success event and the
+handler settles exactly once through the same finalize; unknown stream usage
+keeps the conservative reservation. A crash between reserve and finalize leaves
+the reservation charged until period rollover (accepted, documented in README).
+
+### Convention: Anthropic structured output via the forced-tool pattern
+
+**What**: `response_format: json_schema` for Anthropic models translates to a
+synthesized `structured_output` tool (schema as `input_schema`, forced
+`tool_choice`), whose tool input is unwrapped as the JSON result — non-streaming
+text or streamed text deltas — so downstream `model.ValidateOutput` is
+protocol-independent. JSON mode remains unsupported for Anthropic and rejects
+before provider invocation.
+
+**Why**: Keeps structured output protocol-independent in the domain layer and
+lets the shared offline contract suite pin both dialects with identical
+scenarios.
 
 ### Common Mistake: Env-gated tests sharing persistent service state
 
