@@ -96,7 +96,7 @@ Enabled by `GATEWAY_ADMIN_TOKEN`; listens on `GATEWAY_ADMIN_ADDR`
 ```bash
 ADMIN="Authorization: Bearer dev-admin-token"
 curl -s -H "$ADMIN" http://127.0.0.1:8081/admin/models        # catalog + capabilities
-curl -s -H "$ADMIN" http://127.0.0.1:8081/admin/providers     # registry status
+curl -s -H "$ADMIN" http://127.0.0.1:8081/admin/providers     # registry status, health, breaker state
 curl -s -H "$ADMIN" http://127.0.0.1:8081/admin/policies      # subject grants
 curl -s -H "$ADMIN" "http://127.0.0.1:8081/admin/audit?request_id=req_1"   # audit lookup
 curl -s -H "$ADMIN" "http://127.0.0.1:8081/admin/usage"       # tokens, errors, latency
@@ -104,8 +104,34 @@ curl -s -X POST -H "$ADMIN" http://127.0.0.1:8081/admin/models/gateway-echo/disa
 curl -s -H "$ADMIN" http://127.0.0.1:8081/admin/management-log
 ```
 
+The model enable/disable toggle is persisted together with its
+management-audit record in one atomic transaction and applied to the running
+process immediately — no restart. If the runtime refresh fails after the
+change is saved, the API answers `500` with code `refresh_failed` and the
+management log still shows the operation, so you can tell a saved-but-not-
+applied change from one that never landed.
+
 Management responses are metadata only: no keys, secrets, URLs, or
 prompt/completion content.
+
+### Operational and staged metric fields
+
+`/admin/providers` rows carry registry enablement plus live operational
+state: `health` (`serving`, `degraded` with an open breaker, `disabled`),
+`breaker_state` (`closed`, `half-open`, `open`, `none` when this process has
+no route for the provider, `unknown` when the runtime is not attached), and
+a 24-hour `recent_errors` count with `last_error_class` from the audit
+trail. Error classes only — never error bodies.
+
+`/admin/usage` rows report `requests`, `errors`, `error_rate`, token sums,
+and latency percentiles. In PostgreSQL mode `p50_latency_ms` and
+`p95_latency_ms` are true percentiles over the queried window; development
+mode (in-memory audit) reports a mean under the same field names, which is
+why it is dev-only. Two metric groups from the roadmap are staged, not
+faked: `first_token_p50_ms` / `first_token_p95_ms` stay `null` until streams
+record first-token latency, and `cost_micros` stays `null` until pricing
+configuration exists (the column and contract field are ready). Dashboards
+should treat `null` as "not measured yet", not zero.
 
 ## 6. Production mode
 

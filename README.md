@@ -359,7 +359,13 @@ layer (`internal/model`) that both protocols translate through:
   `/admin/policies`, `/admin/audit`, `/admin/usage`,
   `/admin/management-log`, and the audited
   `POST /admin/models/{name}/enable|disable` switch, all behind the admin
-  token and metadata-only by construction.
+  token and metadata-only by construction. The toggle commits the mutation
+  and its audit record in one transaction and refreshes the running
+  catalog/routes immediately — no restart; a post-commit refresh failure is
+  reported as `refresh_failed` with the audit evidence intact. Provider
+  views carry live breaker/health state and a recent error summary; usage
+  views carry error rate and true percentiles (first-token latency and cost
+  are staged contract fields that stay `null` until recorded).
 
 Docs: `docs/developer-quickstart.md` (mock provider setup, examples),
 `docs/api-versioning.md` (compatibility, deprecation, flags),
@@ -389,4 +395,11 @@ the automated smoke tests run).
 go test ./...   # all package tests
 go vet ./...
 go build ./...
+go run ./cmd/replay   # offline protocol replay over the checked-in fixtures
 ```
+
+`cmd/replay` runs the deterministic provider fixtures through the real
+adapters — mock-provider fixtures directly, and OpenAI/Anthropic fixtures
+through a canned stub transport — asserting the normalized responses and
+stream events. It performs no network I/O and needs no API keys. Custom
+fixture directories: `go run ./cmd/replay -dir <path>`.
