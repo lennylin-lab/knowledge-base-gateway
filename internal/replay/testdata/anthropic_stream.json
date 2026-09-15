@@ -1,0 +1,18 @@
+{
+  "name": "anthropic/stream-text",
+  "provider": "anthropic",
+  "upstream": {
+    "status": 200,
+    "headers": {"Content-Type": "text/event-stream"},
+    "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"up-model\",\"usage\":{\"input_tokens\":5}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"he\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"y\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+  },
+  "request": {
+    "upstream_model": "up-model",
+    "input": [{"role": "user", "text": "hello"}],
+    "stream": true
+  },
+  "expect": {
+    "events": ["created", "text_delta", "text_delta", "text_done", "completed"],
+    "stream_text": "hey"
+  }
+}

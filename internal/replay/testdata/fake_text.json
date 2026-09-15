@@ -1,0 +1,14 @@
+{
+  "name": "fake/text-echo",
+  "provider": "fake",
+  "request": {
+    "upstream_model": "echo-model",
+    "input": [{"role": "user", "text": "hello"}]
+  },
+  "expect": {
+    "status": "completed",
+    "text": "echo: hello",
+    "finish_reason": "stop",
+    "usage_known": true
+  }
+}

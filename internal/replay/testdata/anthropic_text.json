@@ -1,0 +1,18 @@
+{
+  "name": "anthropic/text-and-usage",
+  "provider": "anthropic",
+  "upstream": {
+    "status": 200,
+    "body": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[{\"type\":\"text\",\"text\":\"hello world\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}"
+  },
+  "request": {
+    "upstream_model": "up-model",
+    "input": [{"role": "user", "text": "hello"}]
+  },
+  "expect": {
+    "status": "completed",
+    "text": "hello world",
+    "finish_reason": "stop",
+    "usage_known": true
+  }
+}

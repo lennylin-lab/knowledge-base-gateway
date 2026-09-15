@@ -1,0 +1,15 @@
+{
+  "name": "anthropic/5xx-maps-to-server",
+  "provider": "anthropic",
+  "upstream": {
+    "status": 500,
+    "body": ""
+  },
+  "request": {
+    "upstream_model": "up-model",
+    "input": [{"role": "user", "text": "hello"}]
+  },
+  "expect": {
+    "error_class": "server"
+  }
+}

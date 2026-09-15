@@ -1,0 +1,19 @@
+{
+  "name": "fake/structured-output",
+  "provider": "fake",
+  "request": {
+    "upstream_model": "echo-model",
+    "input": [{"role": "user", "text": "hi"}],
+    "response_format": {
+      "mode": "json_schema",
+      "name": "answer",
+      "schema": {"type": "object", "properties": {"echo": {"type": "string"}}, "required": ["echo"]},
+      "strict": true
+    }
+  },
+  "expect": {
+    "status": "completed",
+    "text": "{\"echo\":\"hi\"}",
+    "finish_reason": "stop"
+  }
+}

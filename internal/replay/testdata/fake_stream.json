@@ -1,0 +1,13 @@
+{
+  "name": "fake/stream-text",
+  "provider": "fake",
+  "request": {
+    "upstream_model": "echo-model",
+    "input": [{"role": "user", "text": "hello world"}],
+    "stream": true
+  },
+  "expect": {
+    "events": ["created", "text_delta", "text_delta", "text_delta", "text_done", "completed"],
+    "stream_text": "echo: hello world"
+  }
+}

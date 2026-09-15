@@ -1,0 +1,15 @@
+{
+  "name": "fake/tool-call",
+  "provider": "fake",
+  "request": {
+    "upstream_model": "echo-model",
+    "input": [{"role": "user", "text": "weather?"}],
+    "tools": [{"name": "get_weather", "description": "look up weather", "parameters": {"type": "object"}}]
+  },
+  "expect": {
+    "status": "completed",
+    "tool_name": "get_weather",
+    "tool_args": "{\"input\":\"weather?\"}",
+    "finish_reason": "tool_calls"
+  }
+}

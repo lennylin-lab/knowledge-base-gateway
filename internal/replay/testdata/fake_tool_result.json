@@ -1,0 +1,16 @@
+{
+  "name": "fake/tool-result-round-trip",
+  "provider": "fake",
+  "request": {
+    "upstream_model": "echo-model",
+    "input": [
+      {"role": "user", "text": "weather?"},
+      {"tool_result": {"call_id": "call_fake_1", "content": "sunny 22C"}}
+    ]
+  },
+  "expect": {
+    "status": "completed",
+    "text": "tool ok: sunny 22C",
+    "finish_reason": "stop"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "fake/refusal",
+  "provider": "fake",
+  "request": {
+    "upstream_model": "echo-model",
+    "input": [{"role": "user", "text": "/refuse this request"}]
+  },
+  "expect": {
+    "status": "completed",
+    "refusal": "I cannot help with that request.",
+    "finish_reason": "stop"
+  }
+}
