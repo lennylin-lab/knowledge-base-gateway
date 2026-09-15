@@ -1,0 +1,6 @@
+{"file":"docs/v1.2-developer-platform-roadmap.md","reason":"A7/A8/A9/A10 management, replay, and verification acceptance criteria"}
+{"file":"docs/developer-quickstart.md","reason":"Mock provider and developer example behavior used by replay/smoke checks"}
+{"file":"docs/api-versioning.md","reason":"Public/admin contract and staged behavior documentation"}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Transactional PostgreSQL management mutation guidance"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Management redaction and metadata-only audit rules"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Tooling, tests, and final quality gate expectations"}

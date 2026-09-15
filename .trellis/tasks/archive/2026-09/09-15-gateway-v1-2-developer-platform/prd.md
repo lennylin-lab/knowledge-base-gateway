@@ -1,22 +1,3 @@
-# Implement V1.2 unified protocol and developer platform
-
-## Goal
-
-Implement the V1.2 unified model protocol, tool calling, structured output, discovery, management queries, and developer platform defined in docs/v1.2-developer-platform-roadmap.md
-
-## Requirements
-
-- TBD
-
-## Acceptance Criteria
-
-- [ ] TBD
-
-## Notes
-
-- Keep `prd.md` focused on requirements, constraints, and acceptance criteria.
-- Lightweight tasks can remain PRD-only.
-- For complex tasks, add `design.md` for technical design and `implement.md` for execution planning before `task.py start`.
 # PRD: V1.2 Unified Model Protocol and Developer Platform
 
 ## Goal

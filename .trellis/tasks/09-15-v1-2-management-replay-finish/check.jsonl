@@ -1,0 +1,6 @@
+{"file":"docs/v1.2-developer-platform-roadmap.md","reason":"Management/replay/final verification acceptance source"}
+{"file":"docs/api-versioning.md","reason":"Documentation consistency for staged admin fields"}
+{"file":"docs/developer-quickstart.md","reason":"Replay/smoke compatibility review"}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Atomic database mutation review"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Public issue and management redaction review"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Full validation gate review"}
