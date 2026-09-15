@@ -1,0 +1,6 @@
+{"file":"docs/v1.2-developer-platform-roadmap.md","reason":"A4/A7/A8/A10 limits, routing, and security acceptance criteria"}
+{"file":"docs/v1.1-production-roadmap.md","reason":"V1.1 routing reliability, SSRF, and production safety baseline"}
+{"file":"docs/agent-start.md","reason":"Provider URL boundary and client compatibility principles"}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"PostgreSQL policy loading and migration conventions"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Before-provider rejection and stable error behavior"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Concurrency, race, and focused regression test expectations"}

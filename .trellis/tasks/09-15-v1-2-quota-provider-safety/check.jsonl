@@ -1,0 +1,5 @@
+{"file":"docs/v1.2-developer-platform-roadmap.md","reason":"Input limits, routing, and safety acceptance verification"}
+{"file":"docs/v1.1-production-roadmap.md","reason":"Provider routing and SSRF hardening check"}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Migration/store review for max_input_tokens plumbing"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"No-provider-call and stable error verification"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Race/concurrency and full Go validation checks"}
