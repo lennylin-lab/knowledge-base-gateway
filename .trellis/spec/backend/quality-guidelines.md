@@ -204,7 +204,9 @@ defer; never rely on the service being empty.
 
 ### Convention: Failover routing stays behind interfaces
 
-**What**: Provider failover (primary/backup route table + circuit breaker in `internal/router`) is selected before any provider call; streaming never switches providers after output starts; retries stay bounded under the total request deadline.
+**What**: Provider failover (primary/backup route table + circuit breaker in `internal/router`) is selected before any provider call; streaming never switches providers after output starts; retries stay bounded under the total request deadline. Route breaker permits are taken lazily, one per attempt (`AdmitRoute` immediately before the provider call, `Record` immediately after); `Resolve` builds the plan permit-free via `EnabledRoutes`.
 
-**Why**: Lets fault tests (`internal/gateway/failover_test.go`) pin the semantics and keeps vendor protocols isolated in `internal/provider`.
+**Why**: Taking permits upfront orphaned half-open permits — a request that stopped at the primary permanently wedged the backup's recovery probe (failsafe-go has no permit release; faking a Record for an unattempted route would corrupt probe semantics). All-open breakers now reject at execution time with the same 503 `no_route_available` envelope and zero provider traffic.
+
+**Why**: Lets fault tests (`internal/gateway/failover_test.go`, `halfopen_probe_test.go`) pin the semantics and keeps vendor protocols isolated in `internal/provider`.
 

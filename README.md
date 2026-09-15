@@ -109,6 +109,11 @@ masquerade as a 429.
 Per-subject budgets configured in `access_policies` are enforced before any
 provider invocation:
 
+- **Input ceilings**: `max_input_tokens` (per subject) and the model's
+  declared `context_tokens` cap the deterministic input estimate
+  (`message content chars / 4`). Requests above either ceiling are rejected
+  with 400 `invalid_request` before rate limiting, quota reservation, or any
+  provider call. `NULL`/`0` means unset.
 - **Periods**: UTC calendar day and UTC calendar month, tracked
   independently. `NULL` or `0` means that period is unlimited; subjects with
   no budget configured keep the pre-quota behavior. Counters are keyed by
@@ -164,7 +169,7 @@ environment only and are never persisted, logged, or echoed in errors.
 | `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
 | `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | – | Anthropic credentials (env only) |
-| `GATEWAY_ALLOW_INSECURE_BASE_URLS` | `false` | Allow `http://` provider base URLs (development only) |
+| `GATEWAY_ALLOW_INSECURE_BASE_URLS` | `false` | Development only: allow `http://` provider base URLs and loopback/private IP-literal hosts (e.g. `127.0.0.1`). Restricted IP destinations (link-local/cloud metadata, multicast, unspecified) stay rejected in every mode |
 
 ### Admin API
 
@@ -180,11 +185,16 @@ Token-gated (`Authorization: Bearer $GATEWAY_ADMIN_TOKEN`):
 Public models route through `model_routes` (priority order) to a primary and
 a backup provider. Circuit breakers (failsafe-go) track consecutive failures
 per route, admit exactly one half-open probe after a cool-down, and recover
-via successful probes. Retries remain finite and deadline-bounded with
+via successful probes; while every route is open, no traffic is admitted —
+breakers are never bypassed. Route permits are taken per attempt, so a
+request that stops at the primary can never consume the backup's recovery
+probe. Retries remain finite and deadline-bounded with
 exponential backoff and jitter between attempts (cenkalti/backoff), only for
 pre-output network/429/5xx/timeout failures; streaming never switches
 providers once output has reached the client. Provider base URLs are validated
-at startup against SSRF rules (https only unless explicitly allowed).
+at startup against SSRF rules (https only unless explicitly allowed; unsafe
+IP destinations such as loopback, private, link-local/metadata, multicast,
+and unspecified addresses are rejected outside explicit local development).
 
 ### Metrics
 
