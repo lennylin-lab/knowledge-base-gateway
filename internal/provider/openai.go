@@ -340,6 +340,7 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 		finish      string
 		usage       *model.Usage
 		textEmitted bool // whether any text delta was emitted
+		sawDone     bool // whether the upstream sent its [DONE] terminator
 	)
 	emitErr := func(e model.Event) error {
 		if err := emit(e); err != nil {
@@ -360,6 +361,7 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 		}
 		payload := bytes.TrimSpace(line[len("data:"):])
 		if bytes.Equal(payload, []byte("[DONE]")) {
+			sawDone = true
 			break
 		}
 		if len(payload) == 0 {
@@ -424,6 +426,15 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return &Error{Class: ClassNetwork, Msg: "upstream stream read failed"}
+	}
+	// Cancellation surfaces as a timeout-class failure, never as truncation.
+	if ctx.Err() != nil {
+		return &Error{Class: ClassTimeout, Msg: "request canceled or deadline exceeded"}
+	}
+	// A clean EOF without the [DONE] terminator is a truncated stream, not a
+	// completion: fail instead of emitting done/completed events.
+	if !sawDone {
+		return &Error{Class: ClassNetwork, Msg: "upstream stream ended without [DONE]"}
 	}
 
 	// Close argument accumulators and assemble the final domain response.

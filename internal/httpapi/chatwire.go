@@ -8,6 +8,7 @@ package httpapi
 import (
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
@@ -97,7 +98,9 @@ func encodeChatCompletion(resp model.Response) chatCompletionOut {
 
 // chatStreamEncoder converts domain events into chat.completion.chunk SSE
 // payloads, preserving the V1 framing: each event is one "data: {...}" line
-// and the caller terminates with "data: [DONE]".
+// and the caller terminates with "data: [DONE]". It also assembles exactly
+// what was delivered so the handler can run deterministic final-output
+// validation over the stream.
 type chatStreamEncoder struct {
 	w       io.Writer
 	flusher http.Flusher
@@ -106,6 +109,12 @@ type chatStreamEncoder struct {
 	created int64
 	model   string
 	usage   *model.Usage
+	finish  string
+
+	text      strings.Builder
+	toolArgs  map[int]*strings.Builder
+	toolOrder []int
+	toolMeta  map[int]*model.ToolCall
 
 	openTools map[int]*chatToolCall
 	toolSeen  bool
@@ -113,11 +122,35 @@ type chatStreamEncoder struct {
 }
 
 func newChatStreamEncoder(w io.Writer, flusher http.Flusher) *chatStreamEncoder {
-	return &chatStreamEncoder{w: w, flusher: flusher, openTools: map[int]*chatToolCall{}}
+	return &chatStreamEncoder{
+		w: w, flusher: flusher,
+		openTools: map[int]*chatToolCall{},
+		toolArgs:  map[int]*strings.Builder{},
+		toolMeta:  map[int]*model.ToolCall{},
+	}
 }
 
 // SawOutput reports whether any chunk reached the client.
 func (e *chatStreamEncoder) SawOutput() bool { return e.sawOutput }
+
+// FinalResponse assembles the streamed output for deterministic final
+// validation. It reflects exactly what was delivered to the client: text from
+// the deltas, tool calls from the assembled argument fragments.
+func (e *chatStreamEncoder) FinalResponse() model.Response {
+	out := model.Response{
+		ID: e.id, Created: e.created, Model: e.model,
+		Status: model.StatusCompleted, FinishReason: e.finish, Usage: e.usage,
+	}
+	if t := e.text.String(); t != "" {
+		out.Output = append(out.Output, model.OutputItem{Kind: model.OutputText, Text: t})
+	}
+	for _, idx := range e.toolOrder {
+		if call := e.toolMeta[idx]; call != nil {
+			out.Output = append(out.Output, model.OutputItem{Kind: model.OutputToolCall, ToolCall: call})
+		}
+	}
+	return out
+}
 
 // Handle writes one domain event as zero or more SSE data chunks.
 func (e *chatStreamEncoder) Handle(ev model.Event) error {
@@ -131,9 +164,17 @@ func (e *chatStreamEncoder) Handle(ev model.Event) error {
 		}
 		return nil
 	case model.EventTextDelta:
+		e.text.WriteString(ev.Delta)
 		return e.writeChunk(&chatMessageOut{Role: model.RoleAssistant, Content: ev.Delta}, "")
 	case model.EventArgsDelta:
 		idx := ev.ToolIndex
+		acc, ok := e.toolArgs[idx]
+		if !ok {
+			acc = &strings.Builder{}
+			e.toolArgs[idx] = acc
+			e.toolOrder = append(e.toolOrder, idx)
+		}
+		acc.WriteString(ev.Delta)
 		tc, open := e.openTools[idx]
 		if !open {
 			tc = &chatToolCall{Type: "function", Index: &idx}
@@ -150,6 +191,21 @@ func (e *chatStreamEncoder) Handle(ev model.Event) error {
 		frag.Function.Arguments = ev.Delta
 		return e.writeChunk(&chatMessageOut{Role: model.RoleAssistant, ToolCalls: []chatToolCall{frag}}, "")
 	case model.EventArgsDone:
+		// Record the assembled call for final output validation. The
+		// adapter-assembled payload is authoritative when present; otherwise
+		// the accumulated fragments are.
+		assembled := ""
+		if acc, ok := e.toolArgs[ev.ToolIndex]; ok {
+			assembled = acc.String()
+		}
+		call := ev.ToolCall
+		if call == nil {
+			call = &model.ToolCall{}
+		}
+		if call.Arguments != "" {
+			assembled = call.Arguments
+		}
+		e.toolMeta[ev.ToolIndex] = &model.ToolCall{ID: call.ID, Name: call.Name, Arguments: assembled}
 		delete(e.openTools, ev.ToolIndex)
 		return nil
 	case model.EventTextDone, model.EventFailed:
@@ -159,12 +215,14 @@ func (e *chatStreamEncoder) Handle(ev model.Event) error {
 		if ev.Response != nil {
 			finish = ev.Response.FinishReason
 		}
+		e.finish = finish
 		if finish == "" {
 			if e.toolSeen {
 				finish = model.FinishToolCalls
 			} else {
 				finish = model.FinishStop
 			}
+			e.finish = finish
 		}
 		// Final V1 chunk: empty delta, finish reason.
 		return e.writeChunk(&chatMessageOut{}, finish)

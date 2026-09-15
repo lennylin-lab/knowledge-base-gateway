@@ -135,6 +135,7 @@ type responsesStreamEncoder struct {
 	publicModel string
 	requestID   string
 	metadata    json.RawMessage
+	req         model.Request // domain request backing final-output validation
 
 	// stream state
 	sawOutput bool
@@ -142,21 +143,33 @@ type responsesStreamEncoder struct {
 	text      strings.Builder
 	args      map[int]*strings.Builder
 	callMeta  map[int]*model.ToolCall
+	callOrder []int
+	// validationErr records a final-output validation failure (invalid
+	// streamed tool arguments or structured-output violation). Built-in
+	// adapters wrap emit errors as internal transport failures, so the
+	// ErrOutputValidation sentinel cannot cross the provider boundary; the
+	// handler reads the recorded failure from here for audit classification.
+	validationErr error
 
 	// assembled stream results
 	head  model.Response
 	final model.Response
 }
 
-func newResponsesStreamEncoder(w io.Writer, flusher http.Flusher, publicModel, requestID string, metadata json.RawMessage) *responsesStreamEncoder {
+func newResponsesStreamEncoder(w io.Writer, flusher http.Flusher, publicModel, requestID string, metadata json.RawMessage, req model.Request) *responsesStreamEncoder {
 	return &responsesStreamEncoder{
-		w: w, flusher: flusher, publicModel: publicModel, requestID: requestID, metadata: metadata,
+		w: w, flusher: flusher, publicModel: publicModel, requestID: requestID, metadata: metadata, req: req,
 		args: map[int]*strings.Builder{}, callMeta: map[int]*model.ToolCall{},
 	}
 }
 
 // SawOutput reports whether any event reached the client.
 func (e *responsesStreamEncoder) SawOutput() bool { return e.sawOutput }
+
+// ValidationErr returns the recorded final-output validation failure, if any.
+// The handler must prefer it over the Stream error for audit classification,
+// because adapters re-wrap emit errors as internal transport failures.
+func (e *responsesStreamEncoder) ValidationErr() error { return e.validationErr }
 
 // Response returns the assembled final response (valid after completed).
 func (e *responsesStreamEncoder) Response() model.Response { return e.final }
@@ -209,11 +222,17 @@ func (e *responsesStreamEncoder) Handle(ev model.Event) error {
 		}
 		if err := model.ValidateToolCallArguments(assembled); err != nil {
 			// Incomplete or invalid streamed JSON is an explicit protocol
-			// error: emit response.failed and stop the stream.
+			// error: emit response.failed and stop the stream. It is an
+			// output validation failure, so audit records it as
+			// schema_validation_failed.
+			e.validationErr = fmt.Errorf("%w: tool arguments: %v", model.ErrOutputValidation, err)
 			if werr := e.WriteFailed("invalid_tool_arguments"); werr != nil {
 				return werr
 			}
-			return fmt.Errorf("%w: tool arguments: %v", model.ErrValidation, err)
+			return e.validationErr
+		}
+		if _, seen := e.callMeta[ev.ToolIndex]; !seen {
+			e.callOrder = append(e.callOrder, ev.ToolIndex)
 		}
 		e.callMeta[ev.ToolIndex] = &model.ToolCall{ID: callIDOf(call), Name: nameOf(call), Arguments: assembled}
 		return e.write("response.function_call_arguments.done", responsesEvent{
@@ -230,7 +249,19 @@ func (e *responsesStreamEncoder) Handle(ev model.Event) error {
 		} else {
 			e.final = e.head
 		}
-		obj := e.completedObject()
+		final := e.assembledFinal()
+		// Final streamed output must carry valid tool arguments and satisfy
+		// the requested structured-output spec; otherwise the stream
+		// terminates in response.failed and is never marked completed.
+		if verr := model.ValidateOutput(e.req, final); verr != nil {
+			e.validationErr = fmt.Errorf("%w: %v", model.ErrOutputValidation, verr)
+			if werr := e.WriteFailed("schema_validation_failed"); werr != nil {
+				return werr
+			}
+			return e.validationErr
+		}
+		e.final = final
+		obj := encodeResponse(e.responseID(), e.publicModel, final, e.metadata)
 		return e.write("response.completed", responsesEvent{Type: "response.completed", Response: &obj})
 	case model.EventFailed:
 		return nil // terminal failures are emitted by the caller via WriteFailed
@@ -256,22 +287,25 @@ func (e *responsesStreamEncoder) responseID() string {
 	return "resp_" + e.requestID
 }
 
-// completedObject builds the final public response from the assembled stream
-// state, independent of which adapter produced it.
-func (e *responsesStreamEncoder) completedObject() responseObject {
+// assembledFinal builds the final domain response from the assembled stream
+// state, independent of which adapter produced it. When the adapter's terminal
+// response lacks items (defensive; built-in adapters include them), output is
+// rebuilt deterministically: text first, then tool calls in first-appearance
+// order.
+func (e *responsesStreamEncoder) assembledFinal() model.Response {
 	resp := e.final
-	// Rebuild output from assembled state when the adapter's terminal
-	// response lacks items (defensive; built-in adapters include them).
 	if len(resp.Output) == 0 {
 		if t := e.text.String(); t != "" {
 			resp.Output = append(resp.Output, model.OutputItem{Kind: model.OutputText, Text: t})
 		}
-		for _, call := range e.callMeta {
-			resp.Output = append(resp.Output, model.OutputItem{Kind: model.OutputToolCall, ToolCall: call})
+		for _, idx := range e.callOrder {
+			if call := e.callMeta[idx]; call != nil {
+				resp.Output = append(resp.Output, model.OutputItem{Kind: model.OutputToolCall, ToolCall: call})
+			}
 		}
 	}
 	resp.Model = e.head.Model
-	return encodeResponse(e.responseID(), e.publicModel, resp, e.metadata)
+	return resp
 }
 
 // WriteFailed emits the unified response.failed terminal event. It is used
@@ -297,6 +331,8 @@ func failedMessage(code string) string {
 		return "the upstream is temporarily unavailable"
 	case "invalid_tool_arguments":
 		return "streamed tool arguments did not assemble to valid JSON"
+	case "schema_validation_failed":
+		return "streamed output did not satisfy the requested structured-output specification"
 	default:
 		return "the request failed"
 	}

@@ -278,7 +278,15 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admiss
 
 	enc := newChatStreamEncoder(w, flusher)
 	providerName, err := h.Service.Stream(r.Context(), adm.plan, preq, enc.Handle)
+	auditErr := error(nil)
 	if err == nil {
+		// Final output validation: invalid streamed tool arguments or
+		// structured output are recorded in audit, never silently marked
+		// successful. The V1 transport has no post-output failure event, so
+		// the delivered chunks keep their [DONE] terminator.
+		if verr := model.ValidateOutput(preq, enc.FinalResponse()); verr != nil {
+			auditErr = verr
+		}
 		// Terminal event only on normal completion.
 		if _, werr := io.WriteString(w, "data: [DONE]\n\n"); werr == nil {
 			flusher.Flush()
@@ -289,7 +297,11 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admiss
 		// because the consumed usage is unknown and never fabricated.
 		adm.qres.Release()
 	}
-	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, enc.SawOutput()), err, adm.attempts(), nil, true, start)
+	recordErr := err
+	if recordErr == nil {
+		recordErr = auditErr
+	}
+	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, enc.SawOutput()), recordErr, adm.attempts(), nil, true, start)
 	if err != nil && !enc.SawOutput() {
 		// Nothing was sent yet: emit a normalized SSE error event.
 		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"type\":\"%s\",\"request_id\":%q}}\n\n", errorType(err), requestID)

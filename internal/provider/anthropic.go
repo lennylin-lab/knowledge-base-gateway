@@ -203,6 +203,11 @@ func (a *Anthropic) do(ctx context.Context, req model.Request, stream bool) (*ht
 
 // --- Non-streaming ---------------------------------------------------------
 
+type anthropicUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
 type anthropicResponse struct {
 	ID      string `json:"id"`
 	Type    string `json:"type"`
@@ -216,10 +221,9 @@ type anthropicResponse struct {
 	} `json:"content"`
 	Model      string `json:"model"`
 	StopReason string `json:"stop_reason"`
-	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	// Usage is a pointer so an upstream response without a usage object stays
+	// unknown instead of being normalized into fabricated zero tokens.
+	Usage *anthropicUsage `json:"usage"`
 }
 
 // Complete performs a non-streaming Messages call normalized to the domain
@@ -254,11 +258,13 @@ func (a *Anthropic) Complete(ctx context.Context, req model.Request) (model.Resp
 	if out.FinishReason == model.FinishLength {
 		out.Status = model.StatusIncomplete
 	}
-	out.Usage = &model.Usage{
-		PromptTokens:     wire.Usage.InputTokens,
-		CompletionTokens: wire.Usage.OutputTokens,
-		TotalTokens:      wire.Usage.InputTokens + wire.Usage.OutputTokens,
-		Known:            true,
+	if wire.Usage != nil {
+		out.Usage = &model.Usage{
+			PromptTokens:     wire.Usage.InputTokens,
+			CompletionTokens: wire.Usage.OutputTokens,
+			TotalTokens:      wire.Usage.InputTokens + wire.Usage.OutputTokens,
+			Known:            true,
+		}
 	}
 	return out, nil
 }
@@ -298,6 +304,7 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 		stop      string
 		inTokens  int
 		outTokens int
+		usageSeen bool // whether the upstream reported any usage object
 	)
 	emitErr := func(e model.Event) error {
 		if err := emit(e); err != nil {
@@ -353,11 +360,13 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 				Message struct {
 					ID    string `json:"id"`
 					Model string `json:"model"`
-					Usage struct {
+					// Pointer presence: a stream without usage objects must
+					// stay unknown rather than normalize to zero tokens.
+					Usage *struct {
 						InputTokens int `json:"input_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
-				Usage struct {
+				Usage *struct {
 					OutputTokens int `json:"output_tokens"`
 				} `json:"usage"`
 				Error struct {
@@ -370,7 +379,10 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 			switch evt.Type {
 			case "message_start":
 				head = model.Response{ID: evt.Message.ID, Model: evt.Message.Model}
-				inTokens = evt.Message.Usage.InputTokens
+				if evt.Message.Usage != nil {
+					inTokens = evt.Message.Usage.InputTokens
+					usageSeen = true
+				}
 				created := head
 				created.Status = "in_progress"
 				if err := emitErr(model.Event{Kind: model.EventCreated, Response: &created}); err != nil {
@@ -409,7 +421,10 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 				}
 			case "message_delta":
 				stop = evt.Delta.StopReason
-				outTokens = evt.Usage.OutputTokens
+				if evt.Usage != nil {
+					outTokens = evt.Usage.OutputTokens
+					usageSeen = true
+				}
 			case "message_stop":
 				if textOpen {
 					if err := emitErr(model.Event{Kind: model.EventTextDone, Text: text.String()}); err != nil {
@@ -422,9 +437,13 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 				if head.FinishReason == model.FinishLength {
 					head.Status = model.StatusIncomplete
 				}
-				head.Usage = &model.Usage{
-					PromptTokens: inTokens, CompletionTokens: outTokens,
-					TotalTokens: inTokens + outTokens, Known: true,
+				// Usage is surfaced only when the upstream actually reported
+				// it; absent usage stays unknown and is never fabricated zero.
+				if usageSeen {
+					head.Usage = &model.Usage{
+						PromptTokens: inTokens, CompletionTokens: outTokens,
+						TotalTokens: inTokens + outTokens, Known: true,
+					}
 				}
 				return emitErr(model.Event{Kind: model.EventCompleted, Response: &head})
 			case "error":

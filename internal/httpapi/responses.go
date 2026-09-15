@@ -9,6 +9,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -260,6 +261,13 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(principal, errValidation)
 		return
 	}
+	// Exactly one JSON document: a second concatenated document or any
+	// non-whitespace trailing bytes is rejected so a smuggled tail can never
+	// change request semantics.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		fail(principal, errValidation)
+		return
+	}
 	if req.Model == "" {
 		fail(principal, fmt.Errorf("%w: model is required", errValidation))
 		return
@@ -334,7 +342,7 @@ func (h *ResponsesHandler) stream(w http.ResponseWriter, r *http.Request, deps a
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	enc := newResponsesStreamEncoder(w, flusher, modelName, requestID, preq.Metadata)
+	enc := newResponsesStreamEncoder(w, flusher, modelName, requestID, preq.Metadata, preq)
 	providerName, err := h.Service.Stream(r.Context(), adm.plan, preq, enc.Handle)
 	// Snapshot output-before-failure: the unified failure event itself does
 	// not count as billable output.
@@ -349,8 +357,16 @@ func (h *ResponsesHandler) stream(w http.ResponseWriter, r *http.Request, deps a
 			adm.qres.Release()
 		}
 	}
+	// Audit the recorded output-validation failure rather than the Stream
+	// error: built-in adapters wrap emit errors as internal transport
+	// failures, so the ErrOutputValidation sentinel never crosses the
+	// provider boundary.
+	auditErr := err
+	if verr := enc.ValidationErr(); verr != nil {
+		auditErr = verr
+	}
 	streamed := enc.Response()
-	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, outputBeforeFailure), err, adm.attempts(), streamed.Usage, true, start)
+	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, outputBeforeFailure), auditErr, adm.attempts(), streamed.Usage, true, start)
 }
 
 // publicResponseID derives the gateway-owned response identifier. The

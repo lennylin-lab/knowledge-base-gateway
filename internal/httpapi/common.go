@@ -5,8 +5,8 @@ package httpapi
 // any body read:
 //
 //	authentication -> bounded decoding (caller) -> model/policy resolution
-//	-> capability precheck -> policy/model output clamps -> rate limit
-//	-> token quota reservation
+//	-> capability precheck -> tool/schema validation -> policy/model output
+//	clamps -> rate limit -> token quota reservation
 //
 // Invalid, expired, and revoked keys therefore receive their 401 before the
 // caller drives any bounded parse work. Denials never reach a provider and
@@ -114,12 +114,16 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 		return &admitted{}, gateway.ErrNotPermitted
 	}
 
-	// 2. Capability precheck: rejected features never reach a provider.
+	// 2. Capability + tool/schema precheck: rejected features and invalid
+	// tool inputs never reach a provider.
 	caps, ok := d.Service.Capabilities(publicModel)
 	if !ok {
 		return &admitted{}, gateway.ErrNoRoute
 	}
 	if err := model.CheckCapabilities(caps, protocol, *mreq); err != nil {
+		return &admitted{}, err
+	}
+	if err := model.ValidateTools(mreq.Tools, caps.MaxTools); err != nil {
 		return &admitted{}, err
 	}
 

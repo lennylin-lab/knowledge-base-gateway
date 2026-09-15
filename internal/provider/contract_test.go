@@ -187,6 +187,29 @@ func runContractSuite(t *testing.T, d dialect) {
 		}
 	})
 
+	t.Run(d.name+"/stream-truncated-without-terminal", func(t *testing.T) {
+		// An upstream stream that ends (clean EOF) without its protocol
+		// terminal marker is a truncation, not a completion: the adapter must
+		// return a transport-class failure and must never emit completed.
+		p := d.newProvider(t, d.handler("stream_truncated", nil))
+		var events []model.Event
+		err := p.Stream(context.Background(), sampleRequest(), func(e model.Event) error {
+			events = append(events, e)
+			return nil
+		})
+		if err == nil {
+			t.Fatal("stream ending without its terminal marker must fail")
+		}
+		if ClassOf(err) == ClassInternal {
+			t.Errorf("truncation must map to a transport failure class, got %v (%v)", ClassOf(err), err)
+		}
+		for _, e := range events {
+			if e.Kind == model.EventCompleted {
+				t.Fatal("truncated stream must not emit completed")
+			}
+		}
+	})
+
 	t.Run(d.name+"/tool-result-round-trip", func(t *testing.T) {
 		var body string
 		p := d.newProvider(t, d.handler("text_usage", &body))
@@ -399,6 +422,18 @@ func openAIHandler(scenario string, lastBody *string) http.HandlerFunc {
 				`{"id":"c","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"paris\"}"}}]}}]}`,
 				`{"id":"c","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
 			)
+		case "stream_truncated":
+			// Data chunks but no [DONE] terminator: a truncated stream.
+			w.Header().Set("Content-Type", "text/event-stream")
+			f := w.(http.Flusher)
+			for _, c := range []string{
+				`{"id":"c","choices":[{"delta":{"content":"he"}}]}`,
+				`{"id":"c","choices":[{"delta":{"content":"y"}}]}`,
+				`{"id":"c","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			} {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", c)
+				f.Flush()
+			}
 		case "tool_call":
 			fmt.Fprintf(w, `{"id":"cmpl-2","created":1700000001,"model":"up-model","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_9","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"paris\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`)
 		case "structured":
@@ -493,6 +528,13 @@ func anthropicHandler(scenario string, lastBody *string) http.HandlerFunc {
 				`{"type":"content_block_stop","index":0}`,
 				`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}`,
 				`{"type":"message_stop"}`,
+			)
+		case "stream_truncated":
+			// Events but no message_stop: a truncated stream.
+			anthropicSSE(w,
+				`{"type":"message_start","message":{"id":"msg_t","model":"up-model","usage":{"input_tokens":5}}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"he"}}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
 			)
 		case "tool_call":
 			fmt.Fprintf(w, `{"id":"msg_4","type":"message","role":"assistant","model":"up-model","content":[{"type":"tool_use","id":"call_9","name":"get_weather","input":{"city":"paris"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":2}}`)
