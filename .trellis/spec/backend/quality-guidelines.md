@@ -233,6 +233,25 @@ always-present fields that stay `null` (cost, first-token latency) — stable
 names so dashboards detect availability, `null` means "not measured", never
 fabricated zero.
 
+### Convention: Decoder compatibility is additive, never weaker
+
+**What**: Strict request decoding (`DisallowUnknownFields`, single JSON
+document, trailing-byte rejection) stays at the outer boundary. When a real
+SDK is verified against the API and sends standard shapes the decoder
+rejected (e.g. openai-python 3.5.0's flat Responses tool object and
+`text.format`), accept those shapes via dedicated wire types with their own
+inner `DisallowUnknownFields`, pinned by tests that prove: both dialects
+decode, unknown inner fields still 400, conflicting spellings 400, and zero
+provider calls on decode failure.
+
+**Why**: The compatibility pass (openai-python 3.5.0) showed SDKs strip unset
+parameters — incompatibilities come from shape dialects, not injected fields;
+relaxing the outer boundary would have traded real validation for nothing.
+
+**Boundary**: Every accepted shape must be documented in
+`docs/api-versioning.md` with the verified SDK version, and the pass matrix
+re-run live before release.
+
 ### Convention: Failover routing stays behind interfaces
 
 **What**: Provider failover (primary/backup route table + circuit breaker in `internal/router`) is selected before any provider call; streaming never switches providers after output starts; retries stay bounded under the total request deadline. Route breaker permits are taken lazily, one per attempt (`AdmitRoute` immediately before the provider call, `Record` immediately after); `Resolve` builds the plan permit-free via `EnabledRoutes`.
