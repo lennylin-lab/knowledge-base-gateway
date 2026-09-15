@@ -161,3 +161,27 @@ Closed the last deferred observation: cmd/migrate's fatal("connect: %v") could e
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: V1.2 unified protocol and developer platform
+<!-- trellis-session: v=2 fp=f6477cfde0a1b307 -->
+
+**Date**: 2026-09-15
+**Task**: V1.2 unified protocol and developer platform
+**Branch**: `v1.2`
+
+### Summary
+
+Implemented the V1.2 developer platform on branch v1.2 (base master): unified provider-neutral domain layer (internal/model) and provider boundary with an offline shared contract suite for both adapters plus a deterministic fake mock provider; POST /v1/responses with SSE event protocol and gateway-owned IDs; GET /v1/models discovery with caller-filtered capability/limit metadata; admin management endpoints (audit query with P50/P95 usage aggregates, model/provider/policy views, management-audited enable/disable) backed by internal/mgmt and PostgreSQL; migration 0003 (llm_requests.protocol, capability declarations, admin_audit). V1/V1.1 wire compatibility locked by golden fixtures. Review found and the follow-up fixed an auth-after-decode ordering regression (401 must precede any body read) — auth is now structurally outside the shared admission pipeline and pinned by auth_order_test.go; check also fixed non-compiling Python SDK examples and a missing config-default assertion. Validation: 15/15 packages pass under -race with env-gated tests zero-skip against real PostgreSQL/Redis (migration to version 3 up/down verified), container smoke green including /v1/models and /v1/responses phases. Deferred: Anthropic structured output stays catalog-gated until a translation exists; SDK compatibility pass with a real openai-python install; streaming usage not yet settled into quotas (conservative reservation retained).
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `af0d60a` | feat: add unified model protocol, discovery, and management platform |
+| `a09111b` | docs: add v1.2 quickstart, api versioning, examples, and smoke phases |
+| `556b5e7` | docs: capture v1.2 pipeline and fixture conventions in backend specs |
+
+### Status
+
+[OK] **Completed**
