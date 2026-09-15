@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
@@ -100,7 +101,8 @@ func encodeChatCompletion(resp model.Response) chatCompletionOut {
 // payloads, preserving the V1 framing: each event is one "data: {...}" line
 // and the caller terminates with "data: [DONE]". It also assembles exactly
 // what was delivered so the handler can run deterministic final-output
-// validation over the stream.
+// validation over the stream, and timestamps the first output delta for the
+// first-token latency audit field.
 type chatStreamEncoder struct {
 	w       io.Writer
 	flusher http.Flusher
@@ -119,6 +121,9 @@ type chatStreamEncoder struct {
 	openTools map[int]*chatToolCall
 	toolSeen  bool
 	sawOutput bool
+	// firstOutputAt timestamps the first text/args delta (the first model
+	// output token), not the created event.
+	firstOutputAt time.Time
 }
 
 func newChatStreamEncoder(w io.Writer, flusher http.Flusher) *chatStreamEncoder {
@@ -132,6 +137,16 @@ func newChatStreamEncoder(w io.Writer, flusher http.Flusher) *chatStreamEncoder 
 
 // SawOutput reports whether any chunk reached the client.
 func (e *chatStreamEncoder) SawOutput() bool { return e.sawOutput }
+
+// FirstTokenMillis reports the elapsed milliseconds from start to the first
+// output delta (text or args), or nil when no output delta reached the client.
+func (e *chatStreamEncoder) FirstTokenMillis(start time.Time) *int64 {
+	if e.firstOutputAt.IsZero() {
+		return nil
+	}
+	ms := e.firstOutputAt.Sub(start).Milliseconds()
+	return &ms
+}
 
 // FinalResponse assembles the streamed output for deterministic final
 // validation. It reflects exactly what was delivered to the client: text from
@@ -164,9 +179,15 @@ func (e *chatStreamEncoder) Handle(ev model.Event) error {
 		}
 		return nil
 	case model.EventTextDelta:
+		if e.firstOutputAt.IsZero() {
+			e.firstOutputAt = time.Now()
+		}
 		e.text.WriteString(ev.Delta)
 		return e.writeChunk(&chatMessageOut{Role: model.RoleAssistant, Content: ev.Delta}, "")
 	case model.EventArgsDelta:
+		if e.firstOutputAt.IsZero() {
+			e.firstOutputAt = time.Now()
+		}
 		idx := ev.ToolIndex
 		acc, ok := e.toolArgs[idx]
 		if !ok {
@@ -214,6 +235,12 @@ func (e *chatStreamEncoder) Handle(ev model.Event) error {
 		finish := ""
 		if ev.Response != nil {
 			finish = ev.Response.FinishReason
+			// Usage reported on the terminal event (OpenAI final usage chunk,
+			// Anthropic message_delta) attaches here; a created-event usage
+			// (fake) is only overridden by an actually-reported one.
+			if ev.Response.Usage != nil {
+				e.usage = ev.Response.Usage
+			}
 		}
 		e.finish = finish
 		if finish == "" {

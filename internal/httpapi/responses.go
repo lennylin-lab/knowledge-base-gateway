@@ -235,7 +235,7 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fail := func(principal auth.Principal, err error) {
 		mapError(w, requestID, err)
-		h.record(deps, requestID, traceID, principal, "", "", 0, err, 1, nil, false, start)
+		h.record(deps, requestID, traceID, principal, "", "", 0, err, 1, nil, false, start, nil)
 	}
 
 	// 1. Authentication before anything else — and before any body read — so
@@ -295,19 +295,23 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.stream(w, r, deps, requestID, traceID, principal, adm, req.Model, mreq, start)
 }
 
-func (h *ResponsesHandler) auditEvent(requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time) audit.Event {
+// auditEvent assembles the metadata-only audit record. firstTokenMillis is
+// the stream time-to-first-output measurement; non-streaming requests pass
+// nil (their full-latency equivalent is LatencyMillis).
+func (h *ResponsesHandler) auditEvent(requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time, firstTokenMillis *int64) audit.Event {
 	return audit.Event{
 		RequestID: requestID, SubjectID: principal.SubjectID, KeyID: principal.KeyID,
 		Model: modelName, Provider: providerName, Status: status,
 		ErrorClass: classifyErr(err), LatencyMillis: time.Since(start).Milliseconds(),
 		PromptTokens: usageTokens(usage, true), CompletionTokens: usageTokens(usage, false),
-		Streaming: streaming, CreatedAt: start, TraceID: traceID,
+		FirstTokenMillis: firstTokenMillis,
+		Streaming:        streaming, CreatedAt: start, TraceID: traceID,
 		RouteAttempts: routeAttempts, Protocol: "responses",
 	}
 }
 
-func (h *ResponsesHandler) record(deps admissionDeps, requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time) {
-	recordRequest(deps, h.auditEvent(requestID, traceID, principal, modelName, providerName, status, err, routeAttempts, usage, streaming, start), usage)
+func (h *ResponsesHandler) record(deps admissionDeps, requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time, firstTokenMillis *int64) {
+	recordRequest(deps, h.auditEvent(requestID, traceID, principal, modelName, providerName, status, err, routeAttempts, usage, streaming, start, firstTokenMillis), usage)
 }
 
 func (h *ResponsesHandler) complete(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
@@ -315,7 +319,7 @@ func (h *ResponsesHandler) complete(w http.ResponseWriter, r *http.Request, deps
 	if err != nil {
 		adm.qres.Release()
 		mapError(w, requestID, err)
-		h.record(deps, requestID, traceID, principal, modelName, providerName, 0, err, adm.attempts(), nil, false, start)
+		h.record(deps, requestID, traceID, principal, modelName, providerName, 0, err, adm.attempts(), nil, false, start, nil)
 		return
 	}
 	adm.qres.Settle(usageTotal(resp.Usage))
@@ -327,7 +331,7 @@ func (h *ResponsesHandler) complete(w http.ResponseWriter, r *http.Request, deps
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(encodeResponse(publicResponseID(resp, requestID), modelName, resp, preq.Metadata))
-	h.record(deps, requestID, traceID, principal, modelName, providerName, http.StatusOK, auditErr, adm.attempts(), resp.Usage, false, start)
+	h.record(deps, requestID, traceID, principal, modelName, providerName, http.StatusOK, auditErr, adm.attempts(), resp.Usage, false, start, nil)
 }
 
 func (h *ResponsesHandler) stream(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
@@ -347,13 +351,22 @@ func (h *ResponsesHandler) stream(w http.ResponseWriter, r *http.Request, deps a
 	// Snapshot output-before-failure: the unified failure event itself does
 	// not count as billable output.
 	outputBeforeFailure := enc.SawOutput()
-	if err != nil {
+	var usage *model.Usage
+	if err == nil {
+		streamed := enc.Response()
+		usage = streamed.Usage
+		// Settle exactly once to the reported stream total (idempotent
+		// finalize); unknown usage keeps the conservative reservation.
+		adm.qres.Settle(usageTotal(usage))
+	} else {
 		// Unified failure event: emitted as the first event when nothing was
 		// sent yet, or as a terminal event when the stream truncated.
 		_ = enc.WriteFailed(errorType(err))
 		if !outputBeforeFailure {
 			// Nothing reached the client before the failure: refund the
-			// reservation idempotently.
+			// reservation idempotently. Truncations after output keep the
+			// conservative reservation; the consumed usage is unknown and
+			// never fabricated.
 			adm.qres.Release()
 		}
 	}
@@ -365,8 +378,7 @@ func (h *ResponsesHandler) stream(w http.ResponseWriter, r *http.Request, deps a
 	if verr := enc.ValidationErr(); verr != nil {
 		auditErr = verr
 	}
-	streamed := enc.Response()
-	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, outputBeforeFailure), auditErr, adm.attempts(), streamed.Usage, true, start)
+	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, outputBeforeFailure), auditErr, adm.attempts(), usage, true, start, enc.FirstTokenMillis(start))
 }
 
 // publicResponseID derives the gateway-owned response identifier. The

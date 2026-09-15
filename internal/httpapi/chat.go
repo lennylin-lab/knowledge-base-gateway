@@ -170,7 +170,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fail := func(principal auth.Principal, err error) {
 		mapError(w, requestID, err)
-		h.record(deps, requestID, traceID, principal, "", "", 0, err, 1, nil, false, start)
+		h.record(deps, requestID, traceID, principal, "", "", 0, err, 1, nil, false, start, nil)
 	}
 
 	// 1. Authentication before anything else — and before any body read — so
@@ -221,20 +221,23 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.stream(w, r, deps, requestID, traceID, principal, adm, req.Model, mreq, start)
 }
 
-// auditEvent assembles the metadata-only audit record.
-func (h *ChatHandler) auditEvent(requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time) audit.Event {
+// auditEvent assembles the metadata-only audit record. firstTokenMillis is
+// the stream time-to-first-output measurement; non-streaming requests pass
+// nil (their full-latency equivalent is LatencyMillis).
+func (h *ChatHandler) auditEvent(requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time, firstTokenMillis *int64) audit.Event {
 	return audit.Event{
 		RequestID: requestID, SubjectID: principal.SubjectID, KeyID: principal.KeyID,
 		Model: modelName, Provider: providerName, Status: status,
 		ErrorClass: classifyErr(err), LatencyMillis: time.Since(start).Milliseconds(),
 		PromptTokens: usageTokens(usage, true), CompletionTokens: usageTokens(usage, false),
-		Streaming: streaming, CreatedAt: start, TraceID: traceID,
+		FirstTokenMillis: firstTokenMillis,
+		Streaming:        streaming, CreatedAt: start, TraceID: traceID,
 		RouteAttempts: routeAttempts, Protocol: "chat",
 	}
 }
 
-func (h *ChatHandler) record(deps admissionDeps, requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time) {
-	recordRequest(deps, h.auditEvent(requestID, traceID, principal, modelName, providerName, status, err, routeAttempts, usage, streaming, start), usage)
+func (h *ChatHandler) record(deps admissionDeps, requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time, firstTokenMillis *int64) {
+	recordRequest(deps, h.auditEvent(requestID, traceID, principal, modelName, providerName, status, err, routeAttempts, usage, streaming, start, firstTokenMillis), usage)
 }
 
 func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
@@ -243,7 +246,7 @@ func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, deps admi
 		// No billable response: refund the reservation idempotently.
 		adm.qres.Release()
 		mapError(w, requestID, err)
-		h.record(deps, requestID, traceID, principal, modelName, providerName, 0, err, adm.attempts(), nil, false, start)
+		h.record(deps, requestID, traceID, principal, modelName, providerName, 0, err, adm.attempts(), nil, false, start, nil)
 		return
 	}
 	// Settle exactly once to the reported total; unknown usage keeps the
@@ -260,7 +263,7 @@ func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, deps admi
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(encodeChatCompletion(resp))
-	h.record(deps, requestID, traceID, principal, modelName, providerName, http.StatusOK, auditErr, adm.attempts(), resp.Usage, false, start)
+	h.record(deps, requestID, traceID, principal, modelName, providerName, http.StatusOK, auditErr, adm.attempts(), resp.Usage, false, start, nil)
 }
 
 func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
@@ -279,12 +282,19 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admiss
 	enc := newChatStreamEncoder(w, flusher)
 	providerName, err := h.Service.Stream(r.Context(), adm.plan, preq, enc.Handle)
 	auditErr := error(nil)
+	var usage *model.Usage
 	if err == nil {
+		final := enc.FinalResponse()
+		usage = final.Usage
+		// Settle exactly once to the reported stream total (idempotent
+		// finalize); unknown usage keeps the conservative reservation —
+		// Settle(nil) is a deliberate no-op.
+		adm.qres.Settle(usageTotal(usage))
 		// Final output validation: invalid streamed tool arguments or
 		// structured output are recorded in audit, never silently marked
 		// successful. The V1 transport has no post-output failure event, so
 		// the delivered chunks keep their [DONE] terminator.
-		if verr := model.ValidateOutput(preq, enc.FinalResponse()); verr != nil {
+		if verr := model.ValidateOutput(preq, final); verr != nil {
 			auditErr = verr
 		}
 		// Terminal event only on normal completion.
@@ -301,7 +311,7 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admiss
 	if recordErr == nil {
 		recordErr = auditErr
 	}
-	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, enc.SawOutput()), recordErr, adm.attempts(), nil, true, start)
+	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, enc.SawOutput()), recordErr, adm.attempts(), usage, true, start, enc.FirstTokenMillis(start))
 	if err != nil && !enc.SawOutput() {
 		// Nothing was sent yet: emit a normalized SSE error event.
 		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"type\":\"%s\",\"request_id\":%q}}\n\n", errorType(err), requestID)

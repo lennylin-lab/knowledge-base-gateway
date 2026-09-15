@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
@@ -144,6 +145,9 @@ type responsesStreamEncoder struct {
 	args      map[int]*strings.Builder
 	callMeta  map[int]*model.ToolCall
 	callOrder []int
+	// firstOutputAt timestamps the first output delta (text or args) for the
+	// first-token latency audit field.
+	firstOutputAt time.Time
 	// validationErr records a final-output validation failure (invalid
 	// streamed tool arguments or structured-output violation). Built-in
 	// adapters wrap emit errors as internal transport failures, so the
@@ -165,6 +169,16 @@ func newResponsesStreamEncoder(w io.Writer, flusher http.Flusher, publicModel, r
 
 // SawOutput reports whether any event reached the client.
 func (e *responsesStreamEncoder) SawOutput() bool { return e.sawOutput }
+
+// FirstTokenMillis reports the elapsed milliseconds from start to the first
+// output delta (text or args), or nil when no output delta reached the client.
+func (e *responsesStreamEncoder) FirstTokenMillis(start time.Time) *int64 {
+	if e.firstOutputAt.IsZero() {
+		return nil
+	}
+	ms := e.firstOutputAt.Sub(start).Milliseconds()
+	return &ms
+}
 
 // ValidationErr returns the recorded final-output validation failure, if any.
 // The handler must prefer it over the Stream error for audit classification,
@@ -188,6 +202,9 @@ func (e *responsesStreamEncoder) Handle(ev model.Event) error {
 		}, e.metadata)
 		return e.write("response.created", responsesEvent{Type: "response.created", Response: &obj})
 	case model.EventTextDelta:
+		if e.firstOutputAt.IsZero() {
+			e.firstOutputAt = time.Now()
+		}
 		e.text.WriteString(ev.Delta)
 		return e.write("response.output_text.delta", responsesEvent{
 			Type: "response.output_text.delta", ItemID: "msg_0",
@@ -199,6 +216,9 @@ func (e *responsesStreamEncoder) Handle(ev model.Event) error {
 			OutputIndex: intPtr(0), ContentIndex: intPtr(0), Text: ev.Text,
 		})
 	case model.EventArgsDelta:
+		if e.firstOutputAt.IsZero() {
+			e.firstOutputAt = time.Now()
+		}
 		acc, ok := e.args[ev.ToolIndex]
 		if !ok {
 			acc = &strings.Builder{}

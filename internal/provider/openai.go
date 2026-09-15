@@ -81,6 +81,13 @@ type openaiWireJSONSchema struct {
 	Strict bool            `json:"strict,omitempty"`
 }
 
+// openaiWireStreamOptions requests token usage on streaming responses. The
+// upstream then appends one final chunk with empty choices carrying usage;
+// upstreams that ignore the option leave usage unknown (never fabricated).
+type openaiWireStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type openaiWireResponseFormat struct {
 	Type       string                `json:"type"`
 	JSONSchema *openaiWireJSONSchema `json:"json_schema,omitempty"`
@@ -92,6 +99,7 @@ type openaiWireRequest struct {
 	Temperature    *float64                  `json:"temperature,omitempty"`
 	MaxTokens      *int                      `json:"max_tokens,omitempty"`
 	Stream         bool                      `json:"stream,omitempty"`
+	StreamOptions  *openaiWireStreamOptions  `json:"stream_options,omitempty"`
 	Tools          []openaiWireTool          `json:"tools,omitempty"`
 	ToolChoice     any                       `json:"tool_choice,omitempty"`
 	ResponseFormat *openaiWireResponseFormat `json:"response_format,omitempty"`
@@ -173,6 +181,11 @@ func specName(name string) string {
 func (o *OpenAI) do(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
 	wire := translateRequest(req)
 	wire.Stream = stream
+	if stream {
+		// Ask the upstream to append a final usage chunk so streams can settle
+		// quota to the reported total; absence stays unknown downstream.
+		wire.StreamOptions = &openaiWireStreamOptions{IncludeUsage: true}
+	}
 	body, err := json.Marshal(wire)
 	if err != nil {
 		return nil, &Error{Class: ClassInternal, Msg: "encode request"}
@@ -379,6 +392,15 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 				return err
 			}
 		}
+		// Parse the usage payload before the choices check: with
+		// stream_options.include_usage the final usage chunk carries empty
+		// choices, and skipping it would lose the reported usage.
+		if chunk.Usage != nil {
+			usage = &model.Usage{
+				PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens,
+				TotalTokens: chunk.Usage.TotalTokens, Known: true,
+			}
+		}
 		if len(chunk.Choices) == 0 {
 			continue
 		}
@@ -416,12 +438,6 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 		}
 		if chunk.Choices[0].FinishReason != nil && *chunk.Choices[0].FinishReason != "" {
 			finish = *chunk.Choices[0].FinishReason
-		}
-		if chunk.Usage != nil {
-			usage = &model.Usage{
-				PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens,
-				TotalTokens: chunk.Usage.TotalTokens, Known: true,
-			}
 		}
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
