@@ -150,6 +150,41 @@ func TestOpenAIStreamUsageSurfaces(t *testing.T) {
 	}
 }
 
+// TestOpenAIStreamRequestsIncludeUsage pins the outbound stream shape: stream
+// requests must ask the upstream for usage via stream_options.include_usage
+// (so quota can settle to the reported total), and non-streaming requests
+// must stay unchanged.
+func TestOpenAIStreamRequestsIncludeUsage(t *testing.T) {
+	var streamBody map[string]any
+	p := upstreamServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&streamBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + `{"id":"c","choices":[{"delta":{"content":"he"}}]}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+	emit := func(e model.Event) error { return nil }
+	if err := p.Stream(context.Background(), model.Request{Model: "m", Input: []model.InputItem{{Role: "user", Text: "x"}}}, emit); err != nil {
+		t.Fatal(err)
+	}
+	so, _ := streamBody["stream_options"].(map[string]any)
+	if so == nil || so["include_usage"] != true {
+		t.Errorf("stream request must set stream_options.include_usage, got %v", streamBody["stream_options"])
+	}
+	if streamBody["stream"] != true {
+		t.Errorf("stream request must set stream=true, got %v", streamBody["stream"])
+	}
+
+	var completeBody map[string]any
+	p2 := upstreamServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&completeBody)
+		w.WriteHeader(http.StatusTeapot)
+	})
+	_, _ = p2.Complete(context.Background(), model.Request{Model: "m", Input: []model.InputItem{{Role: "user", Text: "x"}}})
+	if _, ok := completeBody["stream_options"]; ok {
+		t.Errorf("non-streaming request must not set stream_options, got %v", completeBody["stream_options"])
+	}
+}
+
 func TestOpenAIUpstreamTimeout(t *testing.T) {
 	p := upstreamServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(300 * time.Millisecond)

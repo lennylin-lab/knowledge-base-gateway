@@ -261,6 +261,133 @@ func runContractSuite(t *testing.T, d dialect) {
 		}
 	})
 
+	t.Run(d.name+"/structured-output-finish-stop", func(t *testing.T) {
+		// An unwrapped structured-output result is a JSON payload, not a tool
+		// call: it must finish as stop and never surface the synthesized tool.
+		if !d.caps.StructuredOutput {
+			t.Skip("adapter does not translate structured output")
+		}
+		p := d.newProvider(t, d.handler("structured", nil))
+		req := sampleRequest()
+		req.ResponseSpec = &model.ResponseSpec{
+			Mode: model.ModeJSONSchema, Name: "answer",
+			Schema: json.RawMessage(`{"type":"object","properties":{"echo":{"type":"string"}},"required":["echo"]}`),
+		}
+		resp, err := p.Complete(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.ToolCalls()) != 0 {
+			t.Errorf("synthesized tool must not surface as a tool call: %+v", resp)
+		}
+		if resp.FinishReason != model.FinishStop {
+			t.Errorf("finish = %q, want stop for an unwrapped structured result", resp.FinishReason)
+		}
+	})
+
+	t.Run(d.name+"/stream-structured-output", func(t *testing.T) {
+		if !d.caps.StructuredOutput {
+			t.Skip("adapter does not translate structured output")
+		}
+		p := d.newProvider(t, d.handler("stream_structured", nil))
+		req := sampleRequest()
+		req.ResponseSpec = &model.ResponseSpec{
+			Mode: model.ModeJSONSchema, Name: "answer",
+			Schema: json.RawMessage(`{"type":"object","properties":{"echo":{"type":"string"}},"required":["echo"]}`),
+		}
+		var events []model.Event
+		err := p.Stream(context.Background(), req, func(e model.Event) error {
+			events = append(events, e)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var text strings.Builder
+		deltas := 0
+		var completed *model.Response
+		for _, e := range events {
+			switch e.Kind {
+			case model.EventTextDelta:
+				deltas++
+				text.WriteString(e.Delta)
+			case model.EventArgsDelta, model.EventArgsDone:
+				t.Errorf("structured output must stream as text, not tool args: %v", e.Kind)
+			case model.EventCompleted:
+				completed = e.Response
+			}
+		}
+		if deltas < 2 {
+			t.Errorf("text deltas = %d, want >=2", deltas)
+		}
+		if completed == nil {
+			t.Fatal("stream must complete")
+		}
+		if len(completed.ToolCalls()) != 0 {
+			t.Errorf("synthesized tool must not surface as a tool call: %+v", completed)
+		}
+		if completed.FinishReason == model.FinishToolCalls {
+			t.Errorf("unwrapped structured stream must not finish as tool_calls")
+		}
+		if err := model.ValidateOutput(req, *completed); err != nil {
+			t.Errorf("streamed structured output invalid: %v", err)
+		}
+		if completed.Text() != text.String() {
+			t.Errorf("completed text = %q, want assembled %q", completed.Text(), text.String())
+		}
+		if text.String() != d.structured {
+			t.Errorf("assembled structured text = %q, want %q", text.String(), d.structured)
+		}
+	})
+
+	t.Run(d.name+"/stream-usage-present", func(t *testing.T) {
+		// A stream whose upstream reports usage must complete with known usage
+		// carrying the reported values, so quota can settle to the total.
+		p := d.newProvider(t, d.handler("stream_usage", nil))
+		var completed *model.Response
+		err := p.Stream(context.Background(), sampleRequest(), func(e model.Event) error {
+			if e.Kind == model.EventCompleted {
+				completed = e.Response
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if completed == nil || completed.Usage == nil || !completed.Usage.Known {
+			t.Fatalf("usage-reported stream must complete with known usage: %+v", completed)
+		}
+		if completed.Usage.PromptTokens != d.usagePrompt || completed.Usage.CompletionTokens != d.usageCompletion {
+			t.Errorf("usage = %+v, want prompt %d completion %d", completed.Usage, d.usagePrompt, d.usageCompletion)
+		}
+		if completed.Usage.TotalTokens != d.usagePrompt+d.usageCompletion {
+			t.Errorf("total tokens = %d", completed.Usage.TotalTokens)
+		}
+	})
+
+	t.Run(d.name+"/stream-usage-absent", func(t *testing.T) {
+		// A stream without any upstream usage object completes with unknown
+		// usage; the conservative quota reservation is retained downstream and
+		// the adapter must never fabricate zero tokens.
+		p := d.newProvider(t, d.handler("stream_no_usage", nil))
+		var completed *model.Response
+		err := p.Stream(context.Background(), sampleRequest(), func(e model.Event) error {
+			if e.Kind == model.EventCompleted {
+				completed = e.Response
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if completed == nil {
+			t.Fatal("stream must complete")
+		}
+		if completed.Usage != nil {
+			t.Fatalf("absent stream usage must stay unknown, got %+v", completed.Usage)
+		}
+	})
+
 	t.Run(d.name+"/unsupported-capability-rejected", func(t *testing.T) {
 		p := d.newProvider(t, d.handler("unused", nil))
 		caps := p.Capabilities("up-model")
@@ -422,6 +549,29 @@ func openAIHandler(scenario string, lastBody *string) http.HandlerFunc {
 				`{"id":"c","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"paris\"}"}}]}}]}`,
 				`{"id":"c","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
 			)
+		case "stream_usage":
+			// With stream_options.include_usage the final usage chunk arrives
+			// after the finish chunk with empty choices.
+			sse(w,
+				`{"id":"c","choices":[{"delta":{"content":"he"}}]}`,
+				`{"id":"c","choices":[{"delta":{"content":"y"}}]}`,
+				`{"id":"c","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+				`{"id":"c","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`,
+			)
+		case "stream_no_usage":
+			// An upstream that ignores include_usage sends no usage chunk:
+			// usage must stay unknown.
+			sse(w,
+				`{"id":"c","choices":[{"delta":{"content":"he"}}]}`,
+				`{"id":"c","choices":[{"delta":{"content":"y"}}]}`,
+				`{"id":"c","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			)
+		case "stream_structured":
+			sse(w,
+				`{"id":"c","choices":[{"delta":{"content":"{\"echo"}}]}`,
+				`{"id":"c","choices":[{"delta":{"content":"\":\"x\"}"}}]}`,
+				`{"id":"c","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			)
 		case "stream_truncated":
 			// Data chunks but no [DONE] terminator: a truncated stream.
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -490,7 +640,8 @@ func anthropicDialect() dialect {
 		},
 		handler: anthropicHandler,
 		caps: model.Capabilities{
-			Chat: true, Responses: true, Stream: true, Tools: true, Usage: true,
+			Chat: true, Responses: true, Stream: true, Tools: true,
+			StructuredOutput: true, Usage: true,
 		},
 		usagePrompt: 5, usageCompletion: 2,
 		text:       "hello world",
@@ -536,14 +687,45 @@ func anthropicHandler(scenario string, lastBody *string) http.HandlerFunc {
 				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"he"}}`,
 				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
 			)
+		case "stream_usage":
+			// Usage arrives on the terminal message_delta, as the Messages API
+			// reports it.
+			anthropicSSE(w,
+				`{"type":"message_start","message":{"id":"msg_u1","model":"up-model","usage":{"input_tokens":5}}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"he"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"y"}}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+				`{"type":"message_stop"}`,
+			)
+		case "stream_no_usage":
+			// No usage object anywhere in the stream: usage must stay unknown.
+			anthropicSSE(w,
+				`{"type":"message_start","message":{"id":"msg_u2","model":"up-model"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"he"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"y"}}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+				`{"type":"message_stop"}`,
+			)
+		case "stream_structured":
+			// The forced structured_output tool streams its input as
+			// input_json_delta fragments; the adapter must unwrap them as the
+			// JSON result text.
+			anthropicSSE(w,
+				`{"type":"message_start","message":{"id":"msg_s2","model":"up-model","usage":{"input_tokens":5}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_so","name":"structured_output"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"echo"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\":\"x\"}"}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}`,
+				`{"type":"message_stop"}`,
+			)
 		case "tool_call":
 			fmt.Fprintf(w, `{"id":"msg_4","type":"message","role":"assistant","model":"up-model","content":[{"type":"tool_use","id":"call_9","name":"get_weather","input":{"city":"paris"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":2}}`)
 		case "structured":
-			// Structured output is not translatable for this adapter; the
-			// request never reaches a meaningful upstream call in production
-			// because the precheck rejects it. The mock still returns text so
-			// the suite can assert the adapter-level guard.
-			fmt.Fprintf(w, `{"id":"msg_5","type":"message","role":"assistant","model":"up-model","content":[{"type":"text","text":"{\"echo\":\"x\"}"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}`)
+			// With the synthesized forced-tool translation the upstream answers
+			// with a tool_use block for structured_output carrying the JSON
+			// result as its input; the adapter must unwrap it as text.
+			fmt.Fprintf(w, `{"id":"msg_5","type":"message","role":"assistant","model":"up-model","content":[{"type":"tool_use","id":"call_so","name":"structured_output","input":{"echo":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":2}}`)
 		case "status_400":
 			w.WriteHeader(http.StatusBadRequest)
 		case "status_401":

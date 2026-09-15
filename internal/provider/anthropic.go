@@ -37,12 +37,14 @@ func NewAnthropic(baseURL, apiKey string) *Anthropic {
 func (a *Anthropic) Name() string { return "anthropic" }
 
 // Capabilities reports the adapter-level matrix for the Messages API. JSON
-// mode and JSON-Schema structured output have no Messages API equivalent the
-// adapter can translate, so they stay off; the capability precheck rejects
-// such requests before routing.
+// mode has no Messages API equivalent the adapter can translate, so it stays
+// off; JSON-Schema structured output is translated to the synthesized
+// forced-tool pattern. The capability precheck rejects unsupported requests
+// before routing.
 func (a *Anthropic) Capabilities(string) model.Capabilities {
 	return model.Capabilities{
-		Chat: true, Responses: true, Stream: true, Tools: true, Usage: true,
+		Chat: true, Responses: true, Stream: true, Tools: true,
+		StructuredOutput: true, Usage: true,
 		ContextTokens: 200_000, MaxOutputTokens: 8_192, MaxTools: model.DefaultMaxTools,
 	}
 }
@@ -72,8 +74,15 @@ type anthropicTool struct {
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
+// structuredToolName is the synthesized tool that carries a JSON-Schema
+// structured-output request: its input_schema is the request schema and the
+// upstream is forced to call it. The tool input is unwrapped as the JSON
+// result so downstream validation is protocol-independent.
+const structuredToolName = "structured_output"
+
 type anthropicToolChoice struct {
-	Type string `json:"type"` // auto | any | none
+	Type string `json:"type"` // auto | any | none | tool
+	Name string `json:"name,omitempty"`
 }
 
 type anthropicRequest struct {
@@ -168,12 +177,28 @@ func (a *Anthropic) do(ctx context.Context, req model.Request, stream bool) (*ht
 	case "required":
 		body.ToolChoice = &anthropicToolChoice{Type: "any"}
 	}
-	// The Messages API has no JSON-mode or JSON-schema response format the
-	// adapter could translate; those capabilities are declared false and the
-	// precheck rejects them before routing. A spec that still arrives here is
+	// Structured output translates to the standard forced-tool pattern: the
+	// request schema becomes a synthesized structured_output tool and
+	// tool_choice forces it, so the tool input is the JSON result. JSON mode
+	// has no Messages API translation; the capability stays false and the
+	// precheck rejects it before routing — a spec that still arrives here is
 	// an internal invariant violation and is rejected without a provider call.
 	if req.ResponseSpec != nil {
-		return nil, fmt.Errorf("%w: structured_output", model.ErrCapabilityNotSupported)
+		switch req.ResponseSpec.Mode {
+		case model.ModeJSONSchema:
+			schema := req.ResponseSpec.Schema
+			if len(schema) == 0 {
+				schema = json.RawMessage(`{"type":"object"}`)
+			}
+			body.Tools = append(body.Tools, anthropicTool{
+				Name:        structuredToolName,
+				Description: "Produce the response as JSON matching this schema exactly.",
+				InputSchema: schema,
+			})
+			body.ToolChoice = &anthropicToolChoice{Type: "tool", Name: structuredToolName}
+		default:
+			return nil, fmt.Errorf("%w: json_mode", model.ErrCapabilityNotSupported)
+		}
 	}
 
 	raw, err := json.Marshal(body)
@@ -241,6 +266,7 @@ func (a *Anthropic) Complete(ctx context.Context, req model.Request) (model.Resp
 	var out model.Response
 	out.ID = wire.ID
 	out.Model = wire.Model
+	structuredUnwrapped := false
 	for _, c := range wire.Content {
 		switch c.Type {
 		case "text":
@@ -248,12 +274,24 @@ func (a *Anthropic) Complete(ctx context.Context, req model.Request) (model.Resp
 				out.Output = append(out.Output, model.OutputItem{Kind: model.OutputText, Text: c.Text})
 			}
 		case "tool_use":
+			// The synthesized structured_output tool's input IS the JSON
+			// result: unwrap it as text output, never a tool call.
+			if req.ResponseSpec != nil && c.Name == structuredToolName {
+				out.Output = append(out.Output, model.OutputItem{Kind: model.OutputText, Text: string(c.Input)})
+				structuredUnwrapped = true
+				continue
+			}
 			out.Output = append(out.Output, model.OutputItem{Kind: model.OutputToolCall, ToolCall: &model.ToolCall{
 				ID: c.ID, Name: c.Name, Arguments: string(c.Input),
 			}})
 		}
 	}
 	out.FinishReason = finishFromStop(wire.StopReason)
+	if structuredUnwrapped && out.FinishReason == model.FinishToolCalls && len(out.ToolCalls()) == 0 {
+		// The stop reason names the forced tool, not a caller tool: the
+		// unwrapped JSON payload is a plain result, so finish as stop.
+		out.FinishReason = model.FinishStop
+	}
 	out.Status = model.StatusCompleted
 	if out.FinishReason == model.FinishLength {
 		out.Status = model.StatusIncomplete
@@ -287,7 +325,10 @@ func finishFromStop(reason string) string {
 // Stream converts the Messages SSE stream into domain events: message_start
 // becomes created, text_delta/input_json_delta become text/argument deltas,
 // content_block_stop closes streamed tool calls, and message_stop completes
-// with joined usage.
+// with joined usage. A streamed structured_output tool block (synthesized by
+// the forced-tool translation) unwraps its input_json_delta fragments as text
+// deltas so the assembled JSON result is the output text, consistent with the
+// OpenAI/fake shapes.
 func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
 	resp, err := a.do(ctx, req, true)
 	if err != nil {
@@ -296,15 +337,16 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 	defer resp.Body.Close()
 
 	var (
-		head      model.Response
-		text      strings.Builder
-		textOpen  bool
-		tools     = map[int]*toolAccumulator{}
-		openTool  = -1 // currently open tool block index
-		stop      string
-		inTokens  int
-		outTokens int
-		usageSeen bool // whether the upstream reported any usage object
+		head       model.Response
+		text       strings.Builder
+		textOpen   bool
+		tools      = map[int]*toolAccumulator{}
+		structured = map[int]bool{} // structured_output blocks, unwrapped as text
+		openTool   = -1             // currently open tool block index
+		stop       string
+		inTokens   int
+		outTokens  int
+		usageSeen  bool // whether the upstream reported any usage object
 	)
 	emitErr := func(e model.Event) error {
 		if err := emit(e); err != nil {
@@ -391,6 +433,12 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 			case "content_block_start":
 				if evt.ContentBlock.Type == "tool_use" && evt.Index != nil {
 					idx := *evt.Index
+					if req.ResponseSpec != nil && evt.ContentBlock.Name == structuredToolName {
+						// The synthesized tool streams its input as the JSON
+						// result; its fragments become text deltas below.
+						structured[idx] = true
+						break
+					}
 					tools[idx] = &toolAccumulator{id: evt.ContentBlock.ID, name: evt.ContentBlock.Name}
 					openTool = idx
 				}
@@ -403,18 +451,27 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 						return err
 					}
 				case "input_json_delta":
-					if evt.Index != nil && evt.Delta.PartialJSON != "" {
-						idx := *evt.Index
-						if acc, ok := tools[idx]; ok {
-							acc.args.WriteString(evt.Delta.PartialJSON)
-							if err := emitErr(model.Event{Kind: model.EventArgsDelta, ToolIndex: idx, Delta: evt.Delta.PartialJSON}); err != nil {
-								return err
-							}
+					if evt.Index == nil || evt.Delta.PartialJSON == "" {
+						continue
+					}
+					idx := *evt.Index
+					if structured[idx] {
+						textOpen = true
+						text.WriteString(evt.Delta.PartialJSON)
+						if err := emitErr(model.Event{Kind: model.EventTextDelta, Delta: evt.Delta.PartialJSON}); err != nil {
+							return err
+						}
+						continue
+					}
+					if acc, ok := tools[idx]; ok {
+						acc.args.WriteString(evt.Delta.PartialJSON)
+						if err := emitErr(model.Event{Kind: model.EventArgsDelta, ToolIndex: idx, Delta: evt.Delta.PartialJSON}); err != nil {
+							return err
 						}
 					}
 				}
 			case "content_block_stop":
-				if evt.Index != nil {
+				if evt.Index != nil && !structured[*evt.Index] {
 					if err := closeTool(*evt.Index); err != nil {
 						return err
 					}
@@ -433,6 +490,11 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 					head.Output = append(head.Output, model.OutputItem{Kind: model.OutputText, Text: text.String()})
 				}
 				head.FinishReason = finishFromStop(stop)
+				if head.FinishReason == model.FinishToolCalls && len(structured) > 0 && len(head.ToolCalls()) == 0 {
+					// The stop reason named the unwrapped structured_output
+					// tool; the assembled JSON payload is a plain result.
+					head.FinishReason = model.FinishStop
+				}
 				head.Status = model.StatusCompleted
 				if head.FinishReason == model.FinishLength {
 					head.Status = model.StatusIncomplete

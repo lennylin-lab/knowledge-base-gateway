@@ -3,9 +3,11 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
@@ -120,32 +122,90 @@ func TestAnthropicWireRequestShape(t *testing.T) {
 	}
 }
 
-// TestAnthropicRejectsResponseSpec asserts the adapter-level guard for a
-// capability the Messages API translation cannot honor.
-func TestAnthropicRejectsResponseSpec(t *testing.T) {
+// TestAnthropicRejectsJSONMode asserts the adapter-level guard for the one
+// response mode the Messages API translation cannot honor. json_schema IS
+// translated (synthesized forced tool); json_object has no equivalent, the
+// capability stays false, and the precheck rejects it before routing — this
+// guard is defense in depth.
+func TestAnthropicRejectsJSONMode(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		t.Error("provider must not be called when the spec cannot be translated")
 	}))
 	defer srv.Close()
 	a := NewAnthropic(srv.URL, "secret")
 	req := model.Request{
-		Model: "claude-x",
-		Input: []model.InputItem{{Role: model.RoleUser, Text: "hi"}},
-		ResponseSpec: &model.ResponseSpec{
-			Mode:   model.ModeJSONSchema,
-			Schema: json.RawMessage(`{"type":"object"}`),
-		},
+		Model:        "claude-x",
+		Input:        []model.InputItem{{Role: model.RoleUser, Text: "hi"}},
+		ResponseSpec: &model.ResponseSpec{Mode: model.ModeJSON},
 	}
 	_, err := a.Complete(context.Background(), req)
 	if err == nil {
-		t.Fatal("structured output must be rejected by this adapter")
+		t.Fatal("json_mode must be rejected by this adapter")
 	}
-	if err.Error() == "" {
-		t.Fatal("error must be descriptive")
+	if !errors.Is(err, model.ErrCapabilityNotSupported) {
+		t.Fatalf("rejection must wrap model.ErrCapabilityNotSupported, got %v", err)
 	}
 }
 
-// TestAnthropicCompleteWithoutUsageIsUnknown pins R4/AC4: a non-streaming
+// TestAnthropicStructuredOutputForcedTool pins the structured-output
+// translation: the response schema becomes a synthesized structured_output
+// tool input_schema, tool_choice is forced to that tool, and caller tools are
+// preserved alongside it.
+func TestAnthropicStructuredOutputForcedTool(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":"msg_so","type":"message","role":"assistant","model":"claude-x","content":[{"type":"tool_use","id":"call_so","name":"structured_output","input":{"echo":"hi"}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":2}}`)
+	}))
+	defer srv.Close()
+	a := NewAnthropic(srv.URL, "secret")
+	schema := json.RawMessage(`{"type":"object","properties":{"echo":{"type":"string"}},"required":["echo"]}`)
+	resp, err := a.Complete(context.Background(), model.Request{
+		Model: "claude-x",
+		Input: []model.InputItem{{Role: model.RoleUser, Text: "hi"}},
+		Tools: []model.ToolDefinition{{Name: "get_weather", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		ResponseSpec: &model.ResponseSpec{
+			Mode: model.ModeJSONSchema, Name: "answer", Schema: schema,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %v, want the caller tool plus structured_output", got["tools"])
+	}
+	so, _ := tools[1].(map[string]any)
+	if so["name"] != "structured_output" {
+		t.Fatalf("synthesized tool missing: %v", so)
+	}
+	var gotSchema, wantSchema any
+	gotSchemaBytes, _ := json.Marshal(so["input_schema"])
+	_ = json.Unmarshal(gotSchemaBytes, &gotSchema)
+	_ = json.Unmarshal(schema, &wantSchema)
+	if !reflect.DeepEqual(gotSchema, wantSchema) {
+		t.Errorf("input_schema = %s, want the request schema %s", gotSchemaBytes, schema)
+	}
+	tc, _ := got["tool_choice"].(map[string]any)
+	if tc == nil || tc["type"] != "tool" || tc["name"] != "structured_output" {
+		t.Errorf("tool_choice must force structured_output: %v", got["tool_choice"])
+	}
+
+	// The tool input is unwrapped as the JSON result text, not a tool call.
+	if len(resp.ToolCalls()) != 0 {
+		t.Errorf("synthesized tool must not surface as a tool call: %+v", resp)
+	}
+	if resp.Text() != `{"echo":"hi"}` {
+		t.Errorf("text = %q, want the unwrapped tool input", resp.Text())
+	}
+	if resp.FinishReason != model.FinishStop {
+		t.Errorf("finish = %q, want stop", resp.FinishReason)
+	}
+}
+
+// TestAnthropicStreamWithoutUsageIsUnknown pins R4/AC4: a non-streaming
 // Messages response without a usage object leaves the domain usage unknown —
 // the adapter must not fabricate known zero usage (which would settle token
 // quota to zero and audit fabricated token counts).
