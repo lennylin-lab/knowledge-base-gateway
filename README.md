@@ -126,11 +126,13 @@ provider invocation:
   otherwise a conservative default of 4096 output tokens, plus roughly
   `message content chars / 4` input tokens. Provider-specific tokenizers are
   not used.
-- **Settle**: after a successful non-streaming response the reservation is
-  adjusted exactly once to the upstream-reported total token usage. If the
-  upstream reports no usage, the conservative reservation stays charged —
-  unknown usage is never fabricated as zero in enforcement, audit, or
-  metrics.
+- **Settle**: after a successful response the reservation is adjusted
+  exactly once to the upstream-reported total token usage — non-streaming
+  from the response usage, and streams from the reported stream usage
+  (OpenAI upstreams are asked with `stream_options.include_usage`; Anthropic
+  reports usage on `message_delta`). If the upstream reports no usage, the
+  conservative reservation stays charged — unknown usage is never fabricated
+  as zero in enforcement, audit, or metrics.
 - **Release**: requests that fail before any provider output (including
   client cancellation) get the reservation back idempotently.
 - **Atomicity**: multi-instance deployments (`GATEWAY_LIMITS_MODE=redis`)
@@ -348,7 +350,11 @@ layer (`internal/model`) that both protocols translate through:
 - **Structured output** — JSON mode and `json_schema` specs are validated
   (dialect, size, depth) before invocation; final output validation failures
   are recorded in audit as `schema_validation_failed` and never silently
-  treated as clean successes.
+  treated as clean successes. The Anthropic adapter translates
+  `json_schema` to the standard forced-tool pattern (synthesized
+  `structured_output` tool, forced tool choice) and unwraps the tool input
+  as the JSON result, non-streaming and streaming; JSON mode stays
+  OpenAI-only and is rejected per-model before invocation.
 - **Provider contract tests** — both built-in adapters (OpenAI-compatible,
   Anthropic) pass the same offline suite over a mock transport: text/usage,
   streaming deltas and assembly, tool calls and result round-trip, structured
@@ -364,8 +370,9 @@ layer (`internal/model`) that both protocols translate through:
   catalog/routes immediately — no restart; a post-commit refresh failure is
   reported as `refresh_failed` with the audit evidence intact. Provider
   views carry live breaker/health state and a recent error summary; usage
-  views carry error rate and true percentiles (first-token latency and cost
-  are staged contract fields that stay `null` until recorded).
+  views carry error rate, true percentiles, and first-token latency
+  percentiles over recorded streams (cost stays the staged `null` contract
+  field until a pricing decision lands).
 
 Docs: `docs/developer-quickstart.md` (mock provider setup, examples),
 `docs/api-versioning.md` (compatibility, deprecation, flags),
@@ -381,8 +388,14 @@ the automated smoke tests run).
   quotas are enforced via reserve-before-call / settle-after-response (see
   "Token quotas" above). A reservation whose outcome was never finalized
   (e.g. a crashed process) stays charged until the UTC period rolls over.
-  Streaming usage is not parsed today, so admitted streams keep their
-  conservative reservation.
+  Streams settle to the upstream-reported usage when one is reported;
+  streams without reported usage keep their conservative reservation.
+- **First-token latency** is recorded for streams as the time to the first
+  output event (`llm_requests.first_token_millis`, nullable); non-streaming
+  requests record NULL (their full-latency equivalent is `latency_ms`).
+  `/admin/usage` reports true first-token percentiles in PostgreSQL mode;
+  development mode omits the fields. `cost_micros` remains the staged
+  always-null contract field until real pricing data exists.
 - **Local limiter** is development-only and per-process; multi-instance
   deployments must use `GATEWAY_LIMITS_MODE=redis` (readiness gates this).
   The token-quota gate follows the same mode.

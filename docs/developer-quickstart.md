@@ -127,11 +127,12 @@ trail. Error classes only — never error bodies.
 and latency percentiles. In PostgreSQL mode `p50_latency_ms` and
 `p95_latency_ms` are true percentiles over the queried window; development
 mode (in-memory audit) reports a mean under the same field names, which is
-why it is dev-only. Two metric groups from the roadmap are staged, not
-faked: `first_token_p50_ms` / `first_token_p95_ms` stay `null` until streams
-record first-token latency, and `cost_micros` stays `null` until pricing
-configuration exists (the column and contract field are ready). Dashboards
-should treat `null` as "not measured yet", not zero.
+why it is dev-only. `first_token_p50_ms` / `first_token_p95_ms` are true
+percentiles in PostgreSQL mode over the streams that recorded first-token
+latency (non-streaming requests record none); development mode omits them
+(null) rather than approximating. `cost_micros` remains staged: pricing
+configuration does not exist yet, so it stays `null` and is never fabricated.
+Dashboards should treat `null` as "not measured yet", not zero.
 
 ## 6. Production mode
 

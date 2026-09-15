@@ -28,7 +28,9 @@ Non-streaming: OpenAI-compatible `chat.completion` JSON with `id`, `object`,
 `created`, `model`, `choices`, and `usage` when the upstream reports it.
 
 Streaming: `Content-Type: text/event-stream`, standard `data: {...}` chunks
-(`chat.completion.chunk`), terminated by `data: [DONE]`. If the stream fails
+(`chat.completion.chunk`), terminated by `data: [DONE]`. Chunks carry `usage`
+when the upstream reports it for the stream (typically the final chunk), the
+same `usage` object as non-streaming. If the stream fails
 before any chunk was emitted, a final SSE event carries
 `{"error":{"type":"...","request_id":"..."}}`.
 
