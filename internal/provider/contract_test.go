@@ -156,11 +156,20 @@ func runContractSuite(t *testing.T, d dialect) {
 		var args strings.Builder
 		deltas, done := 0, 0
 		var completed *model.Response
+		firstDeltaSeen := false
 		for _, e := range events {
 			switch e.Kind {
 			case model.EventArgsDelta:
 				deltas++
 				args.WriteString(e.Delta)
+				if !firstDeltaSeen {
+					firstDeltaSeen = true
+					// The opening fragment carries the call identity so
+					// streaming clients can dispatch by name/id.
+					if e.ToolCall == nil || e.ToolCall.ID == "" || e.ToolCall.Name != d.toolName {
+						t.Errorf("first args delta must carry call identity, got %+v", e.ToolCall)
+					}
+				}
 			case model.EventArgsDone:
 				done++
 				if e.ToolCall == nil || e.ToolCall.Name != d.toolName {

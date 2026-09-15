@@ -417,17 +417,27 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 			if tc.Index != nil {
 				idx = *tc.Index
 			}
+			fresh := false
 			acc, ok := tools[idx]
 			if !ok {
 				acc = &toolAccumulator{}
 				tools[idx] = acc
 				toolOrder = append(toolOrder, idx)
+				fresh = true
 			}
 			if tc.ID != "" {
 				acc.id = tc.ID
 			}
 			if tc.Function.Name != "" {
 				acc.name = tc.Function.Name
+			}
+			if fresh {
+				// Opening delta carries the call identity so clients can
+				// dispatch by name before any argument fragment arrives.
+				if err := emitErr(model.Event{Kind: model.EventArgsDelta, ToolIndex: idx,
+					ToolCall: &model.ToolCall{ID: acc.id, Name: acc.name}}); err != nil {
+					return err
+				}
 			}
 			if tc.Function.Arguments != "" {
 				acc.args.WriteString(tc.Function.Arguments)

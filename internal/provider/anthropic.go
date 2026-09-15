@@ -441,6 +441,12 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 					}
 					tools[idx] = &toolAccumulator{id: evt.ContentBlock.ID, name: evt.ContentBlock.Name}
 					openTool = idx
+					// Opening delta carries the call identity so clients can
+					// dispatch by name before any argument fragment arrives.
+					if err := emitErr(model.Event{Kind: model.EventArgsDelta, ToolIndex: idx,
+						ToolCall: &model.ToolCall{ID: evt.ContentBlock.ID, Name: evt.ContentBlock.Name}}); err != nil {
+						return err
+					}
 				}
 			case "content_block_delta":
 				switch evt.Delta.Type {

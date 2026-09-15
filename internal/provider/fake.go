@@ -139,6 +139,13 @@ func (f Fake) Stream(ctx context.Context, req model.Request, emit func(model.Eve
 	switch {
 	case resp.Output[0].Kind == model.OutputToolCall:
 		call := resp.Output[0].ToolCall
+		// Opening delta carries the call identity: per the OpenAI streaming
+		// convention the first tool_calls fragment carries id/name and
+		// clients assemble by index from subsequent fragments.
+		if err := emitErr(model.Event{Kind: model.EventArgsDelta, ToolIndex: 0,
+			ToolCall: &model.ToolCall{ID: call.ID, Name: call.Name}}); err != nil {
+			return err
+		}
 		for i := 0; i < len(call.Arguments); i += 8 {
 			if err := ctx.Err(); err != nil {
 				return &Error{Class: ClassTimeout, Msg: "deadline exceeded"}
