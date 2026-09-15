@@ -637,8 +637,17 @@ func TestResponsesStreamToolArgumentsAssembly(t *testing.T) {
 	}
 	var args strings.Builder
 	argDeltas, argsDone := 0, 0
+	addedSeen, addedBeforeDeltas := false, true
 	for _, ev := range events {
 		switch ev.Event {
+		case "response.output_item.added":
+			addedSeen = true
+			if argDeltas > 0 {
+				addedBeforeDeltas = false
+			}
+			if ev.Data["call_id"] == "" || ev.Data["name"] != "get_weather" {
+				t.Errorf("output_item.added must carry call_id and name, got %v", ev.Data)
+			}
 		case "response.function_call_arguments.delta":
 			argDeltas++
 			args.WriteString(ev.Data["delta"].(string))
@@ -651,6 +660,9 @@ func TestResponsesStreamToolArgumentsAssembly(t *testing.T) {
 				t.Errorf("done name = %v", ev.Data["name"])
 			}
 		}
+	}
+	if !addedSeen || !addedBeforeDeltas {
+		t.Errorf("output_item.added must precede argument deltas (seen=%v before=%v)", addedSeen, addedBeforeDeltas)
 	}
 	if argDeltas < 2 || argsDone != 1 {
 		t.Errorf("argDeltas = %d argsDone = %d", argDeltas, argsDone)

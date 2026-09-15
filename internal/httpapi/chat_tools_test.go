@@ -78,6 +78,7 @@ func TestChatStreamingToolCall(t *testing.T) {
 	}
 	var args strings.Builder
 	finish := ""
+	firstFragmentSeen := false
 	for _, line := range strings.Split(raw, "\n\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
@@ -92,6 +93,14 @@ func TestChatStreamingToolCall(t *testing.T) {
 				for _, tc := range c.Delta.ToolCalls {
 					if tc.Index == nil {
 						t.Fatal("streaming tool delta must carry an index")
+					}
+					if !firstFragmentSeen {
+						firstFragmentSeen = true
+						// OpenAI streaming convention: the first fragment for
+						// a call carries id and function name (issue #2).
+						if tc.ID == "" || tc.Function.Name == "" {
+							t.Fatalf("first tool_call fragment must carry id and name, got id=%q name=%q", tc.ID, tc.Function.Name)
+						}
 					}
 					args.WriteString(tc.Function.Arguments)
 				}

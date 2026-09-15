@@ -223,8 +223,24 @@ func (e *responsesStreamEncoder) Handle(ev model.Event) error {
 		if !ok {
 			acc = &strings.Builder{}
 			e.args[ev.ToolIndex] = acc
+			// Announce the function call item before its argument fragments
+			// so streaming clients can dispatch by name/call_id (OpenAI
+			// Responses convention; additive event type).
+			var callID, name string
+			if ev.ToolCall != nil {
+				callID, name = ev.ToolCall.ID, ev.ToolCall.Name
+			}
+			if err := e.write("response.output_item.added", responsesEvent{
+				Type: "response.output_item.added", ItemID: fmt.Sprintf("fc_%d", ev.ToolIndex),
+				OutputIndex: intPtr(ev.ToolIndex + 1), CallID: callID, Name: name,
+			}); err != nil {
+				return err
+			}
 		}
 		acc.WriteString(ev.Delta)
+		if ev.Delta == "" {
+			return nil
+		}
 		return e.write("response.function_call_arguments.delta", responsesEvent{
 			Type:        "response.function_call_arguments.delta",
 			ItemID:      fmt.Sprintf("fc_%d", ev.ToolIndex),
