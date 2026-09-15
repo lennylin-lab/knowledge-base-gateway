@@ -117,6 +117,43 @@ defer cancel()
 
 **Example**: `ok, retryAfter, release, err := gate.Allow(...)`; check `err` first, map to 503 `limiter_unavailable`; only `ok=false, err=nil` is a 429.
 
+### Convention: Authentication stays outside the shared admission pipeline
+
+**What**: `internal/httpapi` splits handler admission into `authenticate`
+(bearer + key check, run before any body read) and `admit(..., principal)`
+(model/policy → capability precheck → clamps → rate limit → quota reserve).
+The package header documents the enforced order; `auth_order_test.go` pins
+that an invalid key + malformed/oversized body gets 401 before any decode.
+
+**Why**: A V1.2 refactor moved auth inside the post-decode pipeline; the
+spec's "401 before any body read" rule regressed silently until review. The
+order is structural now, not convention.
+
+**Boundary**: When adding admission stages, never fold authentication into
+`admit` — the principal is an input, and every new model-protocol handler
+(`chat`, `responses`, future ones) must call `authenticate` first.
+
+### Convention: Golden fixtures lock wire compatibility before refactors
+
+**What**: `internal/httpapi/testdata/golden/` pins the V1 chat wire shapes
+(non-streaming envelope, SSE chunk framing/field order). Regenerate only with
+a deliberate contract change, and keep `docs/gateway-client-contract.md` in
+the same commit.
+
+**Why**: Wire refactors (e.g. unified protocol translation) can silently
+change chunk fields; the fixtures turn that into a test failure. Note the
+correct stream chunk `object` is `chat.completion.chunk`.
+
+### Convention: Provider adapters share one offline contract suite
+
+**What**: `internal/provider/contract_test.go` runs the same scenario set
+(text/usage, streaming assembly, cancellation, tools round-trip, structured
+output, 400/401/429/500, timeout, malformed) against every adapter, offline.
+
+**Why**: Capability or translation bugs in one adapter can't hide behind the
+routing core; a new adapter inherits the suite for free. Capability-unsupported
+must be rejected before provider invocation (call counters pin this).
+
 ### Convention: Quota reservation/settlement behind quota.Gate
 
 **What**: Daily/monthly token quotas (`internal/quota`) reserve a deterministic
