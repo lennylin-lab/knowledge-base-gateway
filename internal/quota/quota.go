@@ -89,6 +89,14 @@ type Gate interface {
 	Reserve(ctx context.Context, subject string, limits Limits, estimate int64, now time.Time) (Reservation, error)
 }
 
+// InputTokens converts the deterministic character count into the input-token
+// estimate shared by quota reservation and admission input ceilings: roughly
+// charsPerToken characters per token, rounded up. Provider-specific
+// tokenizers are out of scope by design.
+func InputTokens(inputChars int) int64 {
+	return (int64(inputChars) + charsPerToken - 1) / charsPerToken
+}
+
 // Estimate computes the deterministic pre-invocation reservation from the
 // declared max_tokens, the policy output ceiling, and the total message
 // content size. Precedence: declared max_tokens, then the policy output
@@ -103,8 +111,7 @@ func Estimate(maxTokens *int, policyMaxOutput int, inputChars int) int64 {
 	} else if policyMaxOutput > 0 {
 		output = policyMaxOutput
 	}
-	input := (int64(inputChars) + charsPerToken - 1) / charsPerToken
-	return input + int64(output)
+	return InputTokens(inputChars) + int64(output)
 }
 
 // DayKey / MonthKey are the per-subject UTC period counters.

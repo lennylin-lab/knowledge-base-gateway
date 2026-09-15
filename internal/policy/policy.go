@@ -121,6 +121,7 @@ type Limits struct {
 	MaxConcurrent   int
 	DailyTokens     int64 // zero means unset/unknown
 	MonthlyTokens   int64
+	MaxInputTokens  int // zero means unset; rejects oversized inputs before any provider work
 	MaxOutputTokens int // zero means unset; caps request max_tokens
 }
 

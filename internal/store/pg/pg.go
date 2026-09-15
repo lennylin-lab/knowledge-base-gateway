@@ -324,12 +324,13 @@ func (d *DB) LoadProviders(ctx context.Context) ([]ProviderConfig, error) {
 	return out, rows.Err()
 }
 
-// LoadLimits reads per-subject policy limits.
+// LoadLimits reads per-subject policy limits. max_input_tokens is the
+// subject-level input ceiling enforced before any provider invocation.
 func (d *DB) LoadLimits(ctx context.Context) (map[string]policy.Limits, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT subject_id, rate_per_minute, max_concurrent,
 		       COALESCE(daily_tokens, 0), COALESCE(monthly_tokens, 0),
-		       COALESCE(max_output_tokens, 0)
+		       COALESCE(max_input_tokens, 0), COALESCE(max_output_tokens, 0)
 		FROM access_policies`)
 	if err != nil {
 		return nil, err
@@ -340,7 +341,7 @@ func (d *DB) LoadLimits(ctx context.Context) (map[string]policy.Limits, error) {
 		var subject string
 		var l policy.Limits
 		if err := rows.Scan(&subject, &l.RatePerMinute, &l.MaxConcurrent,
-			&l.DailyTokens, &l.MonthlyTokens, &l.MaxOutputTokens); err != nil {
+			&l.DailyTokens, &l.MonthlyTokens, &l.MaxInputTokens, &l.MaxOutputTokens); err != nil {
 			return nil, err
 		}
 		out[subject] = l

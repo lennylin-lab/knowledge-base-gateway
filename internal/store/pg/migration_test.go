@@ -202,6 +202,36 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("policies = %+v err=%v", policies, err)
 	}
 
+	// Input quota safety: access_policies.max_input_tokens loads as the
+	// subject input ceiling; NULL ceilings collapse to zero (unset). Rows are
+	// removed again so the down migration below stays clean.
+	if _, err := pgw.Pool.Exec(ctx,
+		`INSERT INTO subjects (id, tenant_id) VALUES ('subject_input_cap', 'tenant_default')`); err != nil {
+		t.Fatalf("insert subject: %v", err)
+	}
+	if _, err := pgw.Pool.Exec(ctx,
+		`INSERT INTO access_policies
+			(subject_id, public_model, rate_per_minute, max_concurrent, daily_tokens, max_input_tokens, max_output_tokens)
+		 VALUES ('subject_input_cap', 'gateway-echo', 30, 2, 5000, 4096, 256)`); err != nil {
+		t.Fatalf("insert policy: %v", err)
+	}
+	limits, err := pgw.LoadLimits(ctx)
+	if err != nil {
+		t.Fatalf("load limits: %v", err)
+	}
+	if l := limits["subject_input_cap"]; l.MaxInputTokens != 4096 || l.MaxOutputTokens != 256 || l.DailyTokens != 5000 {
+		t.Fatalf("subject_input_cap limits = %+v", l)
+	}
+	if l := limits["subject_default"]; l.MaxInputTokens != 0 || l.MaxOutputTokens != 0 {
+		t.Fatalf("NULL ceilings must load as zero, got %+v", l)
+	}
+	if _, err := pgw.Pool.Exec(ctx, `DELETE FROM access_policies WHERE subject_id = 'subject_input_cap'`); err != nil {
+		t.Fatalf("cleanup policy: %v", err)
+	}
+	if _, err := pgw.Pool.Exec(ctx, `DELETE FROM subjects WHERE id = 'subject_input_cap'`); err != nil {
+		t.Fatalf("cleanup subject: %v", err)
+	}
+
 	// Model enable/disable persists and the management op is audited.
 	if err := pgw.SetModelEnabled(ctx, "gateway-echo", false); err != nil {
 		t.Fatalf("disable model: %v", err)

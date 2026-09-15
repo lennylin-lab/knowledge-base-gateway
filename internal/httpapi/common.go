@@ -5,8 +5,8 @@ package httpapi
 // any body read:
 //
 //	authentication -> bounded decoding (caller) -> model/policy resolution
-//	-> capability precheck -> tool/schema validation -> policy/model output
-//	clamps -> rate limit -> token quota reservation
+//	-> capability precheck -> tool/schema validation -> input ceilings
+//	-> policy/model output clamps -> rate limit -> token quota reservation
 //
 // Invalid, expired, and revoked keys therefore receive their 401 before the
 // caller drives any bounded parse work. Denials never reach a provider and
@@ -127,7 +127,22 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 		return &admitted{}, err
 	}
 
-	// 3. Output clamps: policy ceilings first, then model capability limits.
+	// 3. Input ceilings: the deterministic input estimate (chars/4, the same
+	// signal quota uses) must fit both the subject's persisted input ceiling
+	// and the model's declared context window. Rejection happens before any
+	// rate-limit, quota reservation, or provider work. Messages stay generic
+	// and never echo ceiling values.
+	inputTokens := quota.InputTokens(mreq.InputChars())
+	if d.Policy != nil {
+		if limits, ok := d.Policy.LimitsFor(subject); ok && limits.MaxInputTokens > 0 && inputTokens > int64(limits.MaxInputTokens) {
+			return &admitted{}, fmt.Errorf("%w: input exceeds the maximum input size for this principal", model.ErrValidation)
+		}
+	}
+	if caps.ContextTokens > 0 && inputTokens > int64(caps.ContextTokens) {
+		return &admitted{}, fmt.Errorf("%w: input exceeds the model context window", model.ErrValidation)
+	}
+
+	// 4. Output clamps: policy ceilings first, then model capability limits.
 	if d.Policy != nil {
 		if limits, ok := d.Policy.LimitsFor(subject); ok && limits.MaxOutputTokens > 0 {
 			if mreq.MaxTokens == nil || *mreq.MaxTokens > limits.MaxOutputTokens {
@@ -141,7 +156,7 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 		mreq.MaxTokens = &capped
 	}
 
-	// 4. Rate/concurrency limits.
+	// 5. Rate/concurrency limits.
 	ok, retryAfter, release, limErr := d.Limiter.Allow(r.Context(), subject, time.Now())
 	if limErr != nil {
 		// Limiter infrastructure failure: 503-class, never a rate-limit 429.
@@ -157,7 +172,7 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 		return &admitted{}, &limiter.Error{Code: "rate_limit_exceeded"}
 	}
 
-	// 5. Token quota: reserve a deterministic bounded estimate before any
+	// 6. Token quota: reserve a deterministic bounded estimate before any
 	// provider invocation. Subjects without a configured budget skip quota.
 	qres := quota.Done
 	if d.Quota != nil && d.Policy != nil {
