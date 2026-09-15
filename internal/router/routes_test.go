@@ -105,3 +105,36 @@ func TestAvailableEachBreakerProbesOnce(t *testing.T) {
 		t.Fatalf("each breaker must admit exactly one probe, got total=%d %+v", total, admitted)
 	}
 }
+
+// TestProviderBreakersSummarizesWorstState pins the management health
+// summary: ProviderBreakers aggregates route counts and the worst breaker
+// state per provider across every model, and omits providers with no routes.
+func TestProviderBreakersSummarizesWorstState(t *testing.T) {
+	r := NewRoutes()
+	r.SetRoutes("m", []Route{
+		{ProviderName: "p", Priority: 10, Enabled: true, Breaker: NewBreaker(1, time.Hour)},
+		{ProviderName: "b", Priority: 20, Enabled: true, Breaker: NewBreaker(1, time.Hour)},
+	})
+	r.SetRoutes("n", []Route{
+		{ProviderName: "p", Priority: 10, Enabled: true, Breaker: NewBreaker(1, time.Hour)},
+	})
+
+	got := r.ProviderBreakers()
+	if len(got) != 2 {
+		t.Fatalf("providers = %+v, want p and b", got)
+	}
+	if s := got["p"]; s.TotalRoutes != 2 || s.OpenRoutes != 0 || s.State != "closed" {
+		t.Fatalf("p summary = %+v, want 2 routes all closed", s)
+	}
+
+	// Trip p's route on model m; the summary must report the open route and
+	// the worst state across both of p's routes.
+	r.Record("m", "p", false)
+	got = r.ProviderBreakers()
+	if s := got["p"]; s.TotalRoutes != 2 || s.OpenRoutes != 1 || s.State != "open" {
+		t.Fatalf("p summary after trip = %+v, want 1 of 2 routes open", s)
+	}
+	if s := got["b"]; s.TotalRoutes != 1 || s.State != "closed" {
+		t.Fatalf("b summary = %+v, want closed", s)
+	}
+}

@@ -8,11 +8,15 @@ package pg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/mgmt"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 )
 
 // Models lists every catalog row including disabled ones.
@@ -41,10 +45,19 @@ func (d *DB) Models(ctx context.Context) ([]mgmt.ModelView, error) {
 	return out, rows.Err()
 }
 
-// SetModelEnabled persists a management enable/disable decision and bumps the
-// row's configuration version. Unknown models return mgmt.ErrNotFound.
-func (d *DB) SetModelEnabled(ctx context.Context, publicModel string, enabled bool) error {
-	ct, err := d.Pool.Exec(ctx,
+// SetModelEnabledWithAudit persists a management enable/disable decision and
+// its management-operation audit record in one transaction: either both land
+// or neither does. Unknown models return mgmt.ErrNotFound with nothing
+// written, so a failed operation can never be reported as audited-and-done,
+// and a committed mutation can never be reported as failed.
+func (d *DB) SetModelEnabledWithAudit(ctx context.Context, publicModel string, enabled bool, op mgmt.AdminOp) error {
+	tx, err := d.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful Commit
+
+	ct, err := tx.Exec(ctx,
 		`UPDATE model_catalog SET enabled = $2, config_version = config_version + 1 WHERE public_name = $1`,
 		publicModel, enabled)
 	if err != nil {
@@ -53,10 +66,39 @@ func (d *DB) SetModelEnabled(ctx context.Context, publicModel string, enabled bo
 	if ct.RowsAffected() == 0 {
 		return mgmt.ErrNotFound
 	}
-	return nil
+	if err := writeOp(ctx, tx, op); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
-// Providers lists the provider registry status without endpoints.
+// ModelEntry reads one catalog row regardless of enabled state. The runtime
+// refresh path uses it to swap fresh rows (capabilities and configuration
+// version included) into the live catalog; found is false for unknown models.
+func (d *DB) ModelEntry(ctx context.Context, publicModel string) (policy.ModelInfo, bool, error) {
+	row := d.Pool.QueryRow(ctx, `
+		SELECT public_name, provider, upstream_model, enabled,
+		       COALESCE(capabilities, '{}'::jsonb), config_version
+		FROM model_catalog WHERE public_name = $1`, publicModel)
+	var m policy.ModelInfo
+	var caps []byte
+	if err := row.Scan(&m.PublicName, &m.Provider, &m.UpstreamModel, &m.Enabled, &caps, &m.ConfigVersion); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return policy.ModelInfo{}, false, nil
+		}
+		return policy.ModelInfo{}, false, err
+	}
+	if err := json.Unmarshal(caps, &m.Capabilities); err != nil {
+		return policy.ModelInfo{}, false, fmt.Errorf("model %s: parse capabilities: %w", m.PublicName, err)
+	}
+	return m, true, nil
+}
+
+// Providers lists the provider registry status without endpoints, enriched
+// with a recent (24h) error summary from the audit table. Live breaker state
+// is runtime data invisible to the store; the process wiring overlays it
+// through mgmt.ProviderView.ApplyRuntime, and until then the fields read
+// "unknown".
 func (d *DB) Providers(ctx context.Context) ([]mgmt.ProviderView, error) {
 	rows, err := d.Pool.Query(ctx, `SELECT name, kind, enabled FROM providers ORDER BY name`)
 	if err != nil {
@@ -69,9 +111,48 @@ func (d *DB) Providers(ctx context.Context) ([]mgmt.ProviderView, error) {
 		if err := rows.Scan(&p.Name, &p.Kind, &p.Enabled); err != nil {
 			return nil, err
 		}
+		if p.Enabled {
+			p.Health = mgmt.HealthUnknown
+			p.BreakerState = mgmt.BreakerUnknown
+		} else {
+			p.Health = mgmt.HealthDisabled
+			p.BreakerState = mgmt.BreakerNone
+		}
 		out = append(out, p)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	errRows, err := d.Pool.Query(ctx, `
+		SELECT provider, count(*), COALESCE((array_agg(error_class ORDER BY created_at DESC))[1], '')
+		FROM llm_requests
+		WHERE created_at >= now() - interval '24 hours'
+		  AND (status >= 400 OR COALESCE(error_class,'') <> '')
+		GROUP BY provider`)
+	if err != nil {
+		return nil, err
+	}
+	defer errRows.Close()
+	byProvider := map[string]mgmt.ProviderView{}
+	for errRows.Next() {
+		var name string
+		var s mgmt.ProviderView
+		if err := errRows.Scan(&name, &s.RecentErrors, &s.LastErrorClass); err != nil {
+			return nil, err
+		}
+		byProvider[name] = s
+	}
+	if err := errRows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if s, ok := byProvider[out[i].Name]; ok {
+			out[i].RecentErrors = s.RecentErrors
+			out[i].LastErrorClass = s.LastErrorClass
+		}
+	}
+	return out, nil
 }
 
 // Policies lists access_policies rows for one subject (or all when empty).
@@ -136,8 +217,11 @@ func (d *DB) QueryAudit(ctx context.Context, f mgmt.AuditFilter) ([]audit.Event,
 }
 
 // Usage aggregates request counts, errors, tokens, and latency percentiles
-// per model and protocol. Cost estimation stays staged until pricing
-// configuration exists.
+// per model and protocol. P50/P95 are true PostgreSQL percentiles over the
+// filtered window. cost_micros sums recorded estimates and stays null when
+// no row carries a known cost; pricing configuration does not exist yet, so
+// in practice it is staged null. First-token latency is not recorded by the
+// pipeline yet and is therefore reported as the staged null contract fields.
 func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT model, COALESCE(protocol,'chat') AS protocol,
@@ -146,7 +230,8 @@ func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, er
 		       COALESCE(sum(prompt_tokens), 0),
 		       COALESCE(sum(completion_tokens), 0),
 		       COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms), 0),
-		       COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)
+		       COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0),
+		       sum(cost_micros)
 		FROM llm_requests
 		WHERE ($1 = '' OR subject_id = $1)
 		  AND ($2 = '' OR model = $2)
@@ -164,34 +249,41 @@ func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, er
 	for rows.Next() {
 		var s mgmt.UsageRow
 		if err := rows.Scan(&s.Model, &s.Protocol, &s.Requests, &s.Errors,
-			&s.PromptTokens, &s.OutputTokens, &s.P50Millis, &s.P95Millis); err != nil {
+			&s.PromptTokens, &s.OutputTokens, &s.P50Millis, &s.P95Millis, &s.CostMicros); err != nil {
 			return nil, err
+		}
+		if s.Requests > 0 {
+			s.ErrorRate = float64(s.Errors) / float64(s.Requests)
 		}
 		out = append(out, s)
 	}
 	return out, rows.Err()
 }
 
-// WriteOp persists a management-operation record. Callers must surface
-// failures: a management action without its audit row is an error.
-func (d *DB) WriteOp(ctx context.Context, op mgmt.AdminOp) error {
-	subject := op.AdminSubject
-	if subject == "" {
-		subject = "admin-token"
-	}
-	detail := op.Detail
-	if len(detail) == 0 {
-		detail = json.RawMessage(`{}`)
-	}
-	created := op.CreatedAt
-	if created.IsZero() {
-		created = time.Now()
-	}
-	_, err := d.Pool.Exec(ctx, `
+// writeOp inserts a management-operation record on an executor that is
+// either the pool or an open transaction, so the atomic mutation path can
+// share the insert shape.
+func writeOp(ctx context.Context, ex executor, op mgmt.AdminOp) error {
+	op = mgmt.NormalizeOp(op)
+	_, err := ex.Exec(ctx, `
 		INSERT INTO admin_audit (created_at, action, target, admin_subject, detail)
 		VALUES ($1, $2, $3, $4, $5)`,
-		created, op.Action, op.Target, subject, detail)
+		op.CreatedAt, op.Action, op.Target, op.AdminSubject, op.Detail)
 	return err
+}
+
+// executor is the query surface shared by pgxpool.Pool and pgx.Tx; both are
+// safe for one-shot Exec calls under this package's usage.
+type executor interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// WriteOp persists a management-operation record. Callers must surface
+// failures: a management action without its audit row is an error. Mutations
+// that the store persists (model enable/disable) must go through
+// SetModelEnabledWithAudit so the record and the mutation commit together.
+func (d *DB) WriteOp(ctx context.Context, op mgmt.AdminOp) error {
+	return writeOp(ctx, d.Pool, op)
 }
 
 // Ops returns recent management operations, newest first.

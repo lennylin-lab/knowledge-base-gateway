@@ -103,3 +103,42 @@ func (r *Routes) Record(publicModel, providerName string, success bool) {
 		}
 	}
 }
+
+// BreakerSummary aggregates the breaker state of every live route bound to
+// one provider, for management health reporting. State is the worst state
+// across those routes ("open" > "half-open" > "closed").
+type BreakerSummary struct {
+	TotalRoutes int    // routes bound to the provider across all models
+	OpenRoutes  int    // routes whose breaker is currently open
+	State       string // worst state: "closed" | "half-open" | "open"
+}
+
+// breakerRank orders breaker severity so the worst state wins the summary:
+// closed < half-open < open.
+var breakerRank = map[string]int{"closed": 0, "half-open": 1, "open": 2}
+
+// ProviderBreakers summarizes breaker state per provider name across every
+// model's route table in one consistent snapshot. Providers without live
+// routes are absent from the result.
+func (r *Routes) ProviderBreakers() map[string]BreakerSummary {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := map[string]BreakerSummary{}
+	for _, routes := range r.byModel {
+		for _, rt := range routes {
+			s := out[rt.ProviderName]
+			state := rt.Breaker.State()
+			s.TotalRoutes++
+			if state == "open" {
+				s.OpenRoutes++
+			}
+			// >= also seeds the zero-value empty state with the first route's
+			// state ("closed" ranks equal to "").
+			if breakerRank[state] >= breakerRank[s.State] {
+				s.State = state
+			}
+			out[rt.ProviderName] = s
+		}
+	}
+	return out
+}

@@ -232,22 +232,49 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("cleanup subject: %v", err)
 	}
 
-	// Model enable/disable persists and the management op is audited.
-	if err := pgw.SetModelEnabled(ctx, "gateway-echo", false); err != nil {
+	// Model enable/disable persists atomically with its management op, and
+	// the runtime refresh path can re-read the row regardless of state.
+	if err := pgw.SetModelEnabledWithAudit(ctx, "gateway-echo", false, mgmt.AdminOp{
+		Action: "model_disable", Target: "gateway-echo", Detail: json.RawMessage(`{"enabled":false}`),
+	}); err != nil {
 		t.Fatalf("disable model: %v", err)
 	}
 	if cat2, _ := pgw.LoadCatalog(ctx); len(cat2) != 0 {
 		t.Fatal("disabled model must disappear from the enabled catalog")
 	}
-	if err := pgw.SetModelEnabled(ctx, "gateway-echo", true); err != nil {
+	entry, found, err := pgw.ModelEntry(ctx, "gateway-echo")
+	if err != nil || !found || entry.Enabled {
+		t.Fatalf("model entry = %+v found=%v err=%v, want the disabled row", entry, found, err)
+	}
+	if err := pgw.SetModelEnabledWithAudit(ctx, "gateway-echo", true, mgmt.AdminOp{
+		Action: "model_enable", Target: "gateway-echo",
+	}); err != nil {
 		t.Fatalf("enable model: %v", err)
+	}
+
+	// Atomicity: a failing audit insert must roll the mutation back, leaving
+	// the model enabled and no failed-operation trace behind. Invalid JSON in
+	// the detail column forces the admin_audit insert to fail inside the
+	// transaction.
+	if err := pgw.SetModelEnabledWithAudit(ctx, "gateway-echo", false, mgmt.AdminOp{
+		Action: "model_disable", Target: "gateway-echo", Detail: json.RawMessage(`not-valid-json`),
+	}); err == nil {
+		t.Fatal("atomic mutation must fail when the audit insert fails")
+	}
+	if entry2, _, err := pgw.ModelEntry(ctx, "gateway-echo"); err != nil || !entry2.Enabled {
+		t.Fatalf("failed mutation must not disable the model: entry=%+v err=%v", entry2, err)
 	}
 	if err := pgw.WriteOp(ctx, mgmt.AdminOp{Action: "model_disable", Target: "gateway-echo", Detail: json.RawMessage(`{"enabled":false}`)}); err != nil {
 		t.Fatalf("write op: %v", err)
 	}
+	// Both atomic toggles and the explicit op are recorded; the aborted
+	// mutation above is not.
 	ops, err := pgw.Ops(ctx, 10)
-	if err != nil || len(ops) != 1 || ops[0].Action != "model_disable" || ops[0].Target != "gateway-echo" {
-		t.Fatalf("ops = %+v err=%v", ops, err)
+	if err != nil || len(ops) != 3 || ops[0].Action != "model_disable" || ops[0].Target != "gateway-echo" {
+		t.Fatalf("ops = %+v err=%v, want 3 with the explicit disable newest", ops, err)
+	}
+	if ops[0].AdminSubject == "" {
+		t.Fatal("management op must default its admin subject")
 	}
 
 	// Roll back 0003 through the tool and confirm the new artifacts are gone.

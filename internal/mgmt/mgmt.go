@@ -24,6 +24,29 @@ import (
 // ErrNotFound is returned when a management target does not exist.
 var ErrNotFound = errors.New("management target not found")
 
+// Provider health values reported on ProviderView.Health. They describe the
+// runtime route-breaker state, not an active probe: "serving" (enabled, no
+// open breaker), "degraded" (enabled with at least one open breaker),
+// "disabled" (registry row disabled), and "unknown" (runtime state not
+// wired).
+const (
+	HealthServing  = "serving"
+	HealthDegraded = "degraded"
+	HealthDisabled = "disabled"
+	HealthUnknown  = "unknown"
+)
+
+// Breaker state values reported on ProviderView.BreakerState. They match the
+// router breaker vocabulary plus "none" (no live routes in this process) and
+// "unknown" (runtime state not wired).
+const (
+	BreakerClosed   = "closed"
+	BreakerHalfOpen = "half-open"
+	BreakerOpen     = "open"
+	BreakerNone     = "none"
+	BreakerUnknown  = "unknown"
+)
+
 // ModelView is one catalog row as administrators see it: provider bindings
 // and enablement included, endpoints and credentials excluded.
 type ModelView struct {
@@ -35,11 +58,50 @@ type ModelView struct {
 	Capabilities  model.Capabilities `json:"capabilities"`
 }
 
-// ProviderView is one provider registry row's operational status.
+// ProviderView is one provider registry row's operational status. Registry
+// enablement and the recent error summary come from the store; live breaker
+// state and derived health are overlaid by the running process (see
+// ProviderRuntime and ApplyRuntime) because stores cannot see route state.
+// No endpoints, credentials, or error message bodies are included.
 type ProviderView struct {
-	Name    string `json:"name"`
-	Kind    string `json:"kind"`
-	Enabled bool   `json:"enabled"`
+	Name           string `json:"name"`
+	Kind           string `json:"kind"`
+	Enabled        bool   `json:"enabled"`
+	Health         string `json:"health"`                     // serving | degraded | disabled | unknown
+	BreakerState   string `json:"breaker_state"`              // closed | half-open | open | none | unknown
+	RecentErrors   int64  `json:"recent_errors"`              // errored requests in the recent window
+	LastErrorClass string `json:"last_error_class,omitempty"` // class of the most recent error
+}
+
+// ProviderRuntime is the live per-provider breaker summary injected by the
+// serving process wiring; store implementations cannot observe route state.
+type ProviderRuntime struct {
+	BreakerState string // closed | half-open | open (worst across live routes)
+	TotalRoutes  int    // live routes bound to the provider in this process
+	OpenRoutes   int    // live routes whose breaker is currently open
+}
+
+// ApplyRuntime overlays live breaker state onto a registry view and derives
+// health. Disabled stays disabled; any open breaker degrades; other enabled
+// providers serve. Providers without live routes report breaker "none" and
+// stay "serving" — nothing is failing, there is simply no route bound here.
+func (v *ProviderView) ApplyRuntime(rt ProviderRuntime) {
+	if !v.Enabled {
+		v.Health = HealthDisabled
+		v.BreakerState = BreakerNone
+		return
+	}
+	if rt.TotalRoutes == 0 {
+		v.BreakerState = BreakerNone
+		v.Health = HealthServing
+		return
+	}
+	v.BreakerState = rt.BreakerState
+	if rt.OpenRoutes > 0 {
+		v.Health = HealthDegraded
+		return
+	}
+	v.Health = HealthServing
 }
 
 // PolicyView is one subject/model grant with its ceilings.
@@ -62,16 +124,28 @@ type AuditFilter struct {
 	Limit     int
 }
 
-// UsageRow is one aggregated usage line for dashboards.
+// UsageRow is one aggregated usage line for dashboards. P50/P95 latency is a
+// true percentile in the PostgreSQL implementation; the development-mode
+// service reports a mean and never claims otherwise. The first-token and
+// cost fields are part of the roadmap metric contract but staged: no pipeline
+// records first-token latency yet and pricing configuration does not exist,
+// so they stay null until real data can back them.
 type UsageRow struct {
-	Model        string `json:"model"`
-	Protocol     string `json:"protocol"`
-	Requests     int64  `json:"requests"`
-	Errors       int64  `json:"errors"`
-	PromptTokens int64  `json:"prompt_tokens"`
-	OutputTokens int64  `json:"output_tokens"`
-	P50Millis    int64  `json:"p50_latency_ms"`
-	P95Millis    int64  `json:"p95_latency_ms"`
+	Model        string  `json:"model"`
+	Protocol     string  `json:"protocol"`
+	Requests     int64   `json:"requests"`
+	Errors       int64   `json:"errors"`
+	ErrorRate    float64 `json:"error_rate"`
+	PromptTokens int64   `json:"prompt_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+	P50Millis    int64   `json:"p50_latency_ms"`
+	P95Millis    int64   `json:"p95_latency_ms"`
+
+	// Staged metrics: null until the recording pipeline exists. The field
+	// names are contractual so dashboards can detect availability explicitly.
+	FirstTokenP50Millis *int64 `json:"first_token_p50_ms"`
+	FirstTokenP95Millis *int64 `json:"first_token_p95_ms"`
+	CostMicros          *int64 `json:"cost_micros"` // sum of known estimated cost; null when none known
 }
 
 // AdminOp is one management-operation audit record.
@@ -84,14 +158,36 @@ type AdminOp struct {
 	Detail       json.RawMessage `json:"detail,omitempty"`
 }
 
+// NormalizeOp fills management-audit defaults so every store implementation
+// records the same shape.
+func NormalizeOp(op AdminOp) AdminOp {
+	if op.AdminSubject == "" {
+		op.AdminSubject = "admin-token"
+	}
+	if len(op.Detail) == 0 {
+		op.Detail = json.RawMessage(`{}`)
+	}
+	if op.CreatedAt.IsZero() {
+		op.CreatedAt = time.Now()
+	}
+	return op
+}
+
 // Service is the management query surface consumed by the admin API.
 type Service interface {
 	Models(ctx context.Context) ([]ModelView, error)
-	SetModelEnabled(ctx context.Context, publicModel string, enabled bool) error
+	// SetModelEnabledWithAudit persists an enable/disable decision and its
+	// management-operation audit record as one atomic operation: either both
+	// land or neither does. A returned error means the mutation did not
+	// happen; the admin handler treats it as a failed operation.
+	SetModelEnabledWithAudit(ctx context.Context, publicModel string, enabled bool, op AdminOp) error
 	Providers(ctx context.Context) ([]ProviderView, error)
 	Policies(ctx context.Context, subject string) ([]PolicyView, error)
 	QueryAudit(ctx context.Context, f AuditFilter) ([]audit.Event, error)
 	Usage(ctx context.Context, f AuditFilter) ([]UsageRow, error)
+	// WriteOp appends a management-operation record for mutations that carry
+	// their own atomicity. The model enable/disable switch must use
+	// SetModelEnabledWithAudit instead.
 	WriteOp(ctx context.Context, op AdminOp) error
 	Ops(ctx context.Context, limit int) ([]AdminOp, error)
 }
@@ -129,17 +225,54 @@ func (m *MemoryService) Models(_ context.Context) ([]ModelView, error) {
 	return out, nil
 }
 
-// SetModelEnabled flips the in-memory catalog flag only.
-func (m *MemoryService) SetModelEnabled(_ context.Context, publicModel string, enabled bool) error {
+// SetModelEnabledWithAudit flips the in-memory catalog flag and appends the
+// management-operation record under one lock, so the dev-mode mutation is
+// atomic and immediately live for model resolution.
+func (m *MemoryService) SetModelEnabledWithAudit(_ context.Context, publicModel string, enabled bool, op AdminOp) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if !m.Catalog.SetEnabled(publicModel, enabled) {
 		return ErrNotFound
 	}
+	m.ops = append(m.ops, NormalizeOp(op))
 	return nil
 }
 
-// Providers returns the static startup snapshot.
+// Providers returns the startup registry snapshot enriched with a recent
+// error summary from the in-memory audit sink. Health and breaker state are
+// runtime overlays (see AdminDeps.ProviderRuntime wiring), not store data.
 func (m *MemoryService) Providers(_ context.Context) ([]ProviderView, error) {
-	return m.ProviderList, nil
+	out := make([]ProviderView, len(m.ProviderList))
+	copy(out, m.ProviderList)
+	since := time.Now().Add(-24 * time.Hour)
+	for i := range out {
+		out[i].Health = HealthUnknown
+		out[i].BreakerState = BreakerUnknown
+		if m.Audit == nil {
+			continue
+		}
+		var last *audit.Event
+		for _, e := range m.Audit.Snapshot() {
+			if e.Provider != out[i].Name {
+				continue
+			}
+			if e.Status < 400 && e.ErrorClass == "" {
+				continue
+			}
+			if e.CreatedAt.Before(since) {
+				continue
+			}
+			out[i].RecentErrors++
+			if last == nil || e.CreatedAt.After(last.CreatedAt) {
+				ec := e
+				last = &ec
+			}
+		}
+		if last != nil {
+			out[i].LastErrorClass = last.ErrorClass
+		}
+	}
+	return out, nil
 }
 
 // Policies summarizes the in-memory grant set; explicit policy rows are a
@@ -231,12 +364,21 @@ func (m *MemoryService) Usage(_ context.Context, f AuditFilter) ([]UsageRow, err
 		if e.CompletionTokens != nil {
 			row.OutputTokens += int64(*e.CompletionTokens)
 		}
+		if e.CostMicros != nil {
+			if row.CostMicros == nil {
+				v := *e.CostMicros
+				row.CostMicros = &v
+			} else {
+				*row.CostMicros += *e.CostMicros
+			}
+		}
 		row.P50Millis += e.LatencyMillis
 	}
 	out := []UsageRow{}
 	for _, row := range agg {
 		if row.Requests > 0 {
 			row.P50Millis /= row.Requests
+			row.ErrorRate = float64(row.Errors) / float64(row.Requests)
 		}
 		out = append(out, *row)
 	}
@@ -247,7 +389,7 @@ func (m *MemoryService) Usage(_ context.Context, f AuditFilter) ([]UsageRow, err
 func (m *MemoryService) WriteOp(_ context.Context, op AdminOp) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ops = append(m.ops, op)
+	m.ops = append(m.ops, NormalizeOp(op))
 	return nil
 }
 

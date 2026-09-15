@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -21,6 +23,18 @@ type AdminDeps struct {
 	Logger  *slog.Logger
 	Token   string // GATEWAY_ADMIN_TOKEN; empty disables the endpoints
 	Mgmt    mgmt.Service
+	// ApplyModelChange is the runtime refresh boundary for the model
+	// enable/disable switch. It is invoked after the persisted mutation and
+	// its audit record committed atomically, and must make the change visible
+	// to the running process (catalog and route tables) without a restart.
+	// A returned error is reported as refresh_failed: the change stays
+	// persisted and audited, and the response makes clear the refresh — not
+	// the mutation — failed.
+	ApplyModelChange func(ctx context.Context, publicModel string, enabled bool) error
+	// ProviderRuntime reports live per-provider breaker state so
+	// /admin/providers reflects the running process instead of the registry
+	// alone. A false ok leaves the store-reported fields untouched.
+	ProviderRuntime func(name string) (mgmt.ProviderRuntime, bool)
 }
 
 // NewAdminMux builds the management API. Endpoints are disabled (404) unless
@@ -29,6 +43,11 @@ type AdminDeps struct {
 // the same token and every mutating operation appends a management-audit
 // record.
 func NewAdminMux(deps AdminDeps) *http.ServeMux {
+	// Management failure paths log; tests build deps without a logger, so
+	// normalize once instead of guarding every log site.
+	if deps.Logger == nil {
+		deps.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	mux := http.NewServeMux()
 	guard := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +136,14 @@ func handleManagement(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
 			return
 		}
 		name, enable := parts[0], parts[1] == "enable"
-		err := deps.Mgmt.SetModelEnabled(ctx, name, enable)
+		// The persisted mutation and its management-audit record commit as one
+		// atomic operation: an error here means nothing changed, so a failed
+		// operation can never leave a committed mutation reported as failed.
+		detail, _ := json.Marshal(map[string]bool{"enabled": enable})
+		err := deps.Mgmt.SetModelEnabledWithAudit(ctx, name, enable, mgmt.AdminOp{
+			CreatedAt: time.Now(), Action: "model_" + map[bool]string{true: "enable", false: "disable"}[enable],
+			Target: name, Detail: detail,
+		})
 		if err != nil {
 			if errors.Is(err, mgmt.ErrNotFound) {
 				writeError(w, newRequestID(), http.StatusNotFound, "not_found", "model_not_found", "model not found")
@@ -126,16 +152,15 @@ func handleManagement(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
 			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "update_failed", "could not update model")
 			return
 		}
-		// Management-operation audit: a management action without its audit
-		// row is a failed operation.
-		detail, _ := json.Marshal(map[string]bool{"enabled": enable})
-		if err := deps.Mgmt.WriteOp(ctx, mgmt.AdminOp{
-			CreatedAt: time.Now(), Action: "model_" + map[bool]string{true: "enable", false: "disable"}[enable],
-			Target: name, Detail: detail,
-		}); err != nil {
-			deps.Logger.Error("management audit write failed", "target", name, "error", err)
-			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "audit_write_failed", "could not record management operation")
-			return
+		// Runtime refresh after persistence. The audit evidence is already
+		// committed; a refresh failure is reported as exactly that, so
+		// operators know the stored state and the running process diverge.
+		if deps.ApplyModelChange != nil {
+			if err := deps.ApplyModelChange(ctx, name, enable); err != nil {
+				deps.Logger.Error("management runtime refresh failed", "target", name, "error", err)
+				writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "refresh_failed", "model state saved but the runtime refresh failed")
+				return
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"model": name, "status": map[bool]string{true: "enabled", false: "disabled"}[enable]})
 
@@ -144,6 +169,14 @@ func handleManagement(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
 		if err != nil {
 			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query providers")
 			return
+		}
+		// Overlay live breaker state so the view reflects the running process.
+		if deps.ProviderRuntime != nil {
+			for i := range providers {
+				if rt, ok := deps.ProviderRuntime(providers[i].Name); ok {
+					providers[i].ApplyRuntime(rt)
+				}
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"providers": providers})
 

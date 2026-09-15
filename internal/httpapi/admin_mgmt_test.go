@@ -28,6 +28,9 @@ type adminFixture struct {
 	mux  *http.ServeMux
 	mgmt *mgmt.MemoryService
 	sink *audit.MemorySink
+	svc  *gateway.Service // live resolution path for refresh assertions
+	cap  *policy.Catalog
+	deps AdminDeps // rebuild the mux with extra wiring via newMux
 }
 
 func newAdminFixture(t *testing.T) *adminFixture {
@@ -48,7 +51,15 @@ func newAdminFixture(t *testing.T) *adminFixture {
 		{Name: "fake", Kind: "fake", Enabled: true},
 	})
 	deps := AdminDeps{Manager: manager, Logger: nil, Token: adminToken, Mgmt: service}
-	return &adminFixture{mux: NewAdminMux(deps), mgmt: service, sink: sink}
+	return &adminFixture{mux: NewAdminMux(deps), mgmt: service, sink: sink, svc: svc, cap: catalog, deps: deps}
+}
+
+// newMux replaces the fixture's admin mux with new deps (e.g. a runtime
+// refresh boundary) while reusing the same backing services.
+func (f *adminFixture) newMux(mutate func(*AdminDeps)) {
+	deps := f.deps
+	mutate(&deps)
+	f.mux = NewAdminMux(deps)
 }
 
 func doAdmin(f *adminFixture, method, path, token, body string) *httptest.ResponseRecorder {

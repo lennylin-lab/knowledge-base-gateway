@@ -102,6 +102,27 @@ func (c *Catalog) SetEnabled(publicModel string, enabled bool) bool {
 	return true
 }
 
+// SetEntry inserts or replaces one catalog entry. The management runtime
+// refresh uses it so a persisted enable/disable (with fresh capabilities and
+// configuration version) becomes visible to the running process without a
+// restart. Lookup treats an entry with Enabled=false as absent, so replacing
+// an entry with a disabled row hides the model from resolution.
+func (c *Catalog) SetEntry(info ModelInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.models[info.PublicName] = info
+}
+
+// Remove drops a catalog entry and reports whether it existed. The runtime
+// refresh uses it when the persisted row disappeared underneath the process.
+func (c *Catalog) Remove(publicModel string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.models[publicModel]
+	delete(c.models, publicModel)
+	return ok
+}
+
 // Permitted reports whether a subject may use a model that has already been
 // confirmed to exist. The result is identical for "model missing" and
 // "model forbidden" from the caller's perspective (non-leaky).

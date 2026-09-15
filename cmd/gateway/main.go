@@ -144,21 +144,17 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("load routes: %w", err)
 		}
-		byModel := map[string][]router.Route{}
+		seen := map[string]bool{}
 		for _, rc := range routeCfgs {
-			p, ok := providers[rc.ProviderName]
-			if !ok {
-				return fmt.Errorf("model %s: route references unknown provider %q", rc.PublicModel, rc.ProviderName)
+			if seen[rc.PublicModel] {
+				continue
 			}
-			byModel[rc.PublicModel] = append(byModel[rc.PublicModel], router.Route{
-				ProviderName: rc.ProviderName, Provider: p,
-				UpstreamModel: rc.UpstreamModel, Priority: rc.Priority,
-				Timeout: time.Duration(rc.TimeoutMillis) * time.Millisecond,
-				Enabled: rc.Enabled, Breaker: router.NewBreaker(5, 30*time.Second),
-			})
-		}
-		for m, rs := range byModel {
-			svc.Routes.SetRoutes(m, rs)
+			seen[rc.PublicModel] = true
+			rs, err := routeSet(rc.PublicModel, routeCfgs, providers)
+			if err != nil {
+				return err
+			}
+			svc.Routes.SetRoutes(rc.PublicModel, rs)
 		}
 	}
 
@@ -255,6 +251,65 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		mgmtSvc = mgmt.NewMemoryService(catalog, pol, svc.Routes, auditSink.(*audit.MemorySink), providerViews(providers))
 	}
 
+	// Runtime refresh boundary for the audited model enable/disable switch.
+	// The mutation and its audit record already committed atomically by the
+	// time this runs; it swaps the persisted row and route bindings into the
+	// live catalog and route table so the decision affects subsequent model
+	// resolution without a restart. Development mode needs no boundary: the
+	// in-memory service flips the shared catalog directly.
+	var applyModelChange func(ctx context.Context, publicModel string, enabled bool) error
+	if dbw != nil {
+		applyModelChange = func(ctx context.Context, publicModel string, enabled bool) error {
+			info, found, err := dbw.ModelEntry(ctx, publicModel)
+			if err != nil {
+				return err
+			}
+			if found {
+				catalog.SetEntry(info)
+			} else {
+				catalog.Remove(publicModel) // row vanished underneath us; converge
+			}
+			if !found {
+				return nil
+			}
+			routeCfgs, err := dbw.LoadRoutes(ctx)
+			if err != nil {
+				return err
+			}
+			rs, err := routeSet(publicModel, routeCfgs, providers)
+			if err != nil {
+				return err
+			}
+			if rs == nil && info.Enabled {
+				// No persisted bindings: mirror the single-candidate default
+				// gateway.New derives for catalog entries.
+				if p, ok := providers[info.Provider]; ok {
+					rs = []router.Route{{
+						ProviderName: info.Provider, Provider: p,
+						UpstreamModel: info.UpstreamModel, Priority: 10, Enabled: true,
+						Breaker: router.NewBreaker(5, 30*time.Second),
+					}}
+				}
+			}
+			if rs != nil {
+				svc.Routes.SetRoutes(publicModel, rs)
+			}
+			return nil
+		}
+	}
+
+	// Live provider breaker state for /admin/providers: stores cannot see
+	// route state, so the process overlays it on the registry view. Enabled
+	// providers without any live route in this process report breaker "none".
+	providerRuntime := func(name string) (mgmt.ProviderRuntime, bool) {
+		if s, ok := svc.Routes.ProviderBreakers()[name]; ok {
+			return mgmt.ProviderRuntime{
+				BreakerState: s.State, TotalRoutes: s.TotalRoutes, OpenRoutes: s.OpenRoutes,
+			}, true
+		}
+		return mgmt.ProviderRuntime{}, true
+	}
+
 	chat := &httpapi.ChatHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
 		Audit: auditSink, Metrics: reg,
@@ -320,6 +375,7 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 			Addr: cfg.AdminAddr, ReadHeaderTimeout: 10 * time.Second,
 			Handler: httpapi.NewAdminMux(httpapi.AdminDeps{
 				Manager: keyManager, Logger: logger, Token: cfg.AdminToken, Mgmt: mgmtSvc,
+				ApplyModelChange: applyModelChange, ProviderRuntime: providerRuntime,
 			}),
 		}
 	}
@@ -377,6 +433,30 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	default:
 	}
 	return nil
+}
+
+// routeSet builds the router routes for one public model from the persisted
+// route bindings, and returns nil when the model has none (the caller then
+// keeps or rebuilds the single-candidate default). Both startup and the
+// management runtime-refresh use it so the two paths cannot drift.
+func routeSet(publicModel string, cfgs []pgstore.RouteConfig, providers map[string]provider.Provider) ([]router.Route, error) {
+	var rs []router.Route
+	for _, rc := range cfgs {
+		if rc.PublicModel != publicModel {
+			continue
+		}
+		p, ok := providers[rc.ProviderName]
+		if !ok {
+			return nil, fmt.Errorf("model %s: route references unknown provider %q", publicModel, rc.ProviderName)
+		}
+		rs = append(rs, router.Route{
+			ProviderName: rc.ProviderName, Provider: p,
+			UpstreamModel: rc.UpstreamModel, Priority: rc.Priority,
+			Timeout: time.Duration(rc.TimeoutMillis) * time.Millisecond,
+			Enabled: rc.Enabled, Breaker: router.NewBreaker(5, 30*time.Second),
+		})
+	}
+	return rs, nil
 }
 
 // newProviderFromRegistry builds one provider from a registry entry: kind and

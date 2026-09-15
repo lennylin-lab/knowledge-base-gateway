@@ -485,3 +485,143 @@ func TestDatabaseModePolicyGrantsPermitSeededModel(t *testing.T) {
 		t.Fatalf("run after graceful cancel: %v", err)
 	}
 }
+
+// TestDatabaseModeAdminToggleAffectsLiveServing proves the AC1 management
+// contract against a real PostgreSQL schema: the audited admin model
+// disable/enable takes effect for subsequent model resolution in the same
+// running process — no restart — and the toggle lands in admin_audit.
+func TestDatabaseModeAdminToggleAffectsLiveServing(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping database-backed admin toggle test")
+	}
+	ctx := context.Background()
+	lockTestDatabase(t, dsn)
+	migrateToHead(t, dsn)
+
+	pool, err := pgstore.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool connect: %v", err)
+	}
+	t.Cleanup(func() { pool.Close() })
+
+	// Seed defensively: the shared database may hold state from other tests.
+	const subject = "subject_smoke_toggle"
+	for _, stmt := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO tenants (id, name) VALUES ('tenant_default', 'Default Tenant') ON CONFLICT (id) DO NOTHING`, nil},
+		{`INSERT INTO subjects (id, tenant_id) VALUES ($1, 'tenant_default') ON CONFLICT (id) DO NOTHING`, []any{subject}},
+		{`INSERT INTO access_policies (subject_id, public_model, rate_per_minute, max_concurrent, daily_tokens)
+		  VALUES ($1, 'gateway-echo', 120, 8, 1000000) ON CONFLICT (subject_id, public_model) DO NOTHING`, []any{subject}},
+		{`UPDATE model_catalog SET enabled = true WHERE public_name = 'gateway-echo'`, nil},
+	} {
+		if _, err := pool.Pool.Exec(ctx, stmt.query, stmt.args...); err != nil {
+			t.Fatalf("seed rows: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Pool.Exec(context.Background(), `DELETE FROM access_policies WHERE subject_id = $1`, subject)
+		_, _ = pool.Pool.Exec(context.Background(), `DELETE FROM subjects WHERE id = $1`, subject)
+	})
+
+	mgr := auth.NewManager(pool)
+	gen, err := mgr.Create(ctx, subject, "", time.Time{})
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Pool.Exec(context.Background(), `DELETE FROM api_keys WHERE id = $1`, gen.Record.ID)
+	})
+
+	cfg := dbStartupConfig(t, dsn)
+	cfg.AdminToken = "toggle-test-admin-token"
+	cfg.AdminAddr = freeAddr(t)
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(runCtx, cfg, quietLogger()) }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(10 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		resp, rerr := client.Get("http://" + cfg.Addr + "/readyz")
+		if rerr == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				ready = true
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !ready {
+		cancel()
+		<-done
+		t.Fatal("server never became ready within deadline")
+	}
+
+	admin := func(path string) int {
+		req, err := http.NewRequest(http.MethodPost, "http://"+cfg.AdminAddr+path, nil)
+		if err != nil {
+			t.Fatalf("admin request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+cfg.AdminToken)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("admin call %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+	chat := func() (int, string) {
+		body := `{"model":"gateway-echo","messages":[{"role":"user","content":"smoke"}]}`
+		req, err := http.NewRequest(http.MethodPost, "http://"+cfg.Addr+"/v1/chat/completions", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("chat request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+gen.Plaintext)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("chat call: %v", err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	if status, body := chat(); status != http.StatusOK {
+		t.Fatalf("model must serve before the toggle: status = %d body = %s", status, body)
+	}
+
+	// Disable: audited, and immediately enforced by the running process.
+	if status := admin("/admin/models/gateway-echo/disable"); status != http.StatusOK {
+		t.Fatalf("admin disable status = %d", status)
+	}
+	if status, body := chat(); status != http.StatusForbidden {
+		t.Fatalf("disabled model must stop serving without a restart: status = %d body = %s", status, body)
+	}
+	var ops int
+	if err := pool.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM admin_audit WHERE action = 'model_disable' AND target = 'gateway-echo'`).Scan(&ops); err != nil || ops < 1 {
+		t.Fatalf("disable must be management-audited: ops=%d err=%v", ops, err)
+	}
+
+	// Re-enable: serving resumes in the same process.
+	if status := admin("/admin/models/gateway-echo/enable"); status != http.StatusOK {
+		t.Fatalf("admin enable status = %d", status)
+	}
+	if status, body := chat(); status != http.StatusOK {
+		t.Fatalf("re-enabled model must serve again: status = %d body = %s", status, body)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run after graceful cancel: %v", err)
+	}
+}
