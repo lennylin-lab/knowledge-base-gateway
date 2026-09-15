@@ -1,0 +1,14 @@
+{
+  "model": "gateway-echo",
+  "input": [
+    {"type": "message", "role": "user", "content": "What is the weather in Paris?"},
+    {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+    {"type": "function_call_output", "call_id": "call_1", "output": "sunny, 22C"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
+    }
+  ]
+}

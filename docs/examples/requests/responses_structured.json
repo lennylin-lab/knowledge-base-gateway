@@ -1,0 +1,17 @@
+{
+  "model": "gateway-echo",
+  "input": "hello",
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "echo_answer",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"echo": {"type": "string"}},
+        "required": ["echo"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

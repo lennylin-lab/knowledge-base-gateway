@@ -67,10 +67,20 @@ Request size limits: 1 MiB body, 64 messages, 32k characters per message
 ## Endpoints
 
 - `POST /v1/chat/completions` — OpenAI-compatible chat completions (streaming and non-streaming)
+- `POST /v1/responses` — Responses-compatible protocol (V1.2): text, tool
+  calling, JSON mode / structured output, SSE events; disable with
+  `GATEWAY_RESPONSES_ENABLED=false` (independent rollback switch)
+- `GET /v1/models`, `GET /v1/models/{model}` — caller-filtered model
+  discovery with public capability/limit metadata only (V1.2)
 - `GET /healthz` — liveness, no dependency checks
 - `GET /readyz` — configuration and wiring validated
 - `GET /metrics` — Prometheus text format emitted by the official
   `prometheus/client_golang` (label values are escaped safely)
+
+Capability enforcement is a routing constraint: features a model's catalog
+declaration does not allow (tools, structured output, JSON mode, streaming,
+vision, reasoning, the Responses protocol itself) are rejected with 400
+`capability_not_supported` before any provider is contacted.
 
 ## Error envelope
 
@@ -311,6 +321,40 @@ docker compose run --rm --no-deps migrate            # idempotent `up`
 
 `down`-style rollbacks stay operational-only (`cmd/migrate down` against a
 database you own); the Compose stack never executes them.
+
+## V1.2: unified model protocol and developer platform
+
+V1.2 keeps the V1/V1.1 contracts frozen and adds a provider-neutral domain
+layer (`internal/model`) that both protocols translate through:
+
+- **Unified protocol** — Chat Completions and `/v1/responses` share one
+  routing, retry, failover, quota, and audit pipeline with per-protocol
+  encoders, so the two surfaces can never drift.
+- **Tool calling** — the gateway validates tool names/schemas/count/size,
+  translates definitions per provider, assembles streamed argument
+  fragments deterministically, and validates the final JSON. It never
+  executes tools and never logs tool arguments; callers return tool results
+  as input in the next request.
+- **Structured output** — JSON mode and `json_schema` specs are validated
+  (dialect, size, depth) before invocation; final output validation failures
+  are recorded in audit as `schema_validation_failed` and never silently
+  treated as clean successes.
+- **Provider contract tests** — both built-in adapters (OpenAI-compatible,
+  Anthropic) pass the same offline suite over a mock transport: text/usage,
+  streaming deltas and assembly, tool calls and result round-trip, structured
+  output, unsupported-capability rejection, cancellation, malformed
+  responses, 400/401/429/5xx/timeout mapping. The routing core has no
+  provider-specific branches.
+- **Management API** — `/admin/models`, `/admin/providers`,
+  `/admin/policies`, `/admin/audit`, `/admin/usage`,
+  `/admin/management-log`, and the audited
+  `POST /admin/models/{name}/enable|disable` switch, all behind the admin
+  token and metadata-only by construction.
+
+Docs: `docs/developer-quickstart.md` (mock provider setup, examples),
+`docs/api-versioning.md` (compatibility, deprecation, flags),
+`docs/examples/` (curl, Python, OpenAI SDK, Go — the same request samples
+the automated smoke tests run).
 
 ## Design notes and known limitations
 

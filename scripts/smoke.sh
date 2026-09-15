@@ -28,6 +28,8 @@
 #  10  admin API: never became ready or the key could not be minted
 #  11  chat completion: request failed or the envelope was not a
 #      successful OpenAI-compatible completion
+#  12  responses/models path: model discovery or the /v1/responses
+#      protocol failed against the seeded fake provider
 #
 # Usage: scripts/smoke.sh [--skip-outage] [--down] [--timeout SECONDS]
 #
@@ -167,25 +169,25 @@ chat_phase() {
   log "ok: admin API reachable"
 
   log "minting a throwaway API key for the seeded subject"
-  local create_resp="" smoke_key="" smoke_key_id=""
+  local create_resp="" smoke_key_id=""
   create_resp="$(curl -s --max-time 5 -X POST \
     -H "Authorization: Bearer ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
     -d '{"subject":"subject_default","expires_in_hours":1}' \
     "${ADMIN_URL}/admin/keys" 2>/dev/null)" || create_resp=""
-  smoke_key="$(json_string key "$create_resp")"
-  smoke_key_id="$(json_string key_id "$create_resp")"
-  if [ -z "$smoke_key" ] || [ -z "$smoke_key_id" ]; then
+  SMOKE_KEY="$(json_string key "$create_resp")"
+  SMOKE_KEY_ID="$(json_string key_id "$create_resp")"
+  if [ -z "${SMOKE_KEY:-}" ] || [ -z "${SMOKE_KEY_ID:-}" ]; then
     # The response body holds the plaintext key, so it is never dumped.
     log "admin key minting failed (status: $(admin_code); response withheld: it contains the plaintext key)"
     return 10
   fi
-  log "ok: key minted (id: ${smoke_key_id})"
+  log "ok: key minted (id: ${SMOKE_KEY_ID})"
 
   log "requesting a non-streaming chat completion from the seeded fake provider"
   local body_file chat_status=""
   body_file="$(mktemp)"
   chat_status="$(curl -s --max-time 15 -o "$body_file" -w '%{http_code}' -X POST \
-    -H "Authorization: Bearer ${smoke_key}" -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer ${SMOKE_KEY}" -H 'Content-Type: application/json' \
     -d '{"model":"gateway-echo","messages":[{"role":"user","content":"smoke-chat"}],"max_tokens":16}' \
     "${SMOKE_URL}/v1/chat/completions" 2>/dev/null)" || chat_status="000"
   if [ "$chat_status" != "200" ]; then
@@ -205,17 +207,62 @@ chat_phase() {
   fi
   rm -f "$body_file"
   log "ok: chat completion returned the expected fake-provider envelope"
+  return 0
+}
 
-  # Best-effort cleanup: the key is throwaway and the stack is disposable.
+# revoke_smoke_key KEY_ID -> best-effort cleanup of the throwaway key.
+revoke_smoke_key() {
   local revoke_code=""
   revoke_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
     -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-    "${ADMIN_URL}/admin/keys/${smoke_key_id}/revoke" 2>/dev/null)" || revoke_code="000"
+    "${ADMIN_URL}/admin/keys/$1/revoke" 2>/dev/null)" || revoke_code="000"
   if [ "$revoke_code" = "200" ]; then
     log "ok: throwaway key revoked"
   else
     log "warn: key revoke returned ${revoke_code:-none} (throwaway stack; not failing the smoke)"
   fi
+}
+
+# --- Responses/models phase -----------------------------------------------------
+# Uses the key minted by chat_phase (passed as $1). Verifies caller-filtered
+# discovery and the /v1/responses protocol against the seeded fake provider.
+
+responses_phase() {
+  local smoke_key="$1"
+  local models_status="" body_file=""
+
+  log "requesting model discovery"
+  body_file="$(mktemp)"
+  models_status="$(curl -s --max-time 10 -o "$body_file" -w '%{http_code}' \
+    -H "Authorization: Bearer ${smoke_key}" \
+    "${SMOKE_URL}/v1/models" 2>/dev/null)" || models_status="000"
+  if [ "$models_status" != "200" ] \
+    || ! grep -q '"gateway-echo"' "$body_file" \
+    || grep -q '"fake' "$body_file"; then
+    log "model discovery failed or leaked provider details (HTTP ${models_status:-none}); body follows"
+    cat "$body_file" >&2 2>/dev/null || true
+    rm -f "$body_file"
+    return 12
+  fi
+  log "ok: /v1/models lists only public model metadata"
+
+  log "requesting a non-streaming response from the seeded fake provider"
+  local resp_status=""
+  resp_status="$(curl -s --max-time 15 -o "$body_file" -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${smoke_key}" -H 'Content-Type: application/json' \
+    -d '{"model":"gateway-echo","input":"smoke-responses"}' \
+    "${SMOKE_URL}/v1/responses" 2>/dev/null)" || resp_status="000"
+  if [ "$resp_status" != "200" ] \
+    || ! grep -q '"object":"response"' "$body_file" \
+    || ! grep -q '"status":"completed"' "$body_file" \
+    || ! grep -q '"output_text"' "$body_file"; then
+    log "responses call failed or returned an unexpected envelope (HTTP ${resp_status:-none}); body follows"
+    cat "$body_file" >&2 2>/dev/null || true
+    rm -f "$body_file"
+    return 12
+  fi
+  rm -f "$body_file"
+  log "ok: /v1/responses returned the expected stable envelope"
   return 0
 }
 
@@ -259,9 +306,21 @@ else
 fi
 
 # --- Chat path: admin-minted key, non-streaming fake-provider completion ------
-chat_phase || exit $?
+SMOKE_KEY="" SMOKE_KEY_ID=""
+chat_phase_status=0
+chat_phase || chat_phase_status=$?
+if [ "$chat_phase_status" -ne 0 ]; then
+  exit "$chat_phase_status"
+fi
 
-log "PASS: migration completed, /healthz and /readyz verified, outage and recovery behavior confirmed, chat path verified"
+# --- Responses path: discovery plus the /v1/responses protocol ----------------
+responses_phase "$SMOKE_KEY" || responses_status=$?
+revoke_smoke_key "$SMOKE_KEY_ID"
+if [ "${responses_status:-0}" -ne 0 ]; then
+  exit "$responses_status"
+fi
+
+log "PASS: migration completed, /healthz and /readyz verified, outage and recovery behavior confirmed, chat and responses paths verified"
 if [ "$TEARDOWN" -eq 1 ]; then
   log "tearing down stack and volumes (--down)"
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
