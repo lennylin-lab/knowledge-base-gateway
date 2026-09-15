@@ -117,6 +117,20 @@ defer cancel()
 
 **Example**: `ok, retryAfter, release, err := gate.Allow(...)`; check `err` first, map to 503 `limiter_unavailable`; only `ok=false, err=nil` is a 429.
 
+### Common Mistake: dec.More() misses trailing bracket bytes
+
+**Symptom**: A "strict single JSON document" decoder accepts `{"a":1}]` or
+other non-whitespace trailing bytes.
+
+**Cause**: `json.Decoder.More()` only reports whether another JSON value
+might follow; it does not detect a trailing token that is not a value start.
+Concatenated objects are also silently accepted by a second `Decode` unless
+EOF is asserted.
+
+**Fix / Prevention**: After the first `Decode`, call `dec.Token()` and require
+`errors.Is(err, io.EOF)` — any non-whitespace trailing byte (including `]`,
+`}`, or garbage) then fails the decode. See `internal/httpapi/responses.go`.
+
 ### Convention: Authentication stays outside the shared admission pipeline
 
 **What**: `internal/httpapi` splits handler admission into `authenticate`
