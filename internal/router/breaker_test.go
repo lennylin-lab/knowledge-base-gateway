@@ -112,9 +112,11 @@ func TestAvailablePrefersPriorityAndSkipsOpen(t *testing.T) {
 	backup := Route{ProviderName: "b", Priority: 20, Enabled: true, Breaker: NewBreaker(1, time.Minute)}
 	r.SetRoutes("m", []Route{primary, backup})
 
+	// Available admits at most the first permitted route, so the backup's
+	// permit is never taken while the primary is healthy.
 	got := r.Available("m")
-	if len(got) != 2 || got[0].ProviderName != "p" {
-		t.Fatalf("want primary first, got %+v", got)
+	if len(got) != 1 || got[0].ProviderName != "p" {
+		t.Fatalf("want primary only, got %+v", got)
 	}
 	// Open the primary.
 	r.Record("m", "p", false)
@@ -122,15 +124,18 @@ func TestAvailablePrefersPriorityAndSkipsOpen(t *testing.T) {
 	if len(got) != 1 || got[0].ProviderName != "b" {
 		t.Fatalf("want backup only while primary open, got %+v", got)
 	}
-	// All open: half-open probe of the best route is forced.
+	// All open, cool-downs not elapsed: no route may bypass a breaker permit.
 	r.Record("m", "b", false) // opens backup too (threshold 1)
-	got = r.Available("m")
-	if len(got) != 1 || got[0].ProviderName != "p" {
-		t.Fatalf("want forced probe of primary, got %+v", got)
+	if got = r.Available("m"); len(got) != 0 {
+		t.Fatalf("all-open routes must admit nothing, got %+v", got)
 	}
 	// Disabled routes never appear.
-	r.SetRoutes("m", []Route{primary, {ProviderName: "x", Priority: 1, Enabled: false}})
-	if got = r.Available("m"); len(got) != 1 || got[0].ProviderName != "p" {
+	fresh := NewRoutes()
+	fresh.SetRoutes("m", []Route{
+		{ProviderName: "p", Priority: 10, Enabled: true, Breaker: NewBreaker(1, time.Minute)},
+		{ProviderName: "x", Priority: 1, Enabled: false},
+	})
+	if got = fresh.Available("m"); len(got) != 1 || got[0].ProviderName != "p" {
 		t.Fatalf("disabled route must be skipped, got %+v", got)
 	}
 }

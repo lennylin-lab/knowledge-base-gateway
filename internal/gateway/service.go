@@ -25,7 +25,8 @@ var ErrUnknownModel = errors.New("model not available")
 // same as ErrUnknownModel to avoid leaking policy details.
 var ErrNotPermitted = errors.New("model not permitted")
 
-// ErrNoRoute is returned when every route for a model is disabled or open.
+// ErrNoRoute is returned when a model has no enabled route, or when no
+// route's breaker admits an attempt at execution time.
 var ErrNoRoute = errors.New("no provider route available")
 
 // Candidate is one attemptable route for a request.
@@ -101,15 +102,18 @@ func (s *Service) Capabilities(publicModel string) (model.Capabilities, bool) {
 	return p.Capabilities(info.UpstreamModel), true
 }
 
-// Resolve checks catalog existence, returning the ordered attempt plan.
-// Errors are non-leaky: callers cannot tell whether a model is missing or
-// forbidden.
+// Resolve checks catalog existence, returning the ordered enabled-candidate
+// plan. No breaker permit is taken here: admission happens per attempt in
+// Complete/Stream, immediately before each provider call, so a permit can
+// never be orphaned by a plan that is not fully attempted or by requests
+// rejected between resolution and execution. Errors are non-leaky: callers
+// cannot tell whether a model is missing or forbidden.
 func (s *Service) Resolve(_, publicModel string) (Plan, error) {
 	if _, ok := s.Catalog.Lookup(publicModel); !ok {
 		return Plan{}, ErrUnknownModel
 	}
 	var cands []Candidate
-	for _, rt := range s.Routes.Available(publicModel) {
+	for _, rt := range s.Routes.EnabledRoutes(publicModel) {
 		cands = append(cands, Candidate{
 			Provider: rt.Provider, ProviderName: rt.ProviderName,
 			UpstreamModel: rt.UpstreamModel, Timeout: rt.Timeout,
@@ -186,9 +190,12 @@ func attemptTimeout(ctx context.Context, d time.Duration) (context.Context, cont
 }
 
 // Complete performs a non-streaming completion. Attempts proceed through the
-// candidate order; only pre-output network/429/5xx/timeout failures advance
-// to the next candidate or retry, always within the total deadline. Retry
-// delays follow bounded exponential backoff with jitter, starting at
+// candidate order; each attempt admits its route's breaker permit
+// immediately before the provider call and records the outcome immediately
+// after, so half-open probes are never consumed by requests that stop at an
+// earlier candidate. Only pre-output network/429/5xx/timeout failures
+// advance to the next candidate or retry, always within the total deadline.
+// Retry delays follow bounded exponential backoff with jitter, starting at
 // RetryWait. The second return value names the provider that served (or last
 // attempted) the request for audit purposes.
 func (s *Service) Complete(ctx context.Context, plan Plan, req model.Request) (model.Response, string, error) {
@@ -205,20 +212,24 @@ func (s *Service) Complete(ctx context.Context, plan Plan, req model.Request) (m
 			maxTries = 1 + s.MaxRetries // bounded retries on the primary only
 		}
 		for try := 0; try < maxTries; try++ {
-			attempts++
-			if attempts > 1 {
+			if attempts > 0 {
 				if err := waitBackoff(ctx, bo); err != nil {
 					return model.Response{}, cand.ProviderName, err
 				}
 			}
+			// Admit immediately before the attempt; Record always follows the
+			// call below, so an acquired permit is never orphaned.
+			if !s.Routes.AdmitRoute(plan.PublicModel, cand.ProviderName) {
+				break // breaker refused: fail over to the next candidate
+			}
+			attempts++
 			actx, acancel := attemptTimeout(ctx, cand.Timeout)
 			resp, err := cand.Provider.Complete(actx, creq)
 			acancel()
+			s.Routes.Record(plan.PublicModel, cand.ProviderName, err == nil)
 			if err == nil {
-				s.Routes.Record(plan.PublicModel, cand.ProviderName, true)
 				return resp, cand.ProviderName, nil
 			}
-			s.Routes.Record(plan.PublicModel, cand.ProviderName, false)
 			lastErr = err
 			if ctx.Err() != nil {
 				return model.Response{}, cand.ProviderName, ctx.Err()
@@ -235,6 +246,9 @@ func (s *Service) Complete(ctx context.Context, plan Plan, req model.Request) (m
 }
 
 // Stream performs a streaming completion under the configured total deadline.
+// Each attempt admits its route's breaker permit immediately before the
+// provider call and records the outcome immediately after, so half-open
+// probes are never consumed by requests that stop at an earlier candidate.
 // Failover is permitted only while emit has never succeeded; once output
 // reached the client the error is returned as-is with no retry.
 func (s *Service) Stream(ctx context.Context, plan Plan, req model.Request, emit func(model.Event) error) (string, error) {
@@ -260,15 +274,19 @@ func (s *Service) Stream(ctx context.Context, plan Plan, req model.Request, emit
 				return cand.ProviderName, err
 			}
 		}
+		// Admit immediately before the attempt; Record always follows the
+		// call below, so an acquired permit is never orphaned.
+		if !s.Routes.AdmitRoute(plan.PublicModel, cand.ProviderName) {
+			continue // breaker refused: fail over to the next candidate
+		}
 		attempts++
 		actx, acancel := attemptTimeout(ctx, cand.Timeout)
 		err := cand.Provider.Stream(actx, creq, wrapped)
 		acancel()
+		s.Routes.Record(plan.PublicModel, cand.ProviderName, err == nil)
 		if err == nil {
-			s.Routes.Record(plan.PublicModel, cand.ProviderName, true)
 			return cand.ProviderName, nil
 		}
-		s.Routes.Record(plan.PublicModel, cand.ProviderName, false)
 		lastErr = err
 		if outputStarted || ctx.Err() != nil || !provider.RetryEligible(err) {
 			return cand.ProviderName, err
