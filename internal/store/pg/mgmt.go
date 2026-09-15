@@ -189,7 +189,8 @@ func (d *DB) QueryAudit(ctx context.Context, f mgmt.AuditFilter) ([]audit.Event,
 	rows, err := d.Pool.Query(ctx, `
 		SELECT request_id, subject_id, key_id, model, provider, status,
 		       COALESCE(error_class,''), latency_ms, prompt_tokens, completion_tokens,
-		       streaming, created_at, trace_id, route_attempts, COALESCE(protocol,'chat')
+		       first_token_millis, streaming, created_at, trace_id, route_attempts,
+		       COALESCE(protocol,'chat')
 		FROM llm_requests
 		WHERE ($1 = '' OR request_id = $1)
 		  AND ($2 = '' OR subject_id = $2)
@@ -208,7 +209,8 @@ func (d *DB) QueryAudit(ctx context.Context, f mgmt.AuditFilter) ([]audit.Event,
 		var e audit.Event
 		if err := rows.Scan(&e.RequestID, &e.SubjectID, &e.KeyID, &e.Model, &e.Provider,
 			&e.Status, &e.ErrorClass, &e.LatencyMillis, &e.PromptTokens, &e.CompletionTokens,
-			&e.Streaming, &e.CreatedAt, &e.TraceID, &e.RouteAttempts, &e.Protocol); err != nil {
+			&e.FirstTokenMillis, &e.Streaming, &e.CreatedAt, &e.TraceID, &e.RouteAttempts,
+			&e.Protocol); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -218,10 +220,11 @@ func (d *DB) QueryAudit(ctx context.Context, f mgmt.AuditFilter) ([]audit.Event,
 
 // Usage aggregates request counts, errors, tokens, and latency percentiles
 // per model and protocol. P50/P95 are true PostgreSQL percentiles over the
-// filtered window. cost_micros sums recorded estimates and stays null when
-// no row carries a known cost; pricing configuration does not exist yet, so
-// in practice it is staged null. First-token latency is not recorded by the
-// pipeline yet and is therefore reported as the staged null contract fields.
+// filtered window. First-token percentiles are computed over the rows that
+// recorded one (streams); groups without any recorded value report null —
+// never a fabricated zero. cost_micros sums recorded estimates and stays null
+// when no row carries a known cost; pricing configuration does not exist yet,
+// so in practice it is staged null.
 func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT model, COALESCE(protocol,'chat') AS protocol,
@@ -231,6 +234,8 @@ func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, er
 		       COALESCE(sum(completion_tokens), 0),
 		       COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms), 0),
 		       COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0),
+		       percentile_cont(0.5) WITHIN GROUP (ORDER BY first_token_millis),
+		       percentile_cont(0.95) WITHIN GROUP (ORDER BY first_token_millis),
 		       sum(cost_micros)
 		FROM llm_requests
 		WHERE ($1 = '' OR subject_id = $1)
@@ -249,7 +254,8 @@ func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, er
 	for rows.Next() {
 		var s mgmt.UsageRow
 		if err := rows.Scan(&s.Model, &s.Protocol, &s.Requests, &s.Errors,
-			&s.PromptTokens, &s.OutputTokens, &s.P50Millis, &s.P95Millis, &s.CostMicros); err != nil {
+			&s.PromptTokens, &s.OutputTokens, &s.P50Millis, &s.P95Millis,
+			&s.FirstTokenP50Millis, &s.FirstTokenP95Millis, &s.CostMicros); err != nil {
 			return nil, err
 		}
 		if s.Requests > 0 {

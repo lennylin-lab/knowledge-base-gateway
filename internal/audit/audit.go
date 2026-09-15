@@ -22,6 +22,7 @@ type Event struct {
 	LatencyMillis    int64     `json:"latency_ms"`
 	PromptTokens     *int      `json:"prompt_tokens"`
 	CompletionTokens *int      `json:"completion_tokens"`
+	FirstTokenMillis *int64    `json:"first_token_ms"` // time to first streamed output event; nil when not measured
 	Streaming        bool      `json:"streaming"`
 	CreatedAt        time.Time `json:"created_at"`
 	TraceID          string    `json:"trace_id,omitempty"`

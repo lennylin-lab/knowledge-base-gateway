@@ -77,10 +77,11 @@ func requireVersion(t *testing.T, m *migrate.Migrate, want uint, dirty bool) {
 
 // TestMigrationsAndStores applies every forward migration through the
 // versioned migration tool, exercises the key lifecycle, audit, and V1.2
-// management stores on the real schema, rolls 0003 back through the tool,
-// verifies the new columns and tables are gone, and re-applies to confirm
-// version tracking. It requires a real PostgreSQL instance and is skipped
-// when TEST_DATABASE_URL is not set.
+// management stores on the real schema, verifies the 0004 first-token column
+// round-trips (and rolls back), rolls 0003 back through the tool, verifies
+// the new columns and tables are gone, and re-applies to confirm version
+// tracking. It requires a real PostgreSQL instance and is skipped when
+// TEST_DATABASE_URL is not set.
 func TestMigrationsAndStores(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -103,7 +104,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	requireVersion(t, m, 3, false)
+	requireVersion(t, m, 4, false)
 	if err := m.Up(); !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("second up must be a no-op, got %v", err)
 	}
@@ -155,6 +156,54 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("protocol = %q, want responses", protocol)
 	}
 
+	// V1.3 pipeline: first-token latency persists for streams, stays NULL when
+	// unmeasured, and feeds true percentiles in the usage query.
+	streamEv := audit.Event{
+		RequestID: "req_test_stream", SubjectID: "subject_default", KeyID: gen.Record.ID,
+		Model: "gateway-echo", Provider: "fake-primary", Status: 200,
+		LatencyMillis: 30, FirstTokenMillis: int64Ptr(12), Streaming: true,
+		CreatedAt: time.Now(), TraceID: "req_test_stream", RouteAttempts: 1, Protocol: "chat",
+	}
+	if err := pgw.WriteAudit(ctx, streamEv); err != nil {
+		t.Fatalf("write stream audit: %v", err)
+	}
+	var persisted *int64
+	if err := pgw.Pool.QueryRow(ctx,
+		`SELECT first_token_millis FROM llm_requests WHERE request_id='req_test_stream'`).Scan(&persisted); err != nil {
+		t.Fatalf("read stream audit: %v", err)
+	}
+	if persisted == nil || *persisted != 12 {
+		t.Fatalf("first_token_millis = %v, want 12", persisted)
+	}
+	var unmeasured *int64
+	if err := pgw.Pool.QueryRow(ctx,
+		`SELECT first_token_millis FROM llm_requests WHERE request_id='req_test_1'`).Scan(&unmeasured); err != nil {
+		t.Fatalf("read non-stream audit: %v", err)
+	}
+	if unmeasured != nil {
+		t.Fatalf("unmeasured first token must persist as NULL, got %d", *unmeasured)
+	}
+	queried, err := pgw.QueryAudit(ctx, mgmt.AuditFilter{RequestID: "req_test_stream"})
+	if err != nil || len(queried) != 1 || queried[0].FirstTokenMillis == nil || *queried[0].FirstTokenMillis != 12 {
+		t.Fatalf("audit query first token = %+v err=%v", queried, err)
+	}
+	usageRows, err := pgw.Usage(ctx, mgmt.AuditFilter{Model: "gateway-echo"})
+	if err != nil || len(usageRows) != 2 {
+		t.Fatalf("usage rows = %+v err=%v", usageRows, err)
+	}
+	var chatRow *mgmt.UsageRow
+	for i := range usageRows {
+		if usageRows[i].Protocol == "chat" {
+			chatRow = &usageRows[i]
+		}
+	}
+	if chatRow == nil || chatRow.FirstTokenP50Millis == nil || *chatRow.FirstTokenP50Millis != 12 {
+		t.Fatalf("usage chat row first-token p50 = %+v, want 12 (true percentile over measured rows)", chatRow)
+	}
+	if chatRow.CostMicros != nil {
+		t.Fatalf("cost must stay null while no pricing data exists: %v", chatRow.CostMicros)
+	}
+
 	// V1.2: the seeded model declares its full capability matrix.
 	catalog, err := pgw.LoadCatalog(ctx)
 	if err != nil {
@@ -186,8 +235,14 @@ func TestMigrationsAndStores(t *testing.T) {
 	if err != nil {
 		t.Fatalf("usage: %v", err)
 	}
-	if len(usage) != 1 || usage[0].Requests != 1 || usage[0].Protocol != "responses" {
-		t.Fatalf("usage = %+v", usage)
+	var responsesRow *mgmt.UsageRow
+	for i := range usage {
+		if usage[i].Protocol == "responses" {
+			responsesRow = &usage[i]
+		}
+	}
+	if responsesRow == nil || responsesRow.Requests != 1 {
+		t.Fatalf("usage responses row = %+v", responsesRow)
 	}
 	models, err := pgw.Models(ctx)
 	if err != nil || len(models) != 1 || models[0].Provider != "fake-primary" {
@@ -277,9 +332,29 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatal("management op must default its admin subject")
 	}
 
-	// Roll back 0003 through the tool and confirm the new artifacts are gone.
+	// Roll back 0004 through the tool and confirm the first-token column is
+	// gone, then re-apply it.
 	if err := m.Steps(-1); err != nil {
-		t.Fatalf("roll back one version: %v", err)
+		t.Fatalf("roll back 0004: %v", err)
+	}
+	requireVersion(t, m, 3, false)
+	var firstTokenCols int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_name='llm_requests' AND column_name='first_token_millis'`).Scan(&firstTokenCols); err != nil {
+		t.Fatalf("0004 down check: %v", err)
+	}
+	if firstTokenCols != 0 {
+		t.Fatal("0004 down migration left first_token_millis behind")
+	}
+	if err := m.Up(); err != nil {
+		t.Fatalf("re-apply 0004: %v", err)
+	}
+	requireVersion(t, m, 4, false)
+
+	// Roll back 0003 through the tool and confirm the new artifacts are gone.
+	if err := m.Steps(-2); err != nil {
+		t.Fatalf("roll back two versions: %v", err)
 	}
 	requireVersion(t, m, 2, false)
 	var artifacts int
@@ -300,5 +375,8 @@ func TestMigrationsAndStores(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("re-up: %v", err)
 	}
-	requireVersion(t, m, 3, false)
+	requireVersion(t, m, 4, false)
 }
+
+// int64Ptr is a test helper for optional audit fields.
+func int64Ptr(v int64) *int64 { return &v }

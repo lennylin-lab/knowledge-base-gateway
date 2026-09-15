@@ -52,8 +52,8 @@ func TestMigrationFilesParse(t *testing.T) {
 		versions = append(versions, next)
 		version = next
 	}
-	if len(versions) != 3 {
-		t.Fatalf("expected exactly 3 migration versions, got %v", versions)
+	if len(versions) != 4 {
+		t.Fatalf("expected exactly 4 migration versions, got %v", versions)
 	}
 
 	for _, v := range versions {

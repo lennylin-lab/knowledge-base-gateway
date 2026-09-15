@@ -126,10 +126,11 @@ type AuditFilter struct {
 
 // UsageRow is one aggregated usage line for dashboards. P50/P95 latency is a
 // true percentile in the PostgreSQL implementation; the development-mode
-// service reports a mean and never claims otherwise. The first-token and
-// cost fields are part of the roadmap metric contract but staged: no pipeline
-// records first-token latency yet and pricing configuration does not exist,
-// so they stay null until real data can back them.
+// service reports a mean and never claims otherwise. First-token percentiles
+// cover the rows that recorded one (streams); PostgreSQL reports true
+// percentiles and development mode omits the fields (null) rather than
+// approximating. Cost remains the staged always-null contract field: pricing
+// configuration does not exist yet, so it is never fabricated.
 type UsageRow struct {
 	Model        string  `json:"model"`
 	Protocol     string  `json:"protocol"`
@@ -141,8 +142,11 @@ type UsageRow struct {
 	P50Millis    int64   `json:"p50_latency_ms"`
 	P95Millis    int64   `json:"p95_latency_ms"`
 
-	// Staged metrics: null until the recording pipeline exists. The field
-	// names are contractual so dashboards can detect availability explicitly.
+	// Contract metric fields. First-token percentiles are null until streams
+	// recorded a measurement in the window (dev mode omits them); cost stays
+	// null until a pricing decision lands. The field names are contractual so
+	// dashboards can detect availability explicitly; null means "not
+	// measured", never fabricated zero.
 	FirstTokenP50Millis *int64 `json:"first_token_p50_ms"`
 	FirstTokenP95Millis *int64 `json:"first_token_p95_ms"`
 	CostMicros          *int64 `json:"cost_micros"` // sum of known estimated cost; null when none known
@@ -327,6 +331,8 @@ func (m *MemoryService) QueryAudit(_ context.Context, f AuditFilter) ([]audit.Ev
 
 // Usage aggregates the in-memory snapshot. The latency field is a mean in
 // dev mode (documented); the PostgreSQL implementation reports true P50/P95.
+// Dev mode omits first-token percentiles (they stay null) rather than
+// approximating them; PostgreSQL reports true percentiles over measured rows.
 func (m *MemoryService) Usage(_ context.Context, f AuditFilter) ([]UsageRow, error) {
 	snap := m.Audit.Snapshot()
 	type key struct{ model, protocol string }

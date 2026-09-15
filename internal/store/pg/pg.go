@@ -379,20 +379,20 @@ func (d *DB) LoadGrants(ctx context.Context) ([]ModelGrant, error) {
 
 // --- Audit ---------------------------------------------------------------
 
-// WriteAudit persists one audit event. Token counts stay NULL when usage is
-// unknown; prompt and completion content is never persisted.
+// WriteAudit persists one audit event. Token counts and first-token latency
+// stay NULL when unknown; prompt and completion content is never persisted.
 func (d *DB) WriteAudit(ctx context.Context, e audit.Event) error {
 	_, err := d.Pool.Exec(ctx, `
 		INSERT INTO llm_requests
 			(request_id, subject_id, key_id, model, provider, status, error_class,
-			 latency_ms, prompt_tokens, completion_tokens, streaming, created_at,
-			 trace_id, route_attempts, cost_micros, protocol)
-		VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,NULLIF($16,''))
+			 latency_ms, prompt_tokens, completion_tokens, first_token_millis,
+			 streaming, created_at, trace_id, route_attempts, cost_micros, protocol)
+		VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,NULLIF($17,''))
 		ON CONFLICT (request_id) DO NOTHING`,
 		e.RequestID, e.SubjectID, e.KeyID, e.Model, e.Provider, e.Status, e.ErrorClass,
 		e.LatencyMillis, nullInt(e.PromptTokens), nullInt(e.CompletionTokens),
-		e.Streaming, e.CreatedAt, e.TraceID, e.RouteAttempts, nullInt64(e.CostMicros),
-		e.Protocol)
+		nullInt64(e.FirstTokenMillis), e.Streaming, e.CreatedAt, e.TraceID,
+		e.RouteAttempts, nullInt64(e.CostMicros), e.Protocol)
 	return err
 }
 
