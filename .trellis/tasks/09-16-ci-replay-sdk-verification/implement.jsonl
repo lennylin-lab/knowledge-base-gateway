@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "CI migration/test contract, strict-decoding and golden-fixture conventions that bound any decoder change."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Stable 400 invalid_request semantics for unknown fields; envelope rules for SDK rejection cases."}

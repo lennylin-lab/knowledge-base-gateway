@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verify CI contract unchanged, replay step placement, decoder-change test pins."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify rejection envelopes stay stable and trailing-JSON rules hold."}
