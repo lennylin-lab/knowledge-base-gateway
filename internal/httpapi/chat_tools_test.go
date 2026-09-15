@@ -101,6 +101,10 @@ func TestChatStreamingToolCall(t *testing.T) {
 						if tc.ID == "" || tc.Function.Name == "" {
 							t.Fatalf("first tool_call fragment must carry id and name, got id=%q name=%q", tc.ID, tc.Function.Name)
 						}
+					} else if tc.Function.Name != "" || tc.ID != "" {
+						// Clients concatenate name across fragments; repeating
+						// identity corrupts dispatch (server retest feedback).
+						t.Fatalf("subsequent tool_call fragment must not repeat identity, got id=%q name=%q", tc.ID, tc.Function.Name)
 					}
 					args.WriteString(tc.Function.Arguments)
 				}

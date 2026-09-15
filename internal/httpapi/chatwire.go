@@ -204,13 +204,18 @@ func (e *chatStreamEncoder) Handle(ev model.Event) error {
 				tc.Function.Name = ev.ToolCall.Name
 			}
 			e.openTools[idx] = tc
+			tc.Function.Arguments = ev.Delta
+		} else {
+			// OpenAI streaming convention: the call identity rides only on
+			// the opening fragment; later fragments append arguments by
+			// index. Clients concatenate function.name, so repeating it
+			// corrupts dispatch.
+			frag := &chatToolCall{Type: "function", Index: &idx}
+			frag.Function.Arguments = ev.Delta
+			tc = frag
 		}
 		e.toolSeen = true
-		// Delta chunks carry only the new fragment; id/name/index ride along
-		// so clients can assemble calls by index.
-		frag := *tc
-		frag.Function.Arguments = ev.Delta
-		return e.writeChunk(&chatMessageOut{Role: model.RoleAssistant, ToolCalls: []chatToolCall{frag}}, "")
+		return e.writeChunk(&chatMessageOut{Role: model.RoleAssistant, ToolCalls: []chatToolCall{*tc}}, "")
 	case model.EventArgsDone:
 		// Record the assembled call for final output validation. The
 		// adapter-assembled payload is authoritative when present; otherwise
