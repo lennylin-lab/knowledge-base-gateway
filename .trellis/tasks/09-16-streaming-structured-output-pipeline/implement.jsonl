@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Stream audit classification, truncation-vs-cancellation classes, and never-fabricate rules governing usage settlement."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Provider contract suite, auth/pipeline ordering, golden fixture lock, staged-null metric contract, quota reservation conventions."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Additive migration rules (0004 up/down), unknown-usage-stays-NULL persistence, cmd/migrate usage."}
+{"file": "docs/v1.2-developer-platform-roadmap.md", "reason": "Authoritative capability matrix, structured output contract, and staged observability scope."}
+{"file": "docs/gateway-client-contract.md", "reason": "Client-facing streaming and quota behavior that must remain compatible."}
