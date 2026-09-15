@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 7
-- **Last Active**: 2026-09-15
+- **Total Sessions**: 8
+- **Last Active**: 2026-09-16
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~187 | Active |
+| `journal-1.md` | ~220 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 8 | 2026-09-16 | Resolve issue #1 v1.2 follow-up gaps | `947e12f`, `0f2dd2c`, `ab5b291`, `8d4755d`, `6221be5`, `e9c3540`, `a06da87`, `81f31e2`, `5a4cce6`, `fe0a359`, `3ca7f66`, `84b7d8e` | `master` |
 | 7 | 2026-09-15 | V1.2 unified protocol and developer platform | `af0d60a`, `a09111b`, `556b5e7` | `v1.2` |
 | 6 | 2026-09-15 | Migrate CLI DSN echo sanitization | `e6b371c` | `master` |
 | 5 | 2026-09-15 | Startup hardening and chat-path smoke coverage | `bb3816a`, `25ea579`, `821f36e` | `master` |

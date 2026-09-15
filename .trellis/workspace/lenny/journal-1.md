@@ -185,3 +185,36 @@ Implemented the V1.2 developer platform on branch v1.2 (base master): unified pr
 ### Status
 
 [OK] **Completed**
+
+
+## Session 8: Resolve issue #1 v1.2 follow-up gaps
+<!-- trellis-session: v=2 fp=7973181a5d810680 -->
+
+**Date**: 2026-09-16
+**Task**: Resolve issue #1 v1.2 follow-up gaps
+**Branch**: `master`
+
+### Summary
+
+Completed the resolve-v1-2-followup parent and all three children, closing every one of the 12 issue #1 requirements with zero deferrals. (1) protocol-streaming: tool bounds enforced at shared admission for both protocols; /v1/responses accepts exactly one JSON document; OpenAI clean-EOF-without-[DONE] is a transport truncation with no completed events; Anthropic absent usage stays unknown (never fabricated zeros); streamed final-output validation emits response.failed for responses and audit-visible schema_validation_failed for chat — check caught that built-in adapters wrap emit errors as ClassInternal, so the encoder now records the validation failure for audit classification, pinned with real-adapter tests. (2) quota-provider-safety: input estimate checked against subject max_input_tokens / model context ceiling before rate/quota/provider; SSRF blocklist covers loopback/private/link-local/cloud-metadata IPs with IPv4-mapped-IPv6 canonicalization and a narrow dev allowance; router permits are now taken lazily one per attempt (AdmitRoute/EnabledRoutes) after check found half-open permit starvation wedged backup recovery forever. (3) management-replay-finish: SetModelEnabledWithAudit commits mutation+audit in one transaction with runtime refresh boundary (update_failed vs refresh_failed semantics); /admin/providers gains breaker state/health/24h error summary, /admin/usage gains error_rate plus staged null cost/first-token fields; offline cmd/replay with 12 deterministic fixtures; archived PRD TBD cleanup. Issue #1 updated with two public comments mapping all items to commits; parent validation passed all repo gates (race suite zero-skip, container smoke, replay 12/12, secret scan clean). Deferred notes: DNS-name resolution outside SSRF validation scope (documented boundary); wire replay into a CI step; openai-python SDK compatibility pass.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `947e12f` | fix: close v1.2 protocol admission, decoding, and stream correctness gaps |
+| `0f2dd2c` | docs: capture stream audit classification and decoding lessons in backend specs |
+| `ab5b291` | chore: add v1-2-protocol-streaming task artifacts |
+| `8d4755d` | fix: enforce input token ceilings and harden provider URL safety |
+| `6221be5` | fix: take route breaker permits lazily per attempt to prevent probe starvation |
+| `e9c3540` | docs: document input ceilings and per-attempt routing in README and specs |
+| `a06da87` | chore: add v1-2-quota-provider-safety task artifacts |
+| `81f31e2` | feat: make admin model toggles atomic, audited, and live-applying |
+| `5a4cce6` | feat: add offline replay command with deterministic provider fixtures |
+| `fe0a359` | docs: document management refresh semantics and staged metrics |
+| `3ca7f66` | docs: capture atomic management mutation conventions in backend specs |
+| `84b7d8e` | chore: clean stale placeholder from archived v1.2 prd and add task artifacts |
+
+### Status
+
+[OK] **Completed**
