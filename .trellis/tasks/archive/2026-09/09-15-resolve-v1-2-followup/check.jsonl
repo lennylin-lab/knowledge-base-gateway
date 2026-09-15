@@ -1,0 +1,5 @@
+{"file":"docs/v1.2-developer-platform-roadmap.md","reason":"Final acceptance checklist for issue #1 closure"}
+{"file":"docs/gateway-client-contract.md","reason":"Regression check for existing Chat client behavior"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Quality gate, tests, static checks, and review standards"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Stable error mapping and before-provider-call rejection checks"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Redaction and metadata-only audit verification"}

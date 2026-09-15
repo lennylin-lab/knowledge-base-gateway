@@ -1,0 +1,5 @@
+{"file":"docs/v1.2-developer-platform-roadmap.md","reason":"Authoritative issue #1 acceptance source and staged roadmap scope"}
+{"file":"docs/gateway-client-contract.md","reason":"V1 Chat compatibility contract that all stages must preserve"}
+{"file":"docs/agent-start.md","reason":"Original gateway boundary, error, security, and integration requirements"}
+{"file":".trellis/spec/backend/index.md","reason":"Backend spec index for child task implementers"}
+{"file":".trellis/spec/guides/index.md","reason":"Cross-layer and reuse thinking triggers for staged fixes"}

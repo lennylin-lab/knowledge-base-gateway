@@ -1,0 +1,30 @@
+{
+  "id": "resolve-v1-2-followup",
+  "name": "resolve-v1-2-followup",
+  "title": "Resolve issue #1 v1.2 follow-up gaps",
+  "description": "Resolve the remaining v1.2 protocol, streaming, quota, management, security, and verification gaps tracked in GitHub issue #1 through independently testable stages.",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "lenny",
+  "assignee": "lenny",
+  "createdAt": "2026-09-15",
+  "completedAt": "2026-09-16",
+  "branch": "v1.2",
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "09-15-v1-2-protocol-streaming",
+    "09-15-v1-2-quota-provider-safety",
+    "09-15-v1-2-management-replay-finish"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
