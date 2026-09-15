@@ -218,3 +218,35 @@ Completed the resolve-v1-2-followup parent and all three children, closing every
 ### Status
 
 [OK] **Completed**
+
+
+## Session 9: Streaming pipeline completion and SDK/CI verification
+<!-- trellis-session: v=2 fp=7f4a376d26329bd7 -->
+
+**Date**: 2026-09-16
+**Task**: Streaming pipeline completion and SDK/CI verification
+**Branch**: `master`
+
+### Summary
+
+Closed the remaining staged gaps in two tasks. (1) streaming-structured-output-pipeline: Anthropic structured output translated via the synthesized forced-tool pattern (schema as input_schema, forced tool_choice), unwrapped to protocol-independent text with per-model capability gating; streaming usage settles quotas exactly once (OpenAI streams request stream_options.include_usage, terminal usage chunk parsed; Anthropic message_delta flows through; unknown stream usage keeps the conservative reservation, never fabricated); first_token_millis recorded via additive migration 0004 with true percentiles in /admin/usage PostgreSQL mode; cost stays staged null per product decision (pricing columns deferred until real price data exists). Check pass added the missing chunk-usage sentence to the client contract and a test pinning the outbound include_usage. (2) ci-replay-sdk-verification: replay fixtures now an explicit CI gate step; real openai-python 3.5.0 compatibility matrix (7 scenarios, all PASS) run against a live dev gateway from the sibling venv read-only — two native-shape incompatibilities (flat Responses tool object, text.format) fixed additively in /v1/responses decoding with inner strict decoding preserved (unknown fields, trailing JSON, conflicting spellings all still 400, zero provider calls on rejection); SDK version and required client config documented in quickstart/api-versioning; decoder-compatibility convention captured in specs. All gates green: -race suite, env-gated zero-skip against real PostgreSQL/Redis, migration lifecycle to version 4, replay 12/12, actionlint clean, golden fixtures byte-identical. Remaining deliberate staging: cost pricing columns await real pricing data.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5c851a9` | feat: translate Anthropic structured output via forced-tool pattern |
+| `bef7faf` | feat: settle streaming usage into quotas exactly once |
+| `a120c2f` | feat: record first-token latency with additive migration 0004 |
+| `a2ee970` | docs: document stream usage settlement and structured output |
+| `2bc8582` | docs: capture stream settle and structured-output conventions in specs |
+| `fa37a52` | chore: add streaming-structured-output-pipeline task artifacts |
+| `de4ba86` | ci: run offline replay fixtures as a workflow gate |
+| `d97693d` | feat: accept OpenAI SDK native tool and text.format shapes in /v1/responses |
+| `736edbb` | docs: record openai-python 3.5.0 compatibility matrix and native shapes |
+| `8a7ce37` | docs: capture additive decoder compatibility convention in specs |
+| `03bfd4d` | chore: add ci-replay-sdk-verification task artifacts |
+
+### Status
+
+[OK] **Completed**
