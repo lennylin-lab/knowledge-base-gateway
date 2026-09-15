@@ -3,12 +3,13 @@ package provider
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
 
 func upstreamServer(t *testing.T, handler http.HandlerFunc) *OpenAI {
@@ -16,27 +17,6 @@ func upstreamServer(t *testing.T, handler http.HandlerFunc) *OpenAI {
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 	return NewOpenAI(srv.URL, "sk-upstream-secret")
-}
-
-func TestOpenAIComplete(t *testing.T) {
-	p := upstreamServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer sk-upstream-secret" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"cmpl-1","object":"chat.completion","created":1700000000,"model":"gpt-x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
-	})
-	resp, err := p.Complete(context.Background(), ChatRequest{Model: "gpt-x", Messages: []Message{{Role: "user", Content: "hello"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.ID != "cmpl-1" || len(resp.Choices) != 1 || resp.Choices[0].Message.Content != "hi" {
-		t.Errorf("bad response: %+v", resp)
-	}
-	if !resp.Usage.Known || resp.Usage.TotalTokens != 7 {
-		t.Errorf("usage: %+v", resp.Usage)
-	}
 }
 
 func TestOpenAIErrorClassification(t *testing.T) {
@@ -47,7 +27,7 @@ func TestOpenAIErrorClassification(t *testing.T) {
 	}
 	for code, want := range cases {
 		p := upstreamServer(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) })
-		_, err := p.Complete(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "x"}}})
+		_, err := p.Complete(context.Background(), model.Request{Model: "m", Input: []model.InputItem{{Role: "user", Text: "x"}}})
 		if ClassOf(err) != want {
 			t.Errorf("status %d: class = %v, want %v", code, ClassOf(err), want)
 		}
@@ -60,34 +40,113 @@ func TestOpenAIErrorClassification(t *testing.T) {
 	}
 }
 
-func TestOpenAIStream(t *testing.T) {
+// TestOpenAIWireRequestShape pins the vendor request translation: messages,
+// tool definitions, tool_choice, and response_format must appear in the exact
+// OpenAI Chat Completions shapes.
+func TestOpenAIWireRequestShape(t *testing.T) {
+	temp := 0.5
+	mt := 128
+	var got map[string]any
+	p := upstreamServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusTeapot)
+	})
+	req := model.Request{
+		Model:        "up-model",
+		Instructions: "be brief",
+		Input: []model.InputItem{
+			{Role: model.RoleUser, Text: "weather?"},
+			{ToolCall: &model.ToolCall{ID: "call_1", Name: "get_weather", Arguments: `{"city":"paris"}`}},
+			{ToolResult: &model.ToolResult{CallID: "call_1", Content: "sunny"}},
+			{Role: model.RoleUser, Text: "thanks"},
+		},
+		Temperature: &temp,
+		MaxTokens:   &mt,
+		Tools: []model.ToolDefinition{{
+			Name: "get_weather", Description: "lookup weather",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`),
+		}},
+		ToolChoice: "auto",
+		ResponseSpec: &model.ResponseSpec{
+			Mode: model.ModeJSONSchema, Name: "answer", Strict: true,
+			Schema: json.RawMessage(`{"type":"object"}`),
+		},
+	}
+	_, _ = p.Complete(context.Background(), req)
+
+	if got["model"] != "up-model" || got["temperature"] != 0.5 || got["max_tokens"] != float64(mt) {
+		t.Errorf("generation controls wrong: %v", got)
+	}
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %d, want 5 (system + 4 items): %v", len(msgs), got["messages"])
+	}
+	first, _ := msgs[0].(map[string]any)
+	if first["role"] != "system" || first["content"] != "be brief" {
+		t.Errorf("instructions not hoisted: %v", first)
+	}
+	assistant, _ := msgs[2].(map[string]any)
+	tcs, _ := assistant["tool_calls"].([]any)
+	if assistant["role"] != "assistant" || len(tcs) != 1 {
+		t.Errorf("assistant tool call message wrong: %v", assistant)
+	}
+	tc, _ := tcs[0].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if tc["id"] != "call_1" || fn["name"] != "get_weather" || fn["arguments"] != `{"city":"paris"}` {
+		t.Errorf("tool call wire wrong: %v", tc)
+	}
+	toolMsg, _ := msgs[3].(map[string]any)
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_1" || toolMsg["content"] != "sunny" {
+		t.Errorf("tool result message wrong: %v", toolMsg)
+	}
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %v", got["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["type"] != "function" {
+		t.Errorf("tool type = %v", tool["type"])
+	}
+	fnDef, _ := tool["function"].(map[string]any)
+	if fnDef["name"] != "get_weather" || fnDef["description"] != "lookup weather" {
+		t.Errorf("tool definition wrong: %v", tool)
+	}
+	if got["tool_choice"] != "auto" {
+		t.Errorf("tool_choice = %v", got["tool_choice"])
+	}
+	rf, _ := got["response_format"].(map[string]any)
+	if rf == nil || rf["type"] != "json_schema" {
+		t.Fatalf("response_format = %v", got["response_format"])
+	}
+	js, _ := rf["json_schema"].(map[string]any)
+	if js["name"] != "answer" || js["strict"] != true {
+		t.Errorf("json_schema = %v", js)
+	}
+}
+
+// TestOpenAIStreamUsageSurfaces pins that stream usage is only surfaced when
+// the upstream reports it (never fabricated).
+func TestOpenAIStreamUsageSurfaces(t *testing.T) {
 	p := upstreamServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		f := w.(http.Flusher)
-		for _, chunk := range []string{`{"id":"c","choices":[{"delta":{"content":"he"}}]}`, `{"id":"c","choices":[{"delta":{"content":"y"}}]}`} {
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
-			f.Flush()
-		}
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-		f.Flush()
+		sse(w,
+			`{"id":"c","choices":[{"delta":{"content":"he"}}]}`,
+			`{"id":"c","choices":[{"delta":{"content":"y"}}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}`,
+			`{"id":"c","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		)
 	})
-	var payloads [][]byte
-	err := p.Stream(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "x"}}}, func(pl []byte) error {
-		payloads = append(payloads, pl)
-		return nil
-	})
+	var completed *model.Response
+	err := p.Stream(context.Background(), model.Request{Model: "m", Input: []model.InputItem{{Role: "user", Text: "x"}}},
+		func(e model.Event) error {
+			if e.Kind == model.EventCompleted {
+				completed = e.Response
+			}
+			return nil
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(payloads) != 2 {
-		t.Fatalf("payloads = %d, want 2", len(payloads))
-	}
-	var chunk ChatResponse
-	if err := json.Unmarshal(payloads[0], &chunk); err != nil {
-		t.Fatal(err)
-	}
-	if chunk.Choices[0].Delta.Content != "he" {
-		t.Errorf("chunk = %+v", chunk)
+	if completed == nil || completed.Usage == nil || !completed.Usage.Known || completed.Usage.TotalTokens != 11 {
+		t.Errorf("usage not surfaced: %+v", completed)
 	}
 }
 
@@ -97,36 +156,11 @@ func TestOpenAIUpstreamTimeout(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := p.Complete(ctx, ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "x"}}})
+	_, err := p.Complete(ctx, model.Request{Model: "m", Input: []model.InputItem{{Role: "user", Text: "x"}}})
 	if ClassOf(err) != ClassTimeout {
 		t.Errorf("class = %v, want timeout", ClassOf(err))
 	}
 	if !RetryEligible(err) {
 		t.Errorf("timeout should be retry eligible pre-output")
-	}
-}
-
-func TestFakeProviderEchoAndStream(t *testing.T) {
-	resp, err := Fake{}.Complete(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "abc"}}})
-	if err != nil || resp.Choices[0].Message.Content != "echo: abc" {
-		t.Fatalf("resp = %+v, err = %v", resp, err)
-	}
-	var out strings.Builder
-	f := Fake{}
-	err = f.Stream(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "abcdef"}}}, func(pl []byte) error {
-		var c ChatResponse
-		if err := json.Unmarshal(pl, &c); err != nil {
-			return err
-		}
-		if c.Choices[0].Delta != nil {
-			out.WriteString(c.Choices[0].Delta.Content)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.String() != "echo: abcdef" {
-		t.Errorf("stream = %q", out.String())
 	}
 }

@@ -1,55 +1,16 @@
-// Package provider defines the provider boundary. No SDK types cross it.
+// Package provider defines the provider boundary. No SDK types cross it:
+// adapters translate the internal domain protocol (internal/model) into
+// vendor-specific HTTP protocols, and normalize vendor errors and events
+// back into domain types.
 package provider
 
 import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
-
-// Message is one chat message in OpenAI-compatible form.
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// ChatRequest is the normalized provider request. Model is the upstream name.
-type ChatRequest struct {
-	Model       string      `json:"model"`
-	Messages    []Message   `json:"messages"`
-	Temperature *float64    `json:"temperature,omitempty"`
-	MaxTokens   *int        `json:"max_tokens,omitempty"`
-	Stream      bool        `json:"stream"`
-	RequestID   string      `json:"-"`
-	Metadata    interface{} `json:"-"`
-}
-
-// Usage reports token counts; when the upstream supplies none, Known is false
-// and the values must not be treated as zero.
-type Usage struct {
-	PromptTokens     int  `json:"prompt_tokens"`
-	CompletionTokens int  `json:"completion_tokens"`
-	TotalTokens      int  `json:"total_tokens"`
-	Known            bool `json:"-"`
-}
-
-// Choice is one response choice; Message for non-streaming, Delta for streaming.
-type Choice struct {
-	Index        int      `json:"index"`
-	Message      *Message `json:"message,omitempty"`
-	Delta        *Message `json:"delta,omitempty"`
-	FinishReason string   `json:"finish_reason,omitempty"`
-}
-
-// ChatResponse is the normalized provider response.
-type ChatResponse struct {
-	ID      string   `json:"id"`
-	Object  string   `json:"object"`
-	Created int64    `json:"created"`
-	Model   string   `json:"model"`
-	Choices []Choice `json:"choices"`
-	Usage   *Usage   `json:"usage,omitempty"`
-}
 
 // ErrClass classifies provider failures for error mapping and retry decisions.
 type ErrClass int
@@ -110,10 +71,21 @@ func RetryEligible(err error) bool {
 	return false
 }
 
-// Provider abstracts one upstream vendor. Stream sends already-encoded SSE
-// data payloads (without the "data: " prefix) via send.
+// Provider abstracts one upstream vendor under the unified domain protocol.
+// Complete and Stream consume normalized domain requests; Stream emits domain
+// events (created, deltas, done, completed/failed) through emit. Adapters
+// must honor context cancellation and never surface vendor request/response
+// types through this interface.
 type Provider interface {
-	Complete(ctx context.Context, req ChatRequest) (ChatResponse, error)
-	Stream(ctx context.Context, req ChatRequest, send func(payload []byte) error) error
+	// Name is the adapter identifier used in audit records and routing.
 	Name() string
+	// Capabilities reports what the adapter can do for an upstream model.
+	// Catalog declarations may only narrow this matrix.
+	Capabilities(upstreamModel string) model.Capabilities
+	// Complete performs a non-streaming completion.
+	Complete(ctx context.Context, req model.Request) (model.Response, error)
+	// Stream performs a streaming completion. If emit returns an error the
+	// adapter stops and reports it as a downstream failure; callers never
+	// retry after the first successful emit.
+	Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error
 }

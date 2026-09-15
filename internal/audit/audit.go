@@ -8,23 +8,26 @@ import (
 	"time"
 )
 
-// Event is one metadata-only audit record for a request lifecycle.
+// Event is one metadata-only audit record for a request lifecycle. The JSON
+// tags define the stable management-API projection; there is no field that
+// could carry prompt or completion content.
 type Event struct {
-	RequestID        string
-	SubjectID        string
-	KeyID            string
-	Model            string
-	Provider         string
-	Status           int
-	ErrorClass       string
-	LatencyMillis    int64
-	PromptTokens     *int
-	CompletionTokens *int
-	Streaming        bool
-	CreatedAt        time.Time
-	TraceID          string
-	RouteAttempts    int
-	CostMicros       *int64 // estimated cost; nil when unknown
+	RequestID        string    `json:"request_id"`
+	SubjectID        string    `json:"subject_id"`
+	KeyID            string    `json:"key_id"`
+	Model            string    `json:"model"`
+	Provider         string    `json:"provider"`
+	Status           int       `json:"status"`
+	ErrorClass       string    `json:"error_class,omitempty"`
+	LatencyMillis    int64     `json:"latency_ms"`
+	PromptTokens     *int      `json:"prompt_tokens"`
+	CompletionTokens *int      `json:"completion_tokens"`
+	Streaming        bool      `json:"streaming"`
+	CreatedAt        time.Time `json:"created_at"`
+	TraceID          string    `json:"trace_id,omitempty"`
+	RouteAttempts    int       `json:"route_attempts"`
+	CostMicros       *int64    `json:"cost_micros"` // estimated cost; nil when unknown
+	Protocol         string    `json:"protocol,omitempty"`
 }
 
 // Sink persists audit events. The in-memory sink is development-only; a
@@ -57,6 +60,7 @@ func (m *MemorySink) Write(e Event) {
 			"key_id", e.KeyID,
 			"model", e.Model,
 			"provider", e.Provider,
+			"protocol", e.Protocol,
 			"status", e.Status,
 			"error_class", e.ErrorClass,
 			"latency_ms", e.LatencyMillis,

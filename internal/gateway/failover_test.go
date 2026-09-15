@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/router"
@@ -16,30 +17,34 @@ type scriptedProvider struct {
 	name   string
 	errs   []error // returned in order; nil entries succeed
 	calls  int
-	stream func(s *scriptedProvider, send func([]byte) error) error
+	stream func(s *scriptedProvider, emit func(model.Event) error) error
 }
 
 func (p *scriptedProvider) Name() string { return p.name }
 
-func (p *scriptedProvider) Complete(_ context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
+func (p *scriptedProvider) Capabilities(string) model.Capabilities {
+	return model.Capabilities{Chat: true, Responses: true, Stream: true, Tools: true, Usage: true}
+}
+
+func (p *scriptedProvider) Complete(_ context.Context, _ model.Request) (model.Response, error) {
 	i := p.calls
 	p.calls++
 	if i < len(p.errs) && p.errs[i] != nil {
-		return provider.ChatResponse{}, p.errs[i]
+		return model.Response{}, p.errs[i]
 	}
-	return provider.ChatResponse{ID: "ok-" + p.name}, nil
+	return model.Response{ID: "ok-" + p.name, Status: model.StatusCompleted}, nil
 }
 
-func (p *scriptedProvider) Stream(ctx context.Context, _ provider.ChatRequest, send func([]byte) error) error {
+func (p *scriptedProvider) Stream(ctx context.Context, _ model.Request, emit func(model.Event) error) error {
 	if p.stream != nil {
-		return p.stream(p, send)
+		return p.stream(p, emit)
 	}
 	i := p.calls
 	p.calls++
 	if i < len(p.errs) && p.errs[i] != nil {
 		return p.errs[i]
 	}
-	return send([]byte(`{"ok":true}`))
+	return emit(model.Event{Kind: model.EventTextDelta, Delta: "ok"})
 }
 
 func failoverService(t *testing.T, primary, backup provider.Provider) *Service {
@@ -67,7 +72,7 @@ func TestCompleteFailsOverOnTimeout(t *testing.T) {
 	primary := &scriptedProvider{name: "primary", errs: []error{&provider.Error{Class: provider.ClassTimeout, Msg: "slow"}}}
 	backup := &scriptedProvider{name: "backup"}
 	svc := failoverService(t, primary, backup)
-	resp, name, err := svc.Complete(context.Background(), planFor(t, svc), provider.ChatRequest{})
+	resp, name, err := svc.Complete(context.Background(), planFor(t, svc), model.Request{})
 	if err != nil || resp.ID != "ok-backup" {
 		t.Fatalf("want backup success, got resp=%v err=%v", resp, err)
 	}
@@ -81,7 +86,7 @@ func TestCompleteFailsOverOn429And5xx(t *testing.T) {
 		primary := &scriptedProvider{name: "primary", errs: []error{&provider.Error{Class: class, Msg: "x"}}}
 		backup := &scriptedProvider{name: "backup"}
 		svc := failoverService(t, primary, backup)
-		if _, name, err := svc.Complete(context.Background(), planFor(t, svc), provider.ChatRequest{}); err != nil || name != "backup" {
+		if _, name, err := svc.Complete(context.Background(), planFor(t, svc), model.Request{}); err != nil || name != "backup" {
 			t.Fatalf("class %v: want backup, got %s err=%v", class, name, err)
 		}
 	}
@@ -91,7 +96,7 @@ func TestCompleteDoesNotRetryInvalid(t *testing.T) {
 	primary := &scriptedProvider{name: "primary", errs: []error{&provider.Error{Class: provider.ClassInvalid, Msg: "bad"}}}
 	backup := &scriptedProvider{name: "backup"}
 	svc := failoverService(t, primary, backup)
-	_, name, err := svc.Complete(context.Background(), planFor(t, svc), provider.ChatRequest{})
+	_, name, err := svc.Complete(context.Background(), planFor(t, svc), model.Request{})
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -104,15 +109,15 @@ func TestCompleteDoesNotRetryInvalid(t *testing.T) {
 }
 
 func TestStreamNoSwitchAfterOutput(t *testing.T) {
-	primary := &scriptedProvider{name: "primary", stream: func(p *scriptedProvider, send func([]byte) error) error {
-		if err := send([]byte(`{"delta":1}`)); err != nil {
+	primary := &scriptedProvider{name: "primary", stream: func(p *scriptedProvider, emit func(model.Event) error) error {
+		if err := emit(model.Event{Kind: model.EventTextDelta, Delta: "1"}); err != nil {
 			return err
 		}
 		return &provider.Error{Class: provider.ClassNetwork, Msg: "stream broke"}
 	}}
 	backup := &scriptedProvider{name: "backup"}
 	svc := failoverService(t, primary, backup)
-	_, err := svc.Stream(context.Background(), planFor(t, svc), provider.ChatRequest{}, func([]byte) error { return nil })
+	_, err := svc.Stream(context.Background(), planFor(t, svc), model.Request{}, func(model.Event) error { return nil })
 	if err == nil {
 		t.Fatal("want stream error")
 	}
@@ -125,10 +130,10 @@ func TestStreamFailsOverBeforeOutput(t *testing.T) {
 	primary := &scriptedProvider{name: "primary", errs: []error{&provider.Error{Class: provider.ClassNetwork, Msg: "connect failed"}}}
 	backup := &scriptedProvider{name: "backup"}
 	svc := failoverService(t, primary, backup)
-	var got []byte
-	name, err := svc.Stream(context.Background(), planFor(t, svc), provider.ChatRequest{}, func(b []byte) error { got = b; return nil })
-	if err != nil || len(got) == 0 {
-		t.Fatalf("want backup stream, got err=%v payload=%s", err, got)
+	var got model.Event
+	name, err := svc.Stream(context.Background(), planFor(t, svc), model.Request{}, func(e model.Event) error { got = e; return nil })
+	if err != nil || got.Kind == "" {
+		t.Fatalf("want backup stream, got err=%v event=%v", err, got)
 	}
 	if name != "backup" {
 		t.Fatalf("want backup, got %s", name)
@@ -136,9 +141,9 @@ func TestStreamFailsOverBeforeOutput(t *testing.T) {
 }
 
 func TestFailoverHonorsTotalDeadline(t *testing.T) {
-	block := func(ctx context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
+	block := func(ctx context.Context, _ model.Request) (model.Response, error) {
 		<-ctx.Done()
-		return provider.ChatResponse{}, ctx.Err()
+		return model.Response{}, ctx.Err()
 	}
 	slowPrimary := &deadlineProvider{name: "primary", fn: block}
 	backup := &scriptedProvider{name: "backup"}
@@ -152,7 +157,7 @@ func TestFailoverHonorsTotalDeadline(t *testing.T) {
 			Breaker: router.NewBreaker(5, time.Minute), Timeout: 5 * time.Second},
 	})
 	start := time.Now()
-	_, _, err := svc.Complete(context.Background(), planFor(t, svc), provider.ChatRequest{})
+	_, _, err := svc.Complete(context.Background(), planFor(t, svc), model.Request{})
 	if err == nil {
 		t.Fatal("want deadline error despite backup (total deadline exceeded)")
 	}
@@ -164,14 +169,17 @@ func TestFailoverHonorsTotalDeadline(t *testing.T) {
 
 type deadlineProvider struct {
 	name string
-	fn   func(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error)
+	fn   func(ctx context.Context, req model.Request) (model.Response, error)
 }
 
 func (p *deadlineProvider) Name() string { return p.name }
-func (p *deadlineProvider) Complete(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
+func (p *deadlineProvider) Capabilities(string) model.Capabilities {
+	return model.Capabilities{Chat: true, Responses: true, Stream: true}
+}
+func (p *deadlineProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	return p.fn(ctx, req)
 }
-func (p *deadlineProvider) Stream(ctx context.Context, _ provider.ChatRequest, _ func([]byte) error) error {
+func (p *deadlineProvider) Stream(ctx context.Context, _ model.Request, _ func(model.Event) error) error {
 	<-ctx.Done()
 	return ctx.Err()
 }

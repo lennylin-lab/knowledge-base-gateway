@@ -1,0 +1,1 @@
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"echo: hello","role":"assistant"}}],"created":0,"id":"\u003cid\u003e","model":"upstream-golden","object":"chat.completion","usage":{"completion_tokens":11,"prompt_tokens":10,"total_tokens":21}}

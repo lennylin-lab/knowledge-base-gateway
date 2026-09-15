@@ -3,11 +3,11 @@ package provider
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
+
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
 
 func TestValidateBaseURL(t *testing.T) {
@@ -32,7 +32,11 @@ func TestValidateBaseURL(t *testing.T) {
 	}
 }
 
-func TestAnthropicCompleteContract(t *testing.T) {
+// TestAnthropicWireRequestShape pins the vendor request translation:
+// system hoisting, content blocks, tool definitions with input_schema, and
+// tool_choice mapping.
+func TestAnthropicWireRequestShape(t *testing.T) {
+	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/messages" {
 			t.Errorf("path = %s", r.URL.Path)
@@ -40,73 +44,102 @@ func TestAnthropicCompleteContract(t *testing.T) {
 		if r.Header.Get("x-api-key") != "secret" || r.Header.Get("anthropic-version") == "" {
 			t.Error("missing anthropic auth headers")
 		}
-		var req map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		if req["system"] != "be brief" || req["max_tokens"].(float64) != 64 {
-			t.Errorf("bad request body: %v", req)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-x",
-			"content":     []map[string]string{{"type": "text", "text": "hello"}},
-			"stop_reason": "end_turn",
-			"usage":       map[string]int{"input_tokens": 5, "output_tokens": 2},
-		})
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusTeapot)
 	}))
 	defer srv.Close()
 
 	a := NewAnthropic(srv.URL, "secret")
 	mt := 64
-	resp, err := a.Complete(context.Background(), ChatRequest{
-		Model: "claude-x",
-		Messages: []Message{
-			{Role: "system", Content: "be brief"},
-			{Role: "user", Content: "hi"},
+	req := model.Request{
+		Model:        "claude-x",
+		Instructions: "be brief",
+		Input: []model.InputItem{
+			{Role: model.RoleUser, Text: "weather?"},
+			{ToolCall: &model.ToolCall{ID: "call_1", Name: "get_weather", Arguments: `{"city":"paris"}`}},
+			{ToolResult: &model.ToolResult{CallID: "call_1", Content: "sunny"}},
 		},
 		MaxTokens: &mt,
-	})
-	if err != nil {
-		t.Fatal(err)
+		Tools: []model.ToolDefinition{{
+			Name:        "get_weather",
+			Description: "lookup weather",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`),
+		}},
+		ToolChoice: "required",
 	}
-	if resp.Object != "chat.completion" || resp.Choices[0].Message.Content != "hello" {
-		t.Fatalf("unexpected normalized response: %+v", resp)
+	_, _ = a.Complete(context.Background(), req)
+
+	if got["system"] != "be brief" || got["max_tokens"] != float64(64) {
+		t.Errorf("system/max_tokens wrong: %v", got)
 	}
-	if !resp.Usage.Known || resp.Usage.TotalTokens != 7 {
-		t.Fatalf("usage not normalized: %+v", resp.Usage)
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %d, want 3 (user text, assistant tool_use, user tool_result): %v", len(msgs), got["messages"])
 	}
-	if resp.Choices[0].FinishReason != "stop" {
-		t.Fatalf("stop_reason not mapped: %q", resp.Choices[0].FinishReason)
+	first, _ := msgs[0].(map[string]any)
+	if first["role"] != "user" {
+		t.Errorf("first message role = %v", first["role"])
+	}
+	second, _ := msgs[1].(map[string]any)
+	if second["role"] != "assistant" {
+		t.Errorf("tool call must ride in an assistant turn: %v", second)
+	}
+	blocks, _ := second["content"].([]any)
+	if len(blocks) != 1 {
+		t.Fatalf("assistant blocks = %v", second["content"])
+	}
+	call, _ := blocks[0].(map[string]any)
+	if call["type"] != "tool_use" || call["id"] != "call_1" || call["name"] != "get_weather" {
+		t.Errorf("tool_use block wrong: %v", call)
+	}
+	input, _ := call["input"].(map[string]any)
+	if input["city"] != "paris" {
+		t.Errorf("tool_use input wrong: %v", input)
+	}
+	third, _ := msgs[2].(map[string]any)
+	if third["role"] != "user" {
+		t.Errorf("tool result must ride in a user turn: %v", third)
+	}
+	rblocks, _ := third["content"].([]any)
+	res, _ := rblocks[0].(map[string]any)
+	if res["type"] != "tool_result" || res["tool_use_id"] != "call_1" || res["content"] != "sunny" {
+		t.Errorf("tool_result block wrong: %v", res)
+	}
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %v", got["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["name"] != "get_weather" || tool["input_schema"] == nil {
+		t.Errorf("tool definition wrong: %v", tool)
+	}
+	tc, _ := got["tool_choice"].(map[string]any)
+	if tc == nil || tc["type"] != "any" {
+		t.Errorf("tool_choice required must map to any: %v", got["tool_choice"])
 	}
 }
 
-func TestAnthropicStreamContract(t *testing.T) {
+// TestAnthropicRejectsResponseSpec asserts the adapter-level guard for a
+// capability the Messages API translation cannot honor.
+func TestAnthropicRejectsResponseSpec(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "event: message_start\n")
-		io.WriteString(w, `data: {"type":"message_start","message":{"id":"msg_2","model":"claude-x"}}`+"\n\n")
-		io.WriteString(w, "event: content_block_delta\n")
-		io.WriteString(w, `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"he"}}`+"\n\n")
-		io.WriteString(w, "event: content_block_delta\n")
-		io.WriteString(w, `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"y"}}`+"\n\n")
-		io.WriteString(w, "event: message_delta\n")
-		io.WriteString(w, `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`+"\n\n")
-		io.WriteString(w, "event: message_stop\n")
-		io.WriteString(w, `data: {"type":"message_stop"}`+"\n\n")
+		t.Error("provider must not be called when the spec cannot be translated")
 	}))
 	defer srv.Close()
-
 	a := NewAnthropic(srv.URL, "secret")
-	var chunks []string
-	err := a.Stream(context.Background(), ChatRequest{Model: "claude-x"}, func(b []byte) error {
-		chunks = append(chunks, string(b))
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+	req := model.Request{
+		Model: "claude-x",
+		Input: []model.InputItem{{Role: model.RoleUser, Text: "hi"}},
+		ResponseSpec: &model.ResponseSpec{
+			Mode:   model.ModeJSONSchema,
+			Schema: json.RawMessage(`{"type":"object"}`),
+		},
 	}
-	joined := strings.Join(chunks, "\n")
-	for _, want := range []string{`"object":"chat.completion.chunk"`, `"content":"he"`, `"content":"y"`, `"finish_reason":"stop"`} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("stream chunks missing %s in %s", want, joined)
-		}
+	_, err := a.Complete(context.Background(), req)
+	if err == nil {
+		t.Fatal("structured output must be rejected by this adapter")
+	}
+	if err.Error() == "" {
+		t.Fatal("error must be descriptive")
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"maps"
 	"slices"
 	"sync"
+
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
 
 // Policy is the checked access decision source. It reports whether a subject
@@ -56,12 +58,17 @@ type Catalog struct {
 	models map[string]ModelInfo
 }
 
-// ModelInfo describes one catalog entry.
+// ModelInfo describes one catalog entry. Capabilities is the public model
+// capability matrix; when Declared is false the gateway derives the matrix
+// from the provider adapter. ConfigVersion versions the capability/route
+// configuration for audit correlation.
 type ModelInfo struct {
 	PublicName    string
 	Provider      string
 	UpstreamModel string
 	Enabled       bool
+	Capabilities  model.Capabilities
+	ConfigVersion int
 }
 
 // NewCatalog builds a catalog from entries.
@@ -79,6 +86,20 @@ func (c *Catalog) Lookup(publicModel string) (ModelInfo, bool) {
 	defer c.mu.RUnlock()
 	m, ok := c.models[publicModel]
 	return m, ok && m.Enabled
+}
+
+// SetEnabled flips a catalog entry's enabled flag (management operation).
+// It reports whether the model exists.
+func (c *Catalog) SetEnabled(publicModel string, enabled bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, ok := c.models[publicModel]
+	if !ok {
+		return false
+	}
+	m.Enabled = enabled
+	c.models[publicModel] = m
+	return true
 }
 
 // Permitted reports whether a subject may use a model that has already been

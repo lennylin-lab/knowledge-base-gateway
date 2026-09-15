@@ -55,6 +55,10 @@ type Config struct {
 	AllowInsecure bool   // GATEWAY_ALLOW_INSECURE_BASE_URLS (dev only)
 	AnthropicKey  string
 	AnthropicURL  string
+
+	// V1.2 developer platform. ResponsesEnabled is the independent endpoint
+	// rollback switch; per-model gates live in the catalog capability matrix.
+	ResponsesEnabled bool
 }
 
 // FromEnv builds a Config from environment variables and validates it.
@@ -182,6 +186,11 @@ func FromEnv() (Config, error) {
 	default:
 		return c, fmt.Errorf("GATEWAY_LIMITS_MODE: want \"local\" or \"redis\", got %q", c.LimitsMode)
 	}
+
+	// V1.2 Responses endpoint: enabled by default; set to "false" to disable
+	// the endpoint independently of Chat Completions (documented rollback
+	// switch). Per-model gates live in the catalog capability matrix.
+	c.ResponsesEnabled = os.Getenv("GATEWAY_RESPONSES_ENABLED") != "false"
 	return c, nil
 }
 

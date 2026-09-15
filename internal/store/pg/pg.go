@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -250,10 +251,13 @@ type RouteConfig struct {
 	Enabled       bool
 }
 
-// LoadCatalog reads enabled catalog entries.
+// LoadCatalog reads enabled catalog entries including their declared
+// capability matrix and configuration version. Capabilities is the public
+// routing constraint; empty JSONB means the adapter-level matrix applies.
 func (d *DB) LoadCatalog(ctx context.Context) ([]policy.ModelInfo, error) {
 	rows, err := d.Pool.Query(ctx,
-		`SELECT public_name, provider, upstream_model, enabled FROM model_catalog WHERE enabled`)
+		`SELECT public_name, provider, upstream_model, enabled, COALESCE(capabilities, '{}'::jsonb), config_version
+		 FROM model_catalog WHERE enabled`)
 	if err != nil {
 		return nil, err
 	}
@@ -261,8 +265,12 @@ func (d *DB) LoadCatalog(ctx context.Context) ([]policy.ModelInfo, error) {
 	var out []policy.ModelInfo
 	for rows.Next() {
 		var m policy.ModelInfo
-		if err := rows.Scan(&m.PublicName, &m.Provider, &m.UpstreamModel, &m.Enabled); err != nil {
+		var caps []byte
+		if err := rows.Scan(&m.PublicName, &m.Provider, &m.UpstreamModel, &m.Enabled, &caps, &m.ConfigVersion); err != nil {
 			return nil, err
+		}
+		if err := json.Unmarshal(caps, &m.Capabilities); err != nil {
+			return nil, fmt.Errorf("model %s: parse capabilities: %w", m.PublicName, err)
 		}
 		out = append(out, m)
 	}
@@ -377,12 +385,13 @@ func (d *DB) WriteAudit(ctx context.Context, e audit.Event) error {
 		INSERT INTO llm_requests
 			(request_id, subject_id, key_id, model, provider, status, error_class,
 			 latency_ms, prompt_tokens, completion_tokens, streaming, created_at,
-			 trace_id, route_attempts, cost_micros)
-		VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15)
+			 trace_id, route_attempts, cost_micros, protocol)
+		VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,NULLIF($16,''))
 		ON CONFLICT (request_id) DO NOTHING`,
 		e.RequestID, e.SubjectID, e.KeyID, e.Model, e.Provider, e.Status, e.ErrorClass,
 		e.LatencyMillis, nullInt(e.PromptTokens), nullInt(e.CompletionTokens),
-		e.Streaming, e.CreatedAt, e.TraceID, e.RouteAttempts, nullInt64(e.CostMicros))
+		e.Streaming, e.CreatedAt, e.TraceID, e.RouteAttempts, nullInt64(e.CostMicros),
+		e.Protocol)
 	return err
 }
 

@@ -32,7 +32,7 @@ func TestChatLimiterUnavailableMapsTo503(t *testing.T) {
 	salt, _ := auth.NewSalt()
 	key := "kb_test_key"
 	store.Put(auth.KeyRecord{ID: "key_1", Subject: "s", Salt: salt, Hash: auth.HashAPIKey(salt, key), Status: auth.StatusActive, CreatedAt: time.Now()})
-	catalog := policy.NewCatalog([]policy.ModelInfo{{PublicName: "m", Provider: "fake", UpstreamModel: "up", Enabled: true}})
+	catalog := policy.NewCatalog([]policy.ModelInfo{{PublicName: "m", Provider: "fake", UpstreamModel: "up", Enabled: true, Capabilities: testCaps()}})
 	pol := policy.New()
 	pol.AllowAll("s")
 	chat := &ChatHandler{

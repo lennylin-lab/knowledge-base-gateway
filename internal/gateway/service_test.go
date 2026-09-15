@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 )
@@ -13,21 +14,25 @@ type slowProvider struct{ delay time.Duration }
 
 func (slowProvider) Name() string { return "slow" }
 
-func (s slowProvider) Complete(ctx context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
+func (s slowProvider) Capabilities(string) model.Capabilities {
+	return model.Capabilities{Chat: true, Responses: true, Stream: true}
+}
+
+func (s slowProvider) Complete(ctx context.Context, _ model.Request) (model.Response, error) {
 	select {
 	case <-ctx.Done():
-		return provider.ChatResponse{}, ctx.Err()
+		return model.Response{}, ctx.Err()
 	case <-time.After(s.delay):
-		return provider.ChatResponse{ID: "ok"}, nil
+		return model.Response{ID: "ok", Status: model.StatusCompleted}, nil
 	}
 }
 
-func (s slowProvider) Stream(ctx context.Context, _ provider.ChatRequest, send func([]byte) error) error {
+func (s slowProvider) Stream(ctx context.Context, _ model.Request, emit func(model.Event) error) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(s.delay):
-		return send([]byte("{}"))
+		return emit(model.Event{Kind: model.EventTextDelta, Delta: "{}"})
 	}
 }
 
@@ -45,7 +50,7 @@ func TestCompleteEnforcesTotalDeadline(t *testing.T) {
 	if rerr != nil {
 		t.Fatalf("resolve: %v", rerr)
 	}
-	if _, _, err := svc.Complete(ctx, plan, provider.ChatRequest{}); err == nil {
+	if _, _, err := svc.Complete(ctx, plan, model.Request{}); err == nil {
 		t.Fatal("expected deadline error")
 	}
 	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
@@ -61,7 +66,7 @@ func TestStreamEnforcesTotalDeadline(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if _, err := svc.Stream(ctx, plan, provider.ChatRequest{}, func([]byte) error { return nil }); err == nil {
+	if _, err := svc.Stream(ctx, plan, model.Request{}, func(model.Event) error { return nil }); err == nil {
 		t.Fatal("expected deadline error")
 	}
 }

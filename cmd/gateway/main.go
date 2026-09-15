@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/httpapi"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/mgmt"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
@@ -243,11 +245,27 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		auditSink = audit.NewMemorySink(logger)
 	}
 
+	// Management service: database mode uses the PostgreSQL queries (the DB
+	// satisfies mgmt.Service); development mode uses the in-memory service
+	// over the catalog, route table, and audit sink.
+	var mgmtSvc mgmt.Service
+	if dbw != nil {
+		mgmtSvc = dbw
+	} else {
+		mgmtSvc = mgmt.NewMemoryService(catalog, pol, svc.Routes, auditSink.(*audit.MemorySink), providerViews(providers))
+	}
+
 	chat := &httpapi.ChatHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
 		Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxMsgs: cfg.MaxMessages, MaxChars: cfg.MaxMessageChars,
 	}
+	responses := &httpapi.ResponsesHandler{
+		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
+		Audit: auditSink, Metrics: reg,
+		MaxBody: cfg.MaxBodyBytes, MaxItems: cfg.MaxMessages * 2, MaxChars: cfg.MaxMessageChars,
+	}
+	models := &httpapi.ModelsHandler{Auth: keyAuth, Service: svc, Policy: pol}
 
 	ready := func() bool {
 		if dbw != nil {
@@ -268,10 +286,16 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		return catalog != nil && len(catalog.All()) > 0
 	}
 
+	var responsesHandler http.Handler = responses
+	if !cfg.ResponsesEnabled {
+		responsesHandler = nil // documented rollback switch
+	}
 	mux := httpapi.NewMux(chat, httpapi.Deps{
-		Logger:  logger,
-		ReadyFn: ready,
-		Metrics: reg.Handler(),
+		Logger:    logger,
+		ReadyFn:   ready,
+		Metrics:   reg.Handler(),
+		Responses: responsesHandler,
+		Models:    models,
 	})
 
 	// Bind both listeners synchronously so a port conflict is an ordinary
@@ -294,7 +318,9 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		defer func() { _ = adminLn.Close() }()
 		adminSrv = &http.Server{
 			Addr: cfg.AdminAddr, ReadHeaderTimeout: 10 * time.Second,
-			Handler: httpapi.NewAdminMux(httpapi.AdminDeps{Manager: keyManager, Logger: logger, Token: cfg.AdminToken}),
+			Handler: httpapi.NewAdminMux(httpapi.AdminDeps{
+				Manager: keyManager, Logger: logger, Token: cfg.AdminToken, Mgmt: mgmtSvc,
+			}),
 		}
 	}
 
@@ -384,6 +410,17 @@ func newProviderFromRegistry(cfg config.Config, kind, name, baseURL string) (pro
 	default:
 		return nil, fmt.Errorf("provider %s: unsupported kind %q", name, kind)
 	}
+}
+
+// providerViews snapshots the provider registry for the dev-mode management
+// service. Endpoints and credentials are never included.
+func providerViews(providers map[string]provider.Provider) []mgmt.ProviderView {
+	out := make([]mgmt.ProviderView, 0, len(providers))
+	for name := range providers {
+		out = append(out, mgmt.ProviderView{Name: name, Kind: providers[name].Name(), Enabled: true})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // redisReady pings Redis for readiness checks.

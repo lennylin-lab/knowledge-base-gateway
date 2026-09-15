@@ -15,6 +15,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 )
@@ -30,16 +31,23 @@ type flakyProvider struct {
 
 func (f *flakyProvider) Name() string { return "flaky" }
 
-func (f *flakyProvider) Complete(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
+func (f *flakyProvider) Capabilities(m string) model.Capabilities {
+	if f.inner != nil {
+		return f.inner.Capabilities(m)
+	}
+	return model.Capabilities{Chat: true, Responses: true, Stream: true, Tools: true, Usage: true}
+}
+
+func (f *flakyProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	f.calls++
 	if f.calls <= f.fails {
-		return provider.ChatResponse{}, f.returnErr
+		return model.Response{}, f.returnErr
 	}
 	return f.inner.Complete(ctx, req)
 }
 
-func (f *flakyProvider) Stream(ctx context.Context, req provider.ChatRequest, send func([]byte) error) error {
-	return f.inner.Stream(ctx, req, send)
+func (f *flakyProvider) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
+	return f.inner.Stream(ctx, req, emit)
 }
 
 func newTestHandler(t *testing.T, p provider.Provider, rate int) (*ChatHandler, *audit.MemorySink) {
@@ -52,7 +60,7 @@ func newTestHandler(t *testing.T, p provider.Provider, rate int) (*ChatHandler, 
 	store.Put(auth.KeyRecord{ID: "key-1", Subject: "subject-a", Salt: salt, Hash: auth.HashAPIKey(salt, testKey), Status: auth.StatusActive})
 
 	catalog := policy.NewCatalog([]policy.ModelInfo{
-		{PublicName: "gpt-test", Provider: p.Name(), UpstreamModel: "upstream-gpt-test", Enabled: true},
+		{PublicName: "gpt-test", Provider: p.Name(), UpstreamModel: "upstream-gpt-test", Enabled: true, Capabilities: testCaps()},
 		{PublicName: "disabled", Provider: p.Name(), UpstreamModel: "x", Enabled: false},
 	})
 	pol := policy.New()
@@ -154,7 +162,7 @@ func TestNonStreamingContract(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	var resp provider.ChatResponse
+	var resp chatCompletionOut
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
@@ -297,4 +305,11 @@ func TestMethodNotAllowed(t *testing.T) {
 	if rec.Code != 405 {
 		t.Errorf("status = %d, want 405", rec.Code)
 	}
+}
+
+// testCaps is the declared catalog capability matrix used by the legacy
+// contract tests: text chat with streaming and usage, no clamps, so the
+// documented request arithmetic in these tests stays exact.
+func testCaps() model.Capabilities {
+	return model.Capabilities{Chat: true, Responses: true, Stream: true, Usage: true}
 }

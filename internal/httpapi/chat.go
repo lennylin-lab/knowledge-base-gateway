@@ -2,11 +2,9 @@ package httpapi
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -15,21 +13,131 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
 )
 
-var errValidation = errors.New("invalid request")
+// errValidation aliases the domain validation sentinel so both handler-level
+// and domain-level validation failures map to the same 400-class envelope.
+var errValidation = model.ErrValidation
 
-// chatRequest is the accepted OpenAI-compatible request subset.
+// chatRequest is the accepted OpenAI-compatible request subset. The V1.2
+// additions (tools, tool_choice, response_format) are additive: every
+// pre-V1.2 field keeps its exact semantics.
 type chatRequest struct {
-	Model       string             `json:"model"`
-	Messages    []provider.Message `json:"messages"`
-	Temperature *float64           `json:"temperature"`
-	MaxTokens   *int               `json:"max_tokens"`
-	Stream      bool               `json:"stream"`
-	Metadata    json.RawMessage    `json:"metadata"`
+	Model          string            `json:"model"`
+	Messages       []chatWireMessage `json:"messages"`
+	Temperature    *float64          `json:"temperature"`
+	MaxTokens      *int              `json:"max_tokens"`
+	Stream         bool              `json:"stream"`
+	Metadata       json.RawMessage   `json:"metadata"`
+	Tools          []chatWireTool    `json:"tools"`
+	ToolChoice     string            `json:"tool_choice"`
+	ResponseFormat *chatWireFormat   `json:"response_format"`
+}
+
+// chatWireMessage decodes messages including the tool-calling extensions.
+// Plain text messages decode exactly as before.
+type chatWireMessage struct {
+	Role       string           `json:"role"`
+	Content    string           `json:"content"`
+	ToolCallID string           `json:"tool_call_id"`
+	ToolCalls  []chatToolCallIn `json:"tool_calls"`
+}
+
+type chatToolCallIn struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type chatWireTool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  json.RawMessage `json:"parameters"`
+	} `json:"function"`
+}
+
+type chatWireFormat struct {
+	Type       string `json:"type"`
+	JSONSchema struct {
+		Name   string          `json:"name"`
+		Schema json.RawMessage `json:"schema"`
+		Strict bool            `json:"strict"`
+	} `json:"json_schema"`
+}
+
+// toDomain translates the chat wire request into the domain request.
+func (req *chatRequest) toDomain(requestID string) (model.Request, error) {
+	mreq := model.Request{
+		PublicModel: req.Model,
+		Stream:      req.Stream,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		RequestID:   requestID,
+		Metadata:    req.Metadata,
+	}
+	switch req.ToolChoice {
+	case "", "auto", "none", "required":
+		mreq.ToolChoice = req.ToolChoice
+	default:
+		return mreq, fmt.Errorf("%w: tool_choice must be auto, none, or required", errValidation)
+	}
+	for _, m := range req.Messages {
+		switch {
+		case len(m.ToolCalls) > 0:
+			for _, tc := range m.ToolCalls {
+				if tc.Type != "" && tc.Type != "function" {
+					return mreq, fmt.Errorf("%w: unsupported tool call type", errValidation)
+				}
+				mreq.Input = append(mreq.Input, model.InputItem{
+					Role: m.Role,
+					ToolCall: &model.ToolCall{
+						ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
+					},
+				})
+			}
+			if m.Content != "" {
+				mreq.Input = append(mreq.Input, model.InputItem{Role: m.Role, Text: m.Content})
+			}
+		case m.ToolCallID != "":
+			mreq.Input = append(mreq.Input, model.InputItem{
+				Role:       model.RoleTool,
+				ToolResult: &model.ToolResult{CallID: m.ToolCallID, Content: m.Content},
+			})
+		default:
+			mreq.Input = append(mreq.Input, model.InputItem{Role: m.Role, Text: m.Content})
+		}
+	}
+	for _, t := range req.Tools {
+		if t.Type != "" && t.Type != "function" {
+			return mreq, fmt.Errorf("%w: unsupported tool type", errValidation)
+		}
+		mreq.Tools = append(mreq.Tools, model.ToolDefinition{
+			Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters,
+		})
+	}
+	if req.ResponseFormat != nil {
+		spec := &model.ResponseSpec{Mode: model.ResponseMode(req.ResponseFormat.Type)}
+		switch spec.Mode {
+		case model.ModeJSON:
+		case model.ModeJSONSchema:
+			spec.Name = req.ResponseFormat.JSONSchema.Name
+			spec.Schema = req.ResponseFormat.JSONSchema.Schema
+			spec.Strict = req.ResponseFormat.JSONSchema.Strict
+		default:
+			return mreq, fmt.Errorf("%w: unsupported response_format type", errValidation)
+		}
+		mreq.ResponseSpec = spec
+	}
+	return mreq, nil
 }
 
 // Authenticator is the bearer-key resolution boundary; both the in-memory
@@ -54,164 +162,112 @@ type ChatHandler struct {
 
 func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	requestID := r.Header.Get("X-Request-ID")
-	if requestID == "" || len(requestID) > 128 {
-		requestID = newRequestID()
-	}
+	requestID := requestIDOf(r)
 	w.Header().Set("X-Request-ID", requestID)
-	traceID := r.Header.Get("X-Trace-ID")
-	if traceID == "" {
-		traceID = requestID // request ID doubles as the trace root
-	}
+	traceID := traceIDOf(r, requestID)
 	w.Header().Set("X-Trace-ID", traceID)
+	deps := fromChat(h)
 
-	var principal auth.Principal
-	fail := func(err error) {
+	fail := func(principal auth.Principal, err error) {
 		mapError(w, requestID, err)
-		h.record(requestID, traceID, principal.SubjectID, principal.KeyID, "", "", 0, err, 1, nil, false, start)
+		h.record(deps, requestID, traceID, principal, "", "", 0, err, 1, nil, false, start)
 	}
 
-	// 1. Authentication before anything else.
-	key, ok := bearer(r)
-	if !ok {
-		fail(fmt.Errorf("%w: missing bearer key", auth.ErrInvalid))
-		return
-	}
-	var err error
-	principal, err = h.Auth.Authenticate(key, time.Now())
+	// 1. Authentication before anything else — and before any body read — so
+	// invalid, expired, and revoked keys receive their 401 without driving
+	// any bounded parse work.
+	principal, err := authenticate(r, deps)
 	if err != nil {
-		fail(err)
+		fail(auth.Principal{}, err)
 		return
 	}
 
 	// 2. Bounded request decoding and validation.
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.MaxBody))
 	if err != nil {
-		fail(errValidation)
+		fail(principal, errValidation)
 		return
 	}
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		fail(errValidation)
+		fail(principal, errValidation)
 		return
 	}
 	if err := validate(&req, h.MaxMsgs, h.MaxChars); err != nil {
-		fail(err)
+		fail(principal, err)
 		return
 	}
-
-	// 3. Model existence + subject policy (non-leaky combined errors).
-	plan, err := h.Service.Resolve(principal.SubjectID, req.Model)
+	mreq, err := req.toDomain(requestID)
 	if err != nil {
-		fail(err)
+		fail(principal, err)
 		return
 	}
-	if h.Policy != nil && !h.Policy.Permitted(principal.SubjectID, req.Model) {
-		fail(gateway.ErrNotPermitted)
+
+	// 3. Shared admission pipeline: model/policy -> capability precheck ->
+	// clamps -> rate limit -> quota.
+	adm, auditErr := admit(w, r, deps, "chat", req.Model, &mreq, principal)
+	if auditErr != nil {
+		fail(principal, auditErr)
 		return
 	}
-	if h.Policy != nil {
-		if limits, ok := h.Policy.LimitsFor(principal.SubjectID); ok && limits.MaxOutputTokens > 0 {
-			if req.MaxTokens == nil || *req.MaxTokens > limits.MaxOutputTokens {
-				capped := limits.MaxOutputTokens
-				req.MaxTokens = &capped
-			}
-		}
-	}
+	defer adm.release()
 
-	// 4. Rate/concurrency limits.
-	ok, retryAfter, release, limErr := h.Limiter.Allow(r.Context(), principal.SubjectID, time.Now())
-	if limErr != nil {
-		// Limiter infrastructure failure: 503-class, never a rate-limit 429.
-		fail(limErr)
-		return
-	}
-	if !ok {
-		if retryAfter > 0 {
-			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())+1))
-		}
-		h.MetricsIncRateLimited(req.Model)
-		fail(&limiter.Error{Code: "rate_limit_exceeded"})
-		return
-	}
-	defer release()
-
-	// 5. Token quota: reserve a deterministic bounded estimate before any
-	// provider invocation. Subjects without a configured daily/monthly
-	// budget skip quota entirely.
-	var qres quota.Reservation = quota.Done
-	if h.Quota != nil && h.Policy != nil {
-		if limits, found := h.Policy.LimitsFor(principal.SubjectID); found {
-			ql := quota.Limits{DailyTokens: limits.DailyTokens, MonthlyTokens: limits.MonthlyTokens}
-			if ql.Configured() {
-				est := quota.Estimate(req.MaxTokens, limits.MaxOutputTokens, messageChars(req.Messages))
-				res, qErr := h.Quota.Reserve(r.Context(), principal.SubjectID, ql, est, time.Now())
-				if qErr != nil {
-					var denial *quota.Error
-					if errors.As(qErr, &denial) {
-						// Genuine quota denial: 429 quota_exceeded, provider
-						// never invoked. Retry-After points at the UTC
-						// boundary that resets the denied budget.
-						h.MetricsIncRateLimited(req.Model)
-						if denial.RetryAfter > 0 {
-							w.Header().Set("Retry-After", fmt.Sprintf("%d", int(denial.RetryAfter.Seconds())+1))
-						}
-					}
-					// Otherwise this is quota infrastructure failure, which
-					// mapError routes to the 503 limiter_unavailable contract.
-					fail(qErr)
-					return
-				}
-				qres = res
-			}
-		}
-	}
-
-	preq := provider.ChatRequest{
-		Model: plan.Primary(), Messages: req.Messages, Temperature: req.Temperature,
-		MaxTokens: req.MaxTokens, RequestID: requestID,
-	}
-
+	mreq.Model = adm.plan.Primary()
+	mreq.PublicModel = req.Model
 	if !req.Stream {
-		h.complete(w, r, requestID, traceID, principal, req.Model, plan, preq, qres, start)
+		h.complete(w, r, deps, requestID, traceID, principal, adm, req.Model, mreq, start)
 		return
 	}
-	h.stream(w, r, requestID, traceID, principal, req.Model, plan, preq, qres, start)
+	h.stream(w, r, deps, requestID, traceID, principal, adm, req.Model, mreq, start)
 }
 
-// messageChars sums message content sizes as the deterministic input signal
-// for the quota estimate. Content is never stored.
-func messageChars(msgs []provider.Message) int {
-	n := 0
-	for _, m := range msgs {
-		n += len(m.Content)
+// auditEvent assembles the metadata-only audit record.
+func (h *ChatHandler) auditEvent(requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time) audit.Event {
+	return audit.Event{
+		RequestID: requestID, SubjectID: principal.SubjectID, KeyID: principal.KeyID,
+		Model: modelName, Provider: providerName, Status: status,
+		ErrorClass: classifyErr(err), LatencyMillis: time.Since(start).Milliseconds(),
+		PromptTokens: usageTokens(usage, true), CompletionTokens: usageTokens(usage, false),
+		Streaming: streaming, CreatedAt: start, TraceID: traceID,
+		RouteAttempts: routeAttempts, Protocol: "chat",
 	}
-	return n
 }
 
-func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, requestID, traceID string, principal auth.Principal, model string, plan gateway.Plan, preq provider.ChatRequest, qres quota.Reservation, start time.Time) {
-	resp, providerName, err := h.Service.Complete(r.Context(), plan, preq)
+func (h *ChatHandler) record(deps admissionDeps, requestID, traceID string, principal auth.Principal, modelName, providerName string, status int, err error, routeAttempts int, usage *model.Usage, streaming bool, start time.Time) {
+	recordRequest(deps, h.auditEvent(requestID, traceID, principal, modelName, providerName, status, err, routeAttempts, usage, streaming, start), usage)
+}
+
+func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
+	resp, providerName, err := h.Service.Complete(r.Context(), adm.plan, preq)
 	if err != nil {
 		// No billable response: refund the reservation idempotently.
-		qres.Release()
+		adm.qres.Release()
 		mapError(w, requestID, err)
-		h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, 0, err, 1, nil, false, start)
+		h.record(deps, requestID, traceID, principal, modelName, providerName, 0, err, adm.attempts(), nil, false, start)
 		return
 	}
 	// Settle exactly once to the reported total; unknown usage keeps the
 	// conservative reservation and is never fabricated as zero.
-	qres.Settle(usageTotal(resp.Usage))
+	adm.qres.Settle(usageTotal(resp.Usage))
+
+	// Final output validation: failures are recorded in audit (never marked
+	// successful silently) but the transport still delivers the payload.
+	verr := model.ValidateOutput(preq, resp)
+	auditErr := error(nil)
+	if verr != nil {
+		auditErr = verr
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(resp)
-	h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, http.StatusOK, nil, 1, resp.Usage, false, start)
+	_ = json.NewEncoder(w).Encode(encodeChatCompletion(resp))
+	h.record(deps, requestID, traceID, principal, modelName, providerName, http.StatusOK, auditErr, adm.attempts(), resp.Usage, false, start)
 }
 
-func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID, traceID string, principal auth.Principal, model string, plan gateway.Plan, preq provider.ChatRequest, qres quota.Reservation, start time.Time) {
+func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
 	flusher, canFlush := w.(http.Flusher)
 	if !canFlush {
 		// No provider call will happen; refund the reservation.
-		qres.Release()
+		adm.qres.Release()
 		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "streaming_unsupported", "streaming is not supported by this connection")
 		return
 	}
@@ -220,34 +276,21 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, requestID, 
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	var (
-		writeErr  error
-		sawOutput bool
-	)
-	send := func(payload []byte) error {
-		sawOutput = true
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
-			return err
-		}
-		flusher.Flush()
-		return nil
-	}
-
-	providerName, err := h.Service.Stream(r.Context(), plan, preq, send)
+	enc := newChatStreamEncoder(w, flusher)
+	providerName, err := h.Service.Stream(r.Context(), adm.plan, preq, enc.Handle)
 	if err == nil {
 		// Terminal event only on normal completion.
-		_, writeErr = io.WriteString(w, "data: [DONE]\n\n")
-		if writeErr == nil {
+		if _, werr := io.WriteString(w, "data: [DONE]\n\n"); werr == nil {
 			flusher.Flush()
 		}
-	} else if !sawOutput {
+	} else if !enc.SawOutput() {
 		// Failed before any output: nothing billable, refund idempotently.
 		// Failures after output started keep the conservative reservation
 		// because the consumed usage is unknown and never fabricated.
-		qres.Release()
+		adm.qres.Release()
 	}
-	h.record(requestID, traceID, principal.SubjectID, principal.KeyID, model, providerName, statusFor(err, sawOutput), err, attempts(plan), nil, true, start)
-	if err != nil && !sawOutput {
+	h.record(deps, requestID, traceID, principal, modelName, providerName, statusFor(err, enc.SawOutput()), err, adm.attempts(), nil, true, start)
+	if err != nil && !enc.SawOutput() {
 		// Nothing was sent yet: emit a normalized SSE error event.
 		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"type\":\"%s\",\"request_id\":%q}}\n\n", errorType(err), requestID)
 		flusher.Flush()
@@ -275,81 +318,6 @@ func errorType(err error) string {
 	}
 }
 
-func attempts(plan gateway.Plan) int {
-	if len(plan.Candidates) > 1 {
-		return len(plan.Candidates)
-	}
-	return 1
-}
-
-func (h *ChatHandler) MetricsIncRateLimited(model string) {
-	if h.Metrics != nil {
-		h.Metrics.IncRateLimit(model)
-	}
-}
-
-func (h *ChatHandler) record(requestID, traceID, subject, keyID, model, providerName string, status int, err error, routeAttempts int, usage *provider.Usage, streaming bool, start time.Time) {
-	if h.Audit == nil {
-		return
-	}
-	class := ""
-	if err != nil {
-		class = provider.ClassOf(err).String()
-	}
-	h.Audit.Write(audit.Event{
-		RequestID: requestID, SubjectID: subject, KeyID: keyID, Model: model,
-		Provider: providerName, Status: status, ErrorClass: class,
-		LatencyMillis:    time.Since(start).Milliseconds(),
-		PromptTokens:     usageTokens(usage, true),
-		CompletionTokens: usageTokens(usage, false),
-		Streaming:        streaming, CreatedAt: start,
-		TraceID: traceID, RouteAttempts: routeAttempts,
-	})
-	if h.Metrics != nil {
-		statusLabel := fmt.Sprint(status)
-		h.Metrics.IncRequest(model, statusLabel)
-		h.Metrics.ObserveDuration(model, statusLabel, time.Since(start))
-		if usage != nil && usage.Known {
-			h.Metrics.AddTokens(model, usage.PromptTokens, usage.CompletionTokens)
-		}
-		if err != nil && provider.ClassOf(err) != provider.ClassInternal {
-			h.Metrics.IncUpstreamError(model, providerName, provider.ClassOf(err).String())
-		}
-	}
-}
-
-// usageTokens extracts prompt or completion tokens only when the upstream
-// reported usage; unknown usage stays nil and is never coerced to zero.
-func usageTokens(u *provider.Usage, prompt bool) *int {
-	if u == nil || !u.Known {
-		return nil
-	}
-	v := u.PromptTokens
-	if !prompt {
-		v = u.CompletionTokens
-	}
-	return &v
-}
-
-// usageTotal reports the upstream total token count for quota settlement,
-// or nil when usage is unknown so the conservative reservation is retained.
-func usageTotal(u *provider.Usage) *int64 {
-	if u == nil || !u.Known {
-		return nil
-	}
-	t := int64(u.TotalTokens)
-	return &t
-}
-
-func bearer(r *http.Request) (string, bool) {
-	h := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
-		return "", false
-	}
-	return strings.TrimSpace(h[len(prefix):]), true
-}
-
 func validate(req *chatRequest, maxMsgs, maxChars int) error {
 	if req.Model == "" {
 		return fmt.Errorf("%w: model is required", errValidation)
@@ -369,6 +337,22 @@ func validate(req *chatRequest, maxMsgs, maxChars int) error {
 		return fmt.Errorf("%w: max_tokens out of range", errValidation)
 	}
 	return nil
+}
+
+func requestIDOf(r *http.Request) string {
+	requestID := r.Header.Get("X-Request-ID")
+	if requestID == "" || len(requestID) > 128 {
+		return newRequestID()
+	}
+	return requestID
+}
+
+func traceIDOf(r *http.Request, requestID string) string {
+	traceID := r.Header.Get("X-Trace-ID")
+	if traceID == "" {
+		return requestID // request ID doubles as the trace root
+	}
+	return traceID
 }
 
 var requestCounter atomic.Int64

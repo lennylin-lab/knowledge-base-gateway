@@ -11,6 +11,7 @@ import (
 
 	"github.com/cenkalti/backoff/v5"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/router"
@@ -49,7 +50,7 @@ func (p Plan) Primary() string {
 	return p.Candidates[0].ProviderName
 }
 
-// Service routes normalized chat requests across route candidates with
+// Service routes normalized domain requests across route candidates with
 // per-route timeouts, bounded retries, failover, and a total deadline.
 type Service struct {
 	Catalog    *policy.Catalog
@@ -57,6 +58,8 @@ type Service struct {
 	Timeout    time.Duration // total deadline for the whole request
 	MaxRetries int           // additional attempts on the primary candidate
 	RetryWait  time.Duration // initial retry delay; grows exponentially, zero disables waits
+
+	providers map[string]provider.Provider // retained for capability lookups
 }
 
 // New builds a Service with defaults. providers maps provider names to
@@ -75,7 +78,27 @@ func New(catalog *policy.Catalog, providers map[string]provider.Provider, timeou
 	return &Service{
 		Catalog: catalog, Routes: routes, Timeout: timeout,
 		MaxRetries: maxRetries, RetryWait: 100 * time.Millisecond,
+		providers: providers,
 	}
+}
+
+// Capabilities resolves the effective capability matrix for a public model:
+// the catalog declaration when one exists, otherwise the primary provider's
+// adapter-level matrix. ok is false for unknown or disabled models and for
+// models whose provider is not registered.
+func (s *Service) Capabilities(publicModel string) (model.Capabilities, bool) {
+	info, ok := s.Catalog.Lookup(publicModel)
+	if !ok {
+		return model.Capabilities{}, false
+	}
+	if info.Capabilities.Declared() {
+		return info.Capabilities, true
+	}
+	p, ok := s.providers[info.Provider]
+	if !ok {
+		return model.Capabilities{}, false
+	}
+	return p.Capabilities(info.UpstreamModel), true
 }
 
 // Resolve checks catalog existence, returning the ordered attempt plan.
@@ -168,7 +191,7 @@ func attemptTimeout(ctx context.Context, d time.Duration) (context.Context, cont
 // delays follow bounded exponential backoff with jitter, starting at
 // RetryWait. The second return value names the provider that served (or last
 // attempted) the request for audit purposes.
-func (s *Service) Complete(ctx context.Context, plan Plan, req provider.ChatRequest) (provider.ChatResponse, string, error) {
+func (s *Service) Complete(ctx context.Context, plan Plan, req model.Request) (model.Response, string, error) {
 	ctx, cancel := s.withDeadline(ctx)
 	defer cancel()
 	var lastErr error
@@ -185,7 +208,7 @@ func (s *Service) Complete(ctx context.Context, plan Plan, req provider.ChatRequ
 			attempts++
 			if attempts > 1 {
 				if err := waitBackoff(ctx, bo); err != nil {
-					return provider.ChatResponse{}, cand.ProviderName, err
+					return model.Response{}, cand.ProviderName, err
 				}
 			}
 			actx, acancel := attemptTimeout(ctx, cand.Timeout)
@@ -198,28 +221,28 @@ func (s *Service) Complete(ctx context.Context, plan Plan, req provider.ChatRequ
 			s.Routes.Record(plan.PublicModel, cand.ProviderName, false)
 			lastErr = err
 			if ctx.Err() != nil {
-				return provider.ChatResponse{}, cand.ProviderName, ctx.Err()
+				return model.Response{}, cand.ProviderName, ctx.Err()
 			}
 			if !provider.RetryEligible(err) {
-				return provider.ChatResponse{}, cand.ProviderName, err
+				return model.Response{}, cand.ProviderName, err
 			}
 		}
 	}
 	if lastErr == nil {
 		lastErr = ErrNoRoute
 	}
-	return provider.ChatResponse{}, plan.Primary(), lastErr
+	return model.Response{}, plan.Primary(), lastErr
 }
 
 // Stream performs a streaming completion under the configured total deadline.
-// Failover is permitted only while send has never succeeded; once output
+// Failover is permitted only while emit has never succeeded; once output
 // reached the client the error is returned as-is with no retry.
-func (s *Service) Stream(ctx context.Context, plan Plan, req provider.ChatRequest, send func(payload []byte) error) (string, error) {
+func (s *Service) Stream(ctx context.Context, plan Plan, req model.Request, emit func(model.Event) error) (string, error) {
 	ctx, cancel := s.withDeadline(ctx)
 	defer cancel()
 	outputStarted := false
-	wrapped := func(payload []byte) error {
-		if err := send(payload); err != nil {
+	wrapped := func(e model.Event) error {
+		if err := emit(e); err != nil {
 			return err
 		}
 		outputStarted = true

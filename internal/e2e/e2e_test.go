@@ -21,6 +21,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/httpapi"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/router"
@@ -35,16 +36,20 @@ type flakyProvider struct {
 
 func (p *flakyProvider) Name() string { return p.name }
 
-func (p *flakyProvider) Complete(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
+func (p *flakyProvider) Capabilities(m string) model.Capabilities {
+	return provider.Fake{}.Capabilities(m)
+}
+
+func (p *flakyProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	if p.remaining > 0 {
 		p.remaining--
-		return provider.ChatResponse{}, p.err
+		return model.Response{}, p.err
 	}
 	return provider.Fake{}.Complete(ctx, req)
 }
 
-func (p *flakyProvider) Stream(ctx context.Context, req provider.ChatRequest, send func([]byte) error) error {
-	return provider.Fake{}.Stream(ctx, req, send)
+func (p *flakyProvider) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
+	return provider.Fake{}.Stream(ctx, req, emit)
 }
 
 type fixture struct {
@@ -72,7 +77,7 @@ func start(t *testing.T, primary provider.Provider) *fixture {
 
 	backup := provider.Fake{}
 	catalog := policy.NewCatalog([]policy.ModelInfo{
-		{PublicName: "gateway-echo", Provider: "fake-primary", UpstreamModel: "echo-model", Enabled: true},
+		{PublicName: "gateway-echo", Provider: "fake-primary", UpstreamModel: "echo-model", Enabled: true, Capabilities: testCaps()},
 	})
 	svc := gateway.New(catalog, map[string]provider.Provider{"fake-primary": primary, "fake-backup": backup}, 5*time.Second, 1)
 	svc.RetryWait = time.Millisecond
@@ -203,7 +208,7 @@ func TestEndToEndRateLimitRetryAfter(t *testing.T) {
 	store := auth.NewStore()
 	salt, _ := auth.NewSalt()
 	store.Put(auth.KeyRecord{ID: gen.Record.ID, Subject: "s", Salt: salt, Hash: auth.HashAPIKey(salt, gen.Plaintext), Status: auth.StatusActive, CreatedAt: time.Now()})
-	catalog := policy.NewCatalog([]policy.ModelInfo{{PublicName: "m", Provider: "fake", UpstreamModel: "up", Enabled: true}})
+	catalog := policy.NewCatalog([]policy.ModelInfo{{PublicName: "m", Provider: "fake", UpstreamModel: "up", Enabled: true, Capabilities: testCaps()}})
 	svc := gateway.New(catalog, map[string]provider.Provider{"fake": provider.Fake{}}, time.Second, 0)
 	pol := policy.New()
 	pol.AllowAll("s")
@@ -237,4 +242,10 @@ func TestEndToEndRateLimitRetryAfter(t *testing.T) {
 	if r.Header.Get("Retry-After") == "" {
 		t.Fatal("429 should include Retry-After when computable")
 	}
+}
+
+// testCaps is the declared catalog capability matrix for the e2e fixtures:
+// text chat with streaming and usage, no clamps.
+func testCaps() model.Capabilities {
+	return model.Capabilities{Chat: true, Responses: true, Stream: true, Usage: true}
 }

@@ -16,7 +16,7 @@ var configEnvVars = []string{
 	"GATEWAY_MAX_RETRIES", "GATEWAY_RATE_PER_MINUTE",
 	"GATEWAY_DATABASE_URL", "GATEWAY_LIMITS_MODE", "GATEWAY_REDIS_ADDR",
 	"GATEWAY_ADMIN_TOKEN", "GATEWAY_ADMIN_ADDR",
-	"GATEWAY_ALLOW_INSECURE_BASE_URLS",
+	"GATEWAY_ALLOW_INSECURE_BASE_URLS", "GATEWAY_RESPONSES_ENABLED",
 }
 
 func setEnv(t *testing.T, kv map[string]string) {
@@ -50,6 +50,32 @@ func TestFromEnvValid(t *testing.T) {
 	}
 	if cfg.MaxConcurrent != 8 {
 		t.Errorf("default MaxConcurrent = %d, want 8", cfg.MaxConcurrent)
+	}
+	if !cfg.ResponsesEnabled {
+		t.Error("ResponsesEnabled must default to true; GATEWAY_RESPONSES_ENABLED=false is the rollback switch")
+	}
+}
+
+func TestResponsesEnabledFlag(t *testing.T) {
+	cases := map[string]bool{
+		"false": false,
+		"true":  true,
+		"FALSE": true, // only the exact string "false" disables
+		"":      true,
+	}
+	for raw, want := range cases {
+		setEnv(t, map[string]string{
+			"GATEWAY_API_KEYS":          "key-1:tenant-a:sk-abc",
+			"GATEWAY_MODELS":            "gpt-a:fake:gpt-a",
+			"GATEWAY_RESPONSES_ENABLED": raw,
+		})
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+		if cfg.ResponsesEnabled != want {
+			t.Errorf("GATEWAY_RESPONSES_ENABLED=%q: ResponsesEnabled = %v, want %v", raw, cfg.ResponsesEnabled, want)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/router"
@@ -65,7 +66,7 @@ func TestCompleteRetriesAreBoundedAndDelayed(t *testing.T) {
 	}})
 
 	start := time.Now()
-	_, name, err := svc.Complete(context.Background(), planFor(t, svc), provider.ChatRequest{})
+	_, name, err := svc.Complete(context.Background(), planFor(t, svc), model.Request{})
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("want exhaustion error")
@@ -90,7 +91,7 @@ func TestCompleteWaitHonorsTotalDeadline(t *testing.T) {
 	svc := New(catalog, map[string]provider.Provider{"primary": primary}, 40*time.Millisecond, 5)
 	svc.RetryWait = 5 * time.Second // far beyond the total deadline
 	start := time.Now()
-	_, _, err := svc.Complete(context.Background(), planFor(t, svc), provider.ChatRequest{})
+	_, _, err := svc.Complete(context.Background(), planFor(t, svc), model.Request{})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want deadline error from interrupted wait, got %v", err)
 	}
@@ -106,10 +107,10 @@ func TestStreamDelaysFailoverWithBackoff(t *testing.T) {
 	backup := &scriptedProvider{name: "backup"}
 	svc := failoverService(t, primary, backup)
 	svc.RetryWait = 10 * time.Millisecond
-	var got []byte
-	name, err := svc.Stream(context.Background(), planFor(t, svc), provider.ChatRequest{}, func(b []byte) error { got = b; return nil })
-	if err != nil || len(got) == 0 {
-		t.Fatalf("want backup stream after backoff wait, got err=%v payload=%s", err, got)
+	var got model.Event
+	name, err := svc.Stream(context.Background(), planFor(t, svc), model.Request{}, func(e model.Event) error { got = e; return nil })
+	if err != nil || got.Kind == "" {
+		t.Fatalf("want backup stream after backoff wait, got err=%v event=%v", err, got)
 	}
 	if name != "backup" || primary.calls != 1 {
 		t.Fatalf("want exactly one primary attempt then backup, got primary=%d name=%s", primary.calls, name)

@@ -3,23 +3,31 @@ package httpapi
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/mgmt"
 )
 
-// AdminDeps wires the key lifecycle manager behind token-gated endpoints.
+// AdminDeps wires the key lifecycle manager and the management query service
+// behind token-gated endpoints.
 type AdminDeps struct {
 	Manager *auth.Manager
 	Logger  *slog.Logger
 	Token   string // GATEWAY_ADMIN_TOKEN; empty disables the endpoints
+	Mgmt    mgmt.Service
 }
 
 // NewAdminMux builds the management API. Endpoints are disabled (404) unless
 // a token is configured; the listener must stay on an internal network.
+// Management queries (when Mgmt is wired) are separately authenticated with
+// the same token and every mutating operation appends a management-audit
+// record.
 func NewAdminMux(deps AdminDeps) *http.ServeMux {
 	mux := http.NewServeMux()
 	guard := func(next http.HandlerFunc) http.HandlerFunc {
@@ -68,7 +76,138 @@ func NewAdminMux(deps AdminDeps) *http.ServeMux {
 			writeError(w, newRequestID(), http.StatusNotFound, "not_found", "unknown_action", "unknown key action")
 		}
 	}))
+
+	// V1.2 management queries: read-only operations plus the model
+	// enable/disable switch, all management-audited.
+	if deps.Mgmt != nil {
+		mgmtGuard := guard(func(w http.ResponseWriter, r *http.Request) {
+			// Every request is already token-authenticated; keep a hook here
+			// for future per-admin authorization policies.
+			handleManagement(w, r, deps)
+		})
+		mux.HandleFunc("/admin/models", mgmtGuard)
+		mux.HandleFunc("/admin/models/", mgmtGuard)
+		mux.HandleFunc("/admin/providers", mgmtGuard)
+		mux.HandleFunc("/admin/policies", mgmtGuard)
+		mux.HandleFunc("/admin/audit", mgmtGuard)
+		mux.HandleFunc("/admin/usage", mgmtGuard)
+		mux.HandleFunc("/admin/management-log", mgmtGuard)
+	}
 	return mux
+}
+
+// handleManagement dispatches the management query surface.
+func handleManagement(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
+	ctx := r.Context()
+	switch {
+	case r.URL.Path == "/admin/models" && r.Method == http.MethodGet:
+		models, err := deps.Mgmt.Models(ctx)
+		if err != nil {
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query models")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"models": models})
+
+	case strings.HasPrefix(r.URL.Path, "/admin/models/") && r.Method == http.MethodPost:
+		// /admin/models/{name}/enable | /disable
+		rest := strings.TrimPrefix(r.URL.Path, "/admin/models/")
+		parts := strings.Split(rest, "/")
+		if len(parts) != 2 || (parts[1] != "enable" && parts[1] != "disable") {
+			writeError(w, newRequestID(), http.StatusBadRequest, "invalid_request_error", "invalid_path", "use /admin/models/{name}/enable or /disable")
+			return
+		}
+		name, enable := parts[0], parts[1] == "enable"
+		err := deps.Mgmt.SetModelEnabled(ctx, name, enable)
+		if err != nil {
+			if errors.Is(err, mgmt.ErrNotFound) {
+				writeError(w, newRequestID(), http.StatusNotFound, "not_found", "model_not_found", "model not found")
+				return
+			}
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "update_failed", "could not update model")
+			return
+		}
+		// Management-operation audit: a management action without its audit
+		// row is a failed operation.
+		detail, _ := json.Marshal(map[string]bool{"enabled": enable})
+		if err := deps.Mgmt.WriteOp(ctx, mgmt.AdminOp{
+			CreatedAt: time.Now(), Action: "model_" + map[bool]string{true: "enable", false: "disable"}[enable],
+			Target: name, Detail: detail,
+		}); err != nil {
+			deps.Logger.Error("management audit write failed", "target", name, "error", err)
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "audit_write_failed", "could not record management operation")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"model": name, "status": map[bool]string{true: "enabled", false: "disabled"}[enable]})
+
+	case r.URL.Path == "/admin/providers" && r.Method == http.MethodGet:
+		providers, err := deps.Mgmt.Providers(ctx)
+		if err != nil {
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query providers")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"providers": providers})
+
+	case r.URL.Path == "/admin/policies" && r.Method == http.MethodGet:
+		policies, err := deps.Mgmt.Policies(ctx, r.URL.Query().Get("subject"))
+		if err != nil {
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query policies")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"policies": policies})
+
+	case r.URL.Path == "/admin/audit" && r.Method == http.MethodGet:
+		q := r.URL.Query()
+		events, err := deps.Mgmt.QueryAudit(ctx, mgmt.AuditFilter{
+			RequestID: q.Get("request_id"), Subject: q.Get("subject"), Model: q.Get("model"),
+			From: queryTime(q.Get("from")), To: queryTime(q.Get("to")),
+			Limit: queryInt(q.Get("limit")),
+		})
+		if err != nil {
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query audit records")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"events": events})
+
+	case r.URL.Path == "/admin/usage" && r.Method == http.MethodGet:
+		q := r.URL.Query()
+		rows, err := deps.Mgmt.Usage(ctx, mgmt.AuditFilter{
+			Subject: q.Get("subject"), Model: q.Get("model"),
+			From: queryTime(q.Get("from")), To: queryTime(q.Get("to")),
+		})
+		if err != nil {
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query usage")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"usage": rows})
+
+	case r.URL.Path == "/admin/management-log" && r.Method == http.MethodGet:
+		ops, err := deps.Mgmt.Ops(ctx, queryInt(r.URL.Query().Get("limit")))
+		if err != nil {
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query management log")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"operations": ops})
+
+	default:
+		writeError(w, newRequestID(), http.StatusNotFound, "not_found", "not_found", "unknown management endpoint")
+	}
+}
+
+func queryTime(raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func queryInt(raw string) int {
+	n, _ := strconv.Atoi(raw)
+	return n
 }
 
 type createKeyBody struct {

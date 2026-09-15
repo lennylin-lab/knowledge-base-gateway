@@ -14,6 +14,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
@@ -23,12 +24,14 @@ import (
 // that omit usage (unknown) or report specific totals.
 type usageOverride struct {
 	inner provider.Provider
-	usage *provider.Usage
+	usage *model.Usage
 }
 
 func (u *usageOverride) Name() string { return u.inner.Name() }
 
-func (u *usageOverride) Complete(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
+func (u *usageOverride) Capabilities(m string) model.Capabilities { return u.inner.Capabilities(m) }
+
+func (u *usageOverride) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	resp, err := u.inner.Complete(ctx, req)
 	if err != nil {
 		return resp, err
@@ -37,8 +40,8 @@ func (u *usageOverride) Complete(ctx context.Context, req provider.ChatRequest) 
 	return resp, nil
 }
 
-func (u *usageOverride) Stream(ctx context.Context, req provider.ChatRequest, send func([]byte) error) error {
-	return u.inner.Stream(ctx, req, send)
+func (u *usageOverride) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
+	return u.inner.Stream(ctx, req, emit)
 }
 
 // streamFailOnce fails streaming before any output on the first call.
@@ -49,16 +52,18 @@ type streamFailOnce struct {
 
 func (f *streamFailOnce) Name() string { return f.inner.Name() }
 
-func (f *streamFailOnce) Complete(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
+func (f *streamFailOnce) Capabilities(m string) model.Capabilities { return f.inner.Capabilities(m) }
+
+func (f *streamFailOnce) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	return f.inner.Complete(ctx, req)
 }
 
-func (f *streamFailOnce) Stream(ctx context.Context, req provider.ChatRequest, send func([]byte) error) error {
+func (f *streamFailOnce) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
 	f.calls++
 	if f.calls == 1 {
 		return &provider.Error{Class: provider.ClassServer, Msg: "boom"}
 	}
-	return f.inner.Stream(ctx, req, send)
+	return f.inner.Stream(ctx, req, emit)
 }
 
 // outageQuota simulates quota infrastructure failure (Redis unreachable).
@@ -77,14 +82,16 @@ type countingProvider struct {
 
 func (c *countingProvider) Name() string { return c.inner.Name() }
 
-func (c *countingProvider) Complete(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
+func (c *countingProvider) Capabilities(m string) model.Capabilities { return c.inner.Capabilities(m) }
+
+func (c *countingProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	c.calls++
 	return c.inner.Complete(ctx, req)
 }
 
-func (c *countingProvider) Stream(ctx context.Context, req provider.ChatRequest, send func([]byte) error) error {
+func (c *countingProvider) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
 	c.calls++
-	return c.inner.Stream(ctx, req, send)
+	return c.inner.Stream(ctx, req, emit)
 }
 
 func newQuotaHandler(t *testing.T, p provider.Provider, limits policy.Limits) (*ChatHandler, *countingProvider) {
@@ -95,7 +102,7 @@ func newQuotaHandler(t *testing.T, p provider.Provider, limits policy.Limits) (*
 		t.Fatal(err)
 	}
 	store.Put(auth.KeyRecord{ID: "key-1", Subject: "subject-a", Salt: salt, Hash: auth.HashAPIKey(salt, testKey), Status: auth.StatusActive})
-	catalog := policy.NewCatalog([]policy.ModelInfo{{PublicName: "gpt-test", Provider: p.Name(), UpstreamModel: "up", Enabled: true}})
+	catalog := policy.NewCatalog([]policy.ModelInfo{{PublicName: "gpt-test", Provider: p.Name(), UpstreamModel: "up", Enabled: true, Capabilities: testCaps()}})
 	pol := policy.New()
 	pol.AllowAll("subject-a")
 	pol.SetLimits("subject-a", limits)
@@ -179,7 +186,7 @@ func TestChatQuotaReleaseOnProviderFailure(t *testing.T) {
 }
 
 func TestChatQuotaUnknownUsageRetainsEstimate(t *testing.T) {
-	unknown := &provider.Usage{Known: false}
+	unknown := &model.Usage{Known: false}
 	// Two estimates would fit exactly; one less means the second reserve
 	// only passes if the first estimate was refunded (it must not be).
 	h, p := newQuotaHandler(t, &usageOverride{inner: provider.Fake{}, usage: unknown},
@@ -267,7 +274,7 @@ func TestChatQuotaMonthlyLimitIndependent(t *testing.T) {
 // nil (unknown) when the upstream reports none, even though enforcement
 // retained the conservative reservation.
 func TestChatQuotaAuditKeepsUnknownUsage(t *testing.T) {
-	unknown := &provider.Usage{Known: false}
+	unknown := &model.Usage{Known: false}
 	h, _ := newQuotaHandler(t, &usageOverride{inner: provider.Fake{}, usage: unknown},
 		policy.Limits{DailyTokens: 10 * helloEstimate()})
 	sink := audit.NewMemorySink(nil)

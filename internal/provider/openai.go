@@ -10,11 +10,13 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
+
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
 
 // OpenAI is an OpenAI-compatible chat adapter. The API key is held only here
-// and never logged or serialized.
+// and never logged or serialized. Vendor wire types live in this file and
+// never escape the adapter.
 type OpenAI struct {
 	BaseURL string
 	APIKey  string
@@ -32,9 +34,146 @@ func NewOpenAI(baseURL, apiKey string) *OpenAI {
 
 func (o *OpenAI) Name() string { return "openai" }
 
-func (o *OpenAI) do(ctx context.Context, req ChatRequest, stream bool) (*http.Response, error) {
-	req.Stream = stream
-	body, err := json.Marshal(req)
+// Capabilities reports the adapter-level matrix for OpenAI-compatible
+// upstreams. Vision and reasoning require dedicated message shapes the
+// adapter does not translate yet, so they stay off.
+func (o *OpenAI) Capabilities(string) model.Capabilities {
+	return model.Capabilities{
+		Chat: true, Responses: true, Stream: true, Tools: true,
+		StructuredOutput: true, JSONMode: true, Usage: true,
+		ContextTokens: 128_000, MaxOutputTokens: 16_384, MaxTools: model.DefaultMaxTools,
+	}
+}
+
+// --- OpenAI Chat Completions wire types ----------------------------------
+
+type openaiWireToolCall struct {
+	Index    *int   `json:"index,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
+}
+
+type openaiWireMessage struct {
+	Role       string               `json:"role"`
+	Content    string               `json:"content,omitempty"`
+	ToolCalls  []openaiWireToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string               `json:"tool_call_id,omitempty"`
+}
+
+type openaiWireFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type openaiWireTool struct {
+	Type     string             `json:"type"` // always "function"
+	Function openaiWireFunction `json:"function"`
+}
+
+type openaiWireJSONSchema struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict,omitempty"`
+}
+
+type openaiWireResponseFormat struct {
+	Type       string                `json:"type"`
+	JSONSchema *openaiWireJSONSchema `json:"json_schema,omitempty"`
+}
+
+type openaiWireRequest struct {
+	Model          string                    `json:"model"`
+	Messages       []openaiWireMessage       `json:"messages"`
+	Temperature    *float64                  `json:"temperature,omitempty"`
+	MaxTokens      *int                      `json:"max_tokens,omitempty"`
+	Stream         bool                      `json:"stream,omitempty"`
+	Tools          []openaiWireTool          `json:"tools,omitempty"`
+	ToolChoice     any                       `json:"tool_choice,omitempty"`
+	ResponseFormat *openaiWireResponseFormat `json:"response_format,omitempty"`
+}
+
+// translateRequest converts a domain request into the OpenAI wire request.
+// Instructions hoist to a leading system message; tool results map to tool
+// role messages.
+func translateRequest(req model.Request) openaiWireRequest {
+	out := openaiWireRequest{
+		Model: req.Model, Temperature: req.Temperature, MaxTokens: req.MaxTokens, Stream: req.Stream,
+	}
+	if req.Instructions != "" {
+		out.Messages = append(out.Messages, openaiWireMessage{Role: model.RoleSystem, Content: req.Instructions})
+	}
+	for _, item := range req.Input {
+		switch {
+		case item.ToolCall != nil:
+			out.Messages = append(out.Messages, openaiWireMessage{
+				Role: model.RoleAssistant,
+				ToolCalls: []openaiWireToolCall{{
+					ID: item.ToolCall.ID, Type: "function",
+					Function: struct {
+						Name      string `json:"name,omitempty"`
+						Arguments string `json:"arguments,omitempty"`
+					}{Name: item.ToolCall.Name, Arguments: item.ToolCall.Arguments},
+				}},
+			})
+		case item.ToolResult != nil:
+			out.Messages = append(out.Messages, openaiWireMessage{
+				Role: model.RoleTool, ToolCallID: item.ToolResult.CallID, Content: item.ToolResult.Content,
+			})
+		default:
+			role := item.Role
+			if role == "" {
+				role = model.RoleUser
+			}
+			out.Messages = append(out.Messages, openaiWireMessage{Role: role, Content: item.Text})
+		}
+	}
+	for _, t := range req.Tools {
+		out.Tools = append(out.Tools, openaiWireTool{
+			Type: "function",
+			Function: openaiWireFunction{
+				Name: t.Name, Description: t.Description,
+				Parameters: json.RawMessage(t.Parameters),
+			},
+		})
+	}
+	switch req.ToolChoice {
+	case "auto", "none", "required":
+		out.ToolChoice = req.ToolChoice
+	}
+	if req.ResponseSpec != nil {
+		switch req.ResponseSpec.Mode {
+		case model.ModeJSON:
+			out.ResponseFormat = &openaiWireResponseFormat{Type: "json_object"}
+		case model.ModeJSONSchema:
+			out.ResponseFormat = &openaiWireResponseFormat{
+				Type: "json_schema",
+				JSONSchema: &openaiWireJSONSchema{
+					Name: specName(req.ResponseSpec.Name), Schema: req.ResponseSpec.Schema,
+					Strict: req.ResponseSpec.Strict,
+				},
+			}
+		}
+	}
+	return out
+}
+
+// specName defaults the schema name used for upstream structured output.
+func specName(name string) string {
+	if name == "" {
+		return "response"
+	}
+	return name
+}
+
+func (o *OpenAI) do(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
+	wire := translateRequest(req)
+	wire.Stream = stream
+	body, err := json.Marshal(wire)
 	if err != nil {
 		return nil, &Error{Class: ClassInternal, Msg: "encode request"}
 	}
@@ -71,33 +210,143 @@ func classifyStatus(code int) error {
 	}
 }
 
+// --- Non-streaming --------------------------------------------------------
+
+type openaiWireUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type openaiWireResponse struct {
+	ID      string `json:"id"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Message struct {
+			Content   *string              `json:"content"`
+			ToolCalls []openaiWireToolCall `json:"tool_calls"`
+			Refusal   *string              `json:"refusal"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *openaiWireUsage `json:"usage"`
+}
+
+// normalizeResponse maps an upstream wire response to the domain response.
+func normalizeResponse(wire *openaiWireResponse) model.Response {
+	var out model.Response
+	out.ID = wire.ID
+	out.Created = wire.Created
+	out.Model = wire.Model
+	if len(wire.Choices) > 0 {
+		c := wire.Choices[0]
+		if c.Message.Content != nil && *c.Message.Content != "" {
+			out.Output = append(out.Output, model.OutputItem{Kind: model.OutputText, Text: *c.Message.Content})
+		}
+		if c.Message.Refusal != nil && *c.Message.Refusal != "" {
+			out.Output = append(out.Output, model.OutputItem{Kind: model.OutputRefusal, Text: *c.Message.Refusal})
+		}
+		for _, tc := range c.Message.ToolCalls {
+			out.Output = append(out.Output, model.OutputItem{Kind: model.OutputToolCall, ToolCall: &model.ToolCall{
+				ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
+			}})
+		}
+		out.FinishReason = normalizeFinish(c.FinishReason)
+	}
+	out.Status = model.StatusCompleted
+	if out.FinishReason == model.FinishLength {
+		out.Status = model.StatusIncomplete
+	}
+	return out
+}
+
+// normalizeFinish maps OpenAI finish reasons to domain finish reasons.
+func normalizeFinish(reason string) string {
+	switch reason {
+	case "length":
+		return model.FinishLength
+	case "tool_calls", "function_call":
+		return model.FinishToolCalls
+	case "":
+		return ""
+	default:
+		return model.FinishStop
+	}
+}
+
 // Complete performs a non-streaming completion.
-func (o *OpenAI) Complete(ctx context.Context, req ChatRequest) (ChatResponse, error) {
+func (o *OpenAI) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	resp, err := o.do(ctx, req, false)
 	if err != nil {
-		return ChatResponse{}, err
+		return model.Response{}, err
 	}
 	defer resp.Body.Close()
-	var out ChatResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&out); err != nil {
-		return ChatResponse{}, &Error{Class: ClassServer, Msg: "malformed upstream response"}
+	var wire openaiWireResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&wire); err != nil {
+		return model.Response{}, &Error{Class: ClassServer, Msg: "malformed upstream response"}
 	}
-	if out.Usage == nil {
-		out.Usage = &Usage{} // Known stays false; do not fabricate zeros
-	} else {
-		out.Usage.Known = true
+	out := normalizeResponse(&wire)
+	if wire.Usage != nil {
+		out.Usage = &model.Usage{
+			PromptTokens:     wire.Usage.PromptTokens,
+			CompletionTokens: wire.Usage.CompletionTokens,
+			TotalTokens:      wire.Usage.TotalTokens,
+			Known:            true,
+		}
 	}
 	return out, nil
 }
 
-// Stream performs a streaming completion, forwarding each upstream SSE data
-// payload to send. Errors after the first send are not retried by callers.
-func (o *OpenAI) Stream(ctx context.Context, req ChatRequest, send func(payload []byte) error) error {
+// --- Streaming ------------------------------------------------------------
+
+type openaiWireChunk struct {
+	ID      string `json:"id"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Delta struct {
+			Role      string               `json:"role"`
+			Content   string               `json:"content"`
+			ToolCalls []openaiWireToolCall `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *openaiWireUsage `json:"usage"`
+}
+
+// toolAccumulator assembles one streamed tool call from argument fragments.
+type toolAccumulator struct {
+	id, name string
+	args     strings.Builder
+}
+
+// Stream converts the upstream chat.completion.chunk SSE stream into domain
+// events. Ordering: one created event, text and argument deltas in arrival
+// order, per-tool done events, one text done, then completed. Usage is
+// surfaced only when the upstream reports it on the stream.
+func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
 	resp, err := o.do(ctx, req, true)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+
+	var (
+		head        model.Response
+		text        strings.Builder
+		tools       = map[int]*toolAccumulator{}
+		toolOrder   []int
+		finish      string
+		usage       *model.Usage
+		textEmitted bool // whether any text delta was emitted
+	)
+	emitErr := func(e model.Event) error {
+		if err := emit(e); err != nil {
+			return &Error{Class: ClassInternal, Msg: "downstream send failed"}
+		}
+		return nil
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -111,68 +360,93 @@ func (o *OpenAI) Stream(ctx context.Context, req ChatRequest, send func(payload 
 		}
 		payload := bytes.TrimSpace(line[len("data:"):])
 		if bytes.Equal(payload, []byte("[DONE]")) {
-			return nil
+			break
 		}
 		if len(payload) == 0 {
 			continue
 		}
-		if err := send(payload); err != nil {
-			return &Error{Class: ClassInternal, Msg: "downstream send failed"}
+		var chunk openaiWireChunk
+		if err := json.Unmarshal(payload, &chunk); err != nil {
+			return &Error{Class: ClassServer, Msg: "malformed upstream stream"}
+		}
+		if head.ID == "" && (chunk.ID != "" || chunk.Model != "") {
+			head = model.Response{ID: chunk.ID, Created: chunk.Created, Model: chunk.Model}
+			if err := emitErr(model.Event{Kind: model.EventCreated, Response: &model.Response{
+				ID: head.ID, Created: head.Created, Model: head.Model, Status: "in_progress",
+			}}); err != nil {
+				return err
+			}
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta
+		if delta.Content != "" {
+			textEmitted = true
+			text.WriteString(delta.Content)
+			if err := emitErr(model.Event{Kind: model.EventTextDelta, Delta: delta.Content}); err != nil {
+				return err
+			}
+		}
+		for _, tc := range delta.ToolCalls {
+			idx := 0
+			if tc.Index != nil {
+				idx = *tc.Index
+			}
+			acc, ok := tools[idx]
+			if !ok {
+				acc = &toolAccumulator{}
+				tools[idx] = acc
+				toolOrder = append(toolOrder, idx)
+			}
+			if tc.ID != "" {
+				acc.id = tc.ID
+			}
+			if tc.Function.Name != "" {
+				acc.name = tc.Function.Name
+			}
+			if tc.Function.Arguments != "" {
+				acc.args.WriteString(tc.Function.Arguments)
+				if err := emitErr(model.Event{Kind: model.EventArgsDelta, ToolIndex: idx, Delta: tc.Function.Arguments}); err != nil {
+					return err
+				}
+			}
+		}
+		if chunk.Choices[0].FinishReason != nil && *chunk.Choices[0].FinishReason != "" {
+			finish = *chunk.Choices[0].FinishReason
+		}
+		if chunk.Usage != nil {
+			usage = &model.Usage{
+				PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens,
+				TotalTokens: chunk.Usage.TotalTokens, Known: true,
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return &Error{Class: ClassNetwork, Msg: "upstream stream read failed"}
 	}
-	return nil
-}
 
-// Fake is a deterministic in-process provider for development and tests.
-type Fake struct{}
-
-func (Fake) Name() string { return "fake" }
-
-// Complete echoes the last user message with fixed usage.
-func (Fake) Complete(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	select {
-	case <-ctx.Done():
-		return ChatResponse{}, &Error{Class: ClassTimeout, Msg: "deadline exceeded"}
-	case <-time.After(10 * time.Millisecond):
-	}
-	last := ""
-	for _, m := range req.Messages {
-		if m.Role == "user" {
-			last = m.Content
+	// Close argument accumulators and assemble the final domain response.
+	out := head
+	for _, idx := range toolOrder {
+		acc := tools[idx]
+		call := &model.ToolCall{ID: acc.id, Name: acc.name, Arguments: acc.args.String()}
+		if err := emitErr(model.Event{Kind: model.EventArgsDone, ToolIndex: idx, ToolCall: call}); err != nil {
+			return err
 		}
+		out.Output = append(out.Output, model.OutputItem{Kind: model.OutputToolCall, ToolCall: call})
 	}
-	content := "echo: " + last
-	n := len(content)
-	return ChatResponse{
-		ID: "chatcmpl-fake", Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
-		Choices: []Choice{{Index: 0, Message: &Message{Role: "assistant", Content: content}, FinishReason: "stop"}},
-		Usage:   &Usage{PromptTokens: 10, CompletionTokens: n, TotalTokens: 10 + n, Known: true},
-	}, nil
-}
-
-// Stream emits the echo content in fixed-size chunks, then finishes.
-func (Fake) Stream(ctx context.Context, req ChatRequest, send func(payload []byte) error) error {
-	resp, _ := Fake{}.Complete(ctx, req)
-	chunk := resp
-	msg := resp.Choices[0].Message
-	const size = 8
-	for i := 0; i < len(msg.Content); i += size {
-		if err := ctx.Err(); err != nil {
-			return &Error{Class: ClassTimeout, Msg: "deadline exceeded"}
+	if textEmitted {
+		if err := emitErr(model.Event{Kind: model.EventTextDone, Text: text.String()}); err != nil {
+			return err
 		}
-		end := min(i+size, len(msg.Content))
-		c := chunk
-		c.Choices = []Choice{{Index: 0, Delta: &Message{Role: "assistant", Content: msg.Content[i:end]}}}
-		b, _ := json.Marshal(c)
-		if err := send(b); err != nil {
-			return &Error{Class: ClassInternal, Msg: "downstream send failed"}
-		}
+		out.Output = append(out.Output, model.OutputItem{Kind: model.OutputText, Text: text.String()})
 	}
-	final := chunk
-	final.Choices = []Choice{{Index: 0, Delta: &Message{}, FinishReason: "stop"}}
-	b, _ := json.Marshal(final)
-	return send(b)
+	out.FinishReason = normalizeFinish(finish)
+	out.Status = model.StatusCompleted
+	if out.FinishReason == model.FinishLength {
+		out.Status = model.StatusIncomplete
+	}
+	out.Usage = usage
+	return emitErr(model.Event{Kind: model.EventCompleted, Response: &out})
 }

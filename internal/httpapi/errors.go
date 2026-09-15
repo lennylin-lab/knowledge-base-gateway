@@ -9,6 +9,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
 )
@@ -68,6 +69,9 @@ func mapError(w http.ResponseWriter, requestID string, err error) {
 	case errors.Is(err, gateway.ErrUnknownModel), errors.Is(err, gateway.ErrNotPermitted):
 		// Deliberately non-leaky: missing vs forbidden are indistinguishable.
 		writeError(w, requestID, http.StatusForbidden, "permission_error", "model_not_allowed", "the requested model is not available for this principal")
+	case errors.Is(err, model.ErrCapabilityNotSupported):
+		// Declared capability rejected before any provider invocation.
+		writeError(w, requestID, http.StatusBadRequest, "invalid_request_error", "capability_not_supported", "the requested capability is not supported by this model")
 	case errors.Is(err, errValidation):
 		writeError(w, requestID, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
