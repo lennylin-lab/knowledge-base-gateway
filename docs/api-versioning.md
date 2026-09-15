@@ -59,7 +59,8 @@ native structured output) pass through the SDK with no `extra_body`
 workarounds once these shapes are accepted.
 
 Stable event types (SSE): `response.created`,
-`response.output_text.delta`, `response.output_text.done`,
+`response.output_item.added` (V1.2.1: announces a function call item with
+`call_id`/`name` before its argument fragments), `response.output_text.delta`, `response.output_text.done`,
 `response.function_call_arguments.delta`,
 `response.function_call_arguments.done`, `response.completed`,
 `response.failed`. Terminal streams end with exactly one of
