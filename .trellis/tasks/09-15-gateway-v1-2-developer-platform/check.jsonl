@@ -1,0 +1,5 @@
+{"file": "docs/v1.2-developer-platform-roadmap.md", "reason": "V1.2 acceptance, protocol, capability, management, and developer-doc checks"}
+{"file": "docs/gateway-client-contract.md", "reason": "Chat/SSE compatibility regression contract"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Quality gates, race/static checks, and boundary review"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Error, cancellation, retry, and redaction verification"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Observability and sensitive-field checks"}

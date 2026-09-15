@@ -1,0 +1,7 @@
+{"file": "docs/v1.2-developer-platform-roadmap.md", "reason": "Authoritative V1.2 unified protocol, capability, management, examples, and acceptance scope"}
+{"file": "docs/v1.1-production-roadmap.md", "reason": "V1.1 compatibility baseline and routing/limits/observability contracts"}
+{"file": "docs/agent-start.md", "reason": "Original Chat Completions, SSE, security, and provider boundaries"}
+{"file": "docs/gateway-client-contract.md", "reason": "Existing client-facing contract that must remain compatible"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Stable error mapping, cancellation, and no-provider-call rules"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Go quality, interface boundaries, and verification conventions"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Secret/content redaction and correlation requirements"}
