@@ -202,6 +202,23 @@ expectations.
 persistent service must namespace keys per run (random prefix) or clean up in
 defer; never rely on the service being empty.
 
+### Convention: Management mutations commit atomically with their audit record
+
+**What**: Admin mutations that must be audited (e.g. model enable/disable) run
+the catalog update and the `admin_audit` insert in one transaction
+(`SetModelEnabledWithAudit`); the handler applies runtime refresh only after
+commit via an injected `ApplyModelChange` boundary.
+
+**Why**: An unaudited committed change (or a phantom audit row for a rolled-back
+change) breaks the operational evidence chain. Failure semantics are split:
+`update_failed` = nothing changed; `refresh_failed` = change committed and
+audited but the live process may be divergent — never collapse the two.
+
+**Boundary**: Metrics contracts that cannot be measured yet are staged as
+always-present fields that stay `null` (cost, first-token latency) — stable
+names so dashboards detect availability, `null` means "not measured", never
+fabricated zero.
+
 ### Convention: Failover routing stays behind interfaces
 
 **What**: Provider failover (primary/backup route table + circuit breaker in `internal/router`) is selected before any provider call; streaming never switches providers after output starts; retries stay bounded under the total request deadline. Route breaker permits are taken lazily, one per attempt (`AdmitRoute` immediately before the provider call, `Record` immediately after); `Resolve` builds the plan permit-free via `EnabledRoutes`.
