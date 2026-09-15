@@ -1,0 +1,5 @@
+{"file":"docs/v1.2-developer-platform-roadmap.md","reason":"A2/A3/A4/A5/A6/A7/A10 protocol and streaming acceptance criteria"}
+{"file":"docs/gateway-client-contract.md","reason":"Existing Chat Completions compatibility contract"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Stable error envelopes, pre-provider rejection, and cancellation semantics"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Go test/static-check expectations and interface boundaries"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"No prompt/tool argument/secret leakage while handling failures"}

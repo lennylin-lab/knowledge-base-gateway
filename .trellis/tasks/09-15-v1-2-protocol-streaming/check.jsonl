@@ -1,0 +1,5 @@
+{"file":"docs/v1.2-developer-platform-roadmap.md","reason":"Acceptance check for protocol, tools, structured output, and provider consistency"}
+{"file":"docs/gateway-client-contract.md","reason":"Golden Chat compatibility verification"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Audit/error-class and no-provider-call verification"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Required validation and regression test review"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Redaction review for stream/provider failures"}
