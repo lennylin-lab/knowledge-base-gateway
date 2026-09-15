@@ -5,8 +5,8 @@ no provider URLs in client code.
 
     pip install openai
 
-Requires the gateway running with the mock provider (see
-docs/developer-quickstart.md).
+Verified against openai-python 3.5.0. Requires the gateway running with the
+mock provider (see docs/developer-quickstart.md).
 """
 import json
 import uuid
@@ -39,29 +39,31 @@ print("chat stream:", "".join(
 response = client.responses.create(model="gateway-echo", input="hello")
 print("responses:", response.status, response.output_text)
 
+# --- Responses (streaming) -------------------------------------------------
+# Typed events arrive in order and end with response.completed.
+stream = client.responses.create(model="gateway-echo", input="hello", stream=True)
+print("responses stream:", "".join(
+    ev.delta for ev in stream if ev.type == "response.output_text.delta"))
+
 # --- Responses (tool calling, manual loop) ---------------------------------
 # The gateway transports tool calls; YOUR code executes tools and sends
 # results back in a follow-up request. The gateway never runs tools.
 #
-# The gateway accepts the documented MVP subset of the Responses API
-# (docs/api-versioning.md). Tools use the nested chat-completions function
-# shape and `tool_choice`; both go through extra_body because they are
-# gateway MVP fields rather than SDK parameters.
+# `tools` accepts the native flat Responses function shape and the nested
+# chat-completions shape (`{"type": "function", "function": {...}}` via
+# extra_body); both are documented in docs/api-versioning.md.
 tools = [{
     "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Look up current weather for a city",
-        "parameters": {
-            "type": "object",
-            "properties": {"city": {"type": "string"}},
-            "required": ["city"],
-        },
+    "name": "get_weather",
+    "description": "Look up current weather for a city",
+    "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
     },
 }]
 response = client.responses.create(
-    model="gateway-echo", input="What is the weather in Paris?",
-    extra_body={"tools": tools, "tool_choice": "auto"})
+    model="gateway-echo", input="What is the weather in Paris?", tools=tools)
 call = next(o for o in response.output if o.type == "function_call")
 print("tool call:", call.name, call.arguments)
 
@@ -75,13 +77,15 @@ follow_up = client.responses.create(
         {"type": "function_call_output", "call_id": call.call_id,
          "output": json.dumps({"temp_c": 22, "sky": "sunny"})},
     ],
-    extra_body={"tools": tools},
+    tools=tools,
 )
 print("after tool:", follow_up.output_text)
 
 # --- Responses (structured output) -----------------------------------------
-# Structured output uses the gateway's `response_format` field (nested
-# json_schema object), passed through extra_body.
+# Structured output uses the SDK's native `text.format` parameter. The
+# gateway MVP dialect (`response_format` with a nested json_schema object,
+# passed through extra_body) is also accepted; the two are mutually
+# exclusive.
 schema = {
     "type": "object",
     "properties": {"echo": {"type": "string"}},
@@ -91,9 +95,11 @@ schema = {
 response = client.responses.create(
     model="gateway-echo",
     input="hello",
-    extra_body={"response_format": {
+    text={"format": {
         "type": "json_schema",
-        "json_schema": {"name": "echo_answer", "strict": True, "schema": schema},
+        "name": "echo_answer",
+        "strict": True,
+        "schema": schema,
     }},
 )
 print("structured:", json.loads(response.output_text))

@@ -34,7 +34,29 @@ status mapping are frozen across both protocols for all of V1.
 
 Accepted request fields: `model`, `input` (string or typed item array),
 `instructions`, `temperature`, `max_output_tokens`, `stream`, `tools`,
-`tool_choice`, `response_format`, `metadata`. Everything else is rejected.
+`tool_choice`, `response_format`, `text`, `metadata`. Everything else is
+rejected.
+
+Two spellings are accepted for two fields, covering both the gateway MVP
+dialect and the native Responses shapes the openai SDK sends:
+
+- `tools` entries may use the nested chat-completions shape
+  (`{"type":"function","function":{name, description, parameters}}`) or the
+  flat Responses shape (`{"type":"function","name":...,
+  "description":...,"parameters":...}`). Unknown fields are rejected inside
+  either shape.
+- Structured output may use `response_format`
+  (`{"type":"json_schema","json_schema":{name, schema, strict}}`, the MVP
+  dialect) or `text` (`{"format":{"type":"json_schema","name":...,
+  "schema":...,"strict":...}}`, the native SDK parameter;
+  `{"format":{"type":"text"}}` selects plain text and
+  `{"format":{"type":"json_object"}}` JSON mode). `text` and
+  `response_format` are mutually exclusive.
+
+Verified against openai-python 3.5.0: chat completions (non-streaming and
+streaming) and `/v1/responses` (non-streaming, streaming, native tools,
+native structured output) pass through the SDK with no `extra_body`
+workarounds once these shapes are accepted.
 
 Stable event types (SSE): `response.created`,
 `response.output_text.delta`, `response.output_text.done`,

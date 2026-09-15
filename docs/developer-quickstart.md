@@ -59,6 +59,42 @@ names, and URLs are never exposed.
 Every request should carry `X-Request-ID` (client generated) so gateway
 audit rows, metrics, and traces correlate with your logs.
 
+## 3.1 OpenAI Python SDK compatibility
+
+Verified against **openai-python 3.5.0** (Python 3.12) with the mock
+provider. The SDK only needs `base_url` and a dev API key — no provider
+secrets, no provider URLs:
+
+```python
+import uuid
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8080/v1",   # local gateway, mock provider
+    api_key="kb_dev_key_123",              # a GATEWAY_API_KEYS plaintext key
+    default_headers={"X-Request-ID": str(uuid.uuid4())},
+)
+```
+
+The verified pass matrix:
+
+| Scenario | SDK call | Status |
+|---|---|---|
+| Chat, non-streaming | `client.chat.completions.create(model, messages)` | pass |
+| Chat, streaming | `... stream=True` (SSE chunks, `chat.completion.chunk`) | pass |
+| Responses, non-streaming | `client.responses.create(model, input)` | pass |
+| Responses, streaming | `... stream=True` (typed events) | pass |
+| Responses, tools | native `tools=[{"type":"function","name":...}]` | pass |
+| Responses, tool round trip | `function_call` + `function_call_output` input items | pass |
+| Responses, structured output | native `text={"format":{"type":"json_schema",...}}` | pass |
+
+The gateway accepts both tool spellings (nested chat shape and the flat
+Responses shape) and both structured-output spellings (`response_format`
+and `text.format`, mutually exclusive); see `docs/api-versioning.md` for
+the exact contract. The SDK strips unset parameters, so no default fields
+are injected beyond what you pass. A runnable example is
+`docs/examples/python_openai_sdk.py`.
+
 ## 4. Errors, retries, and IDs
 
 Errors use one stable envelope on both protocols:
