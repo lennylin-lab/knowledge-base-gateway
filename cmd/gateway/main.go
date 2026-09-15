@@ -19,6 +19,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/config"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/dberr"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/envfile"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/httpapi"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
@@ -33,6 +34,10 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+	if err := envfile.Load(".env"); err != nil {
+		logger.Error("failed to load .env", "error", err)
+		os.Exit(1)
+	}
 
 	cfg, err := config.FromEnv()
 	if err != nil {

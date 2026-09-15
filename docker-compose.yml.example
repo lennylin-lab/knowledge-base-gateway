@@ -1,6 +1,10 @@
 # Gateway-owned container stack: PostgreSQL + Redis + one-shot migration +
 # gateway in database-backed Redis mode.
 #
+# Copy this file to docker-compose.yml before starting the stack:
+#
+#   cp docker-compose.yml.example docker-compose.yml
+#
 # Dependency order:
 #
 #   postgres healthy -\

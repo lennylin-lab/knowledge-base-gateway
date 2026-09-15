@@ -9,12 +9,15 @@ requirement document.
 ## Quick start (development, fake provider)
 
 ```bash
-export GATEWAY_API_KEYS="key-1:tenant-a:sk-dev-internal-key"
-export GATEWAY_MODELS="gpt-4o-mini:fake:gpt-4o-mini"
-export GATEWAY_PROVIDER=fake
-export GATEWAY_ADDR=:8080
+cp .env.example .env
 go run ./cmd/gateway
 ```
+
+The gateway and migration commands load `.env` from the current directory when
+it exists. Existing process environment variables take precedence, so
+production deployments can continue to inject configuration directly without
+using a dotenv file. Keep real credentials in an ignored `.env`, never in
+`.env.example`.
 
 Call it:
 
@@ -30,11 +33,19 @@ Streaming: add `"stream": true` to the body; the response is
 
 ## Using the real OpenAI-compatible provider
 
+Edit `.env`:
+
 ```bash
-export GATEWAY_PROVIDER=openai
-export OPENAI_API_KEY=sk-...        # never persisted; process env only
-export OPENAI_BASE_URL=https://api.openai.com/v1
-export GATEWAY_MODELS="gpt-4o-mini:openai:gpt-4o-mini"
+GATEWAY_PROVIDER=openai
+OPENAI_API_KEY=sk-...        # keep only in ignored .env; never commit
+OPENAI_BASE_URL=https://api.openai.com/v1
+GATEWAY_MODELS="gpt-4o-mini:openai:gpt-4o-mini"
+```
+
+Then start the gateway normally:
+
+```bash
+go run ./cmd/gateway
 ```
 
 ## Configuration
@@ -185,11 +196,14 @@ Schema changes are versioned in `migrations/` (`<version>_<name>.up.sql` /
 mutates the schema at startup:
 
 ```bash
-go run ./cmd/migrate -dsn "$GATEWAY_DATABASE_URL" up      # apply all pending
-go run ./cmd/migrate -dsn "$GATEWAY_DATABASE_URL" steps -1 # roll back one version
-go run ./cmd/migrate -dsn "$GATEWAY_DATABASE_URL" down     # roll back everything (destructive)
-go run ./cmd/migrate -dsn "$GATEWAY_DATABASE_URL" version  # current schema version
+go run ./cmd/migrate up      # apply all pending
+go run ./cmd/migrate steps -1 # roll back one version
+go run ./cmd/migrate down     # roll back everything (destructive)
+go run ./cmd/migrate version  # current schema version
 ```
+
+The migration command reads `GATEWAY_DATABASE_URL` from `.env` when no `-dsn`
+flag is supplied. An explicit `-dsn` still takes precedence.
 
 The tool (golang-migrate on the pgx/v5 driver) tracks the applied version in
 `schema_migrations` and takes a PostgreSQL advisory lock, so concurrent
@@ -207,13 +221,22 @@ contract.
 all configuration is injected at run time by Compose or the deployment
 environment.
 
-`docker-compose.yml` owns the deployment-shaped stack: PostgreSQL and Redis
-with health checks, a one-shot migration job (`cmd/migrate up`, idempotent for
-a fully-applied schema), and the gateway in database-backed Redis mode
+`docker-compose.yml.example` is the safe template for the deployment-shaped
+stack. Copy it to the local, ignored `docker-compose.yml` before starting:
+
+```bash
+cp docker-compose.yml.example docker-compose.yml
+```
+
+The stack runs PostgreSQL and Redis with health checks, a one-shot migration
+job (`cmd/migrate up`, idempotent for a fully-applied schema), and the gateway
+in database-backed Redis mode
 (catalog/routes/policies/keys come from PostgreSQL; the dev-only
 `GATEWAY_API_KEYS` / `GATEWAY_MODELS` variables are not used). The gateway
 also runs the admin API with a deterministic throwaway token (loopback-only
-host port; override `GATEWAY_ADMIN_TOKEN` for anything non-disposable).
+host port; override `GATEWAY_ADMIN_TOKEN` for anything non-disposable). Docker
+Compose reads the root `.env` for `${...}` interpolation; only variables
+listed in the Compose `environment:` sections are passed to the Go process.
 Destructive rollback is never part of startup.
 
 ```bash

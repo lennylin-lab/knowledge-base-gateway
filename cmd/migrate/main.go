@@ -4,7 +4,7 @@
 //
 // Usage:
 //
-//	migrate -dsn "$GATEWAY_DATABASE_URL" -dir migrations <command>
+//	migrate [-dsn "$GATEWAY_DATABASE_URL"] [-dir migrations] <command>
 //
 // Commands:
 //
@@ -33,9 +33,13 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/dberr"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/envfile"
 )
 
 func main() {
+	if err := envfile.Load(".env"); err != nil {
+		fatal("load .env: %v", err)
+	}
 	dsn := flag.String("dsn", os.Getenv("GATEWAY_DATABASE_URL"), "PostgreSQL DSN (defaults to GATEWAY_DATABASE_URL)")
 	dir := flag.String("dir", "migrations", "migrations directory")
 	flag.Parse()
@@ -122,7 +126,7 @@ func newMigrator(dsn, dir string) (*migrate.Migrate, func(), error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: migrate -dsn <postgres-dsn> [-dir migrations] up|down|steps N|version")
+	fmt.Fprintln(os.Stderr, "usage: migrate [-dsn <postgres-dsn>] [-dir migrations] up|down|steps N|version")
 }
 
 func fatal(format string, args ...any) {

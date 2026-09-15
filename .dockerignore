@@ -1,6 +1,9 @@
 # Keep the build context minimal: only go.mod/go.sum, Go sources, and the
 # migrations directory are needed by the Dockerfile.
 .git
+.env
+.env.*
+!.env.example
 .github
 .agents
 .claude
