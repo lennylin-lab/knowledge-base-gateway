@@ -1,0 +1,62 @@
+# Build static Linux binaries and publish a GitHub Release when a version tag
+# is pushed (v*). Configuration is never baked into the binaries: deploy with
+# environment variables or a server-side .env, same as local development.
+#
+# Server deploy sketch (after downloading assets from the Release page):
+#   tar -xzf migrations.tar.gz
+#   GATEWAY_DATABASE_URL=... ./migrate-linux-amd64 -dir migrations up
+#   GATEWAY_ADDR=:8080 GATEWAY_DATABASE_URL=... ./gateway-linux-amd64
+#
+# Tag a release:
+#   git tag v1.0.0 && git push origin v1.0.0
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build and publish release assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go (version declared by go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build Linux amd64 binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          build_flags=(-ldflags="-s -w" -trimpath)
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build "${build_flags[@]}" -o dist/gateway-linux-amd64 ./cmd/gateway
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build "${build_flags[@]}" -o dist/migrate-linux-amd64 ./cmd/migrate
+          tar -czf dist/migrations.tar.gz -C . migrations
+          (cd dist && sha256sum gateway-linux-amd64 migrate-linux-amd64 migrations.tar.gz > SHA256SUMS)
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/gateway-linux-amd64
+            dist/migrate-linux-amd64
+            dist/migrations.tar.gz
+            dist/SHA256SUMS
