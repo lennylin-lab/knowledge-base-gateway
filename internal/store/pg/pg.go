@@ -338,8 +338,11 @@ func (d *DB) LoadProviders(ctx context.Context) ([]ProviderConfig, error) {
 // max_input_tokens is the subject-level input ceiling enforced before any
 // provider invocation; the default slots backfill requests that omit
 // `model`. Rows are ordered by subject and id so the per-subject projection
-// is deterministic, and the default-model mutation keeps the slots uniform
-// across a subject's rows.
+// is deterministic: ceilings keep the last-row-wins projection, while the
+// default-model slots take the first non-empty value in id order across the
+// subject's rows — a row with a NULL slot never erases a default declared on
+// another row of the same subject. The default-model mutation keeps the
+// slots uniform across a subject's rows.
 func (d *DB) LoadLimits(ctx context.Context) (map[string]policy.Limits, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT subject_id, rate_per_minute, max_concurrent,
@@ -354,12 +357,14 @@ func (d *DB) LoadLimits(ctx context.Context) (map[string]policy.Limits, error) {
 	out := map[string]policy.Limits{}
 	for rows.Next() {
 		var subject string
-		var l policy.Limits
-		if err := rows.Scan(&subject, &l.RatePerMinute, &l.MaxConcurrent,
-			&l.DailyTokens, &l.MonthlyTokens, &l.MaxInputTokens, &l.MaxOutputTokens,
-			&l.DefaultModel, &l.DefaultEmbeddingModel); err != nil {
+		var row policy.Limits
+		if err := rows.Scan(&subject, &row.RatePerMinute, &row.MaxConcurrent,
+			&row.DailyTokens, &row.MonthlyTokens, &row.MaxInputTokens, &row.MaxOutputTokens,
+			&row.DefaultModel, &row.DefaultEmbeddingModel); err != nil {
 			return nil, err
 		}
+		l := out[subject]
+		l.FoldPolicyRow(row)
 		out[subject] = l
 	}
 	return out, rows.Err()

@@ -356,6 +356,85 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("cleanup subject: %v", err)
 	}
 
+	// Multi-row policy collapse (issue #7): a subject with several
+	// access_policies rows keeps defaults declared on any of them — the
+	// loader takes the first non-empty slot value in id order, chat and
+	// embedding judged independently — while ceilings keep the historical
+	// last-row-wins projection. Rows are inserted in ascending id order.
+	if _, err := pgw.Pool.Exec(ctx,
+		`INSERT INTO model_catalog (public_name, provider, upstream_model, capabilities)
+		 VALUES ('gateway-echo-2', 'fake-primary', 'echo-model-2', '{}')`); err != nil {
+		t.Fatalf("insert second model: %v", err)
+	}
+	if _, err := pgw.Pool.Exec(ctx,
+		`INSERT INTO subjects (id, tenant_id) VALUES ('subject_multi_row', 'tenant_default'),
+			('subject_row1_defaults', 'tenant_default'), ('subject_null_defaults', 'tenant_default')`); err != nil {
+		t.Fatalf("insert multi-row subjects: %v", err)
+	}
+	// subject_multi_row: chat default on row 1 (NULL later), embedding default
+	// on row 2 (NULL on row 1) — both must resolve; ceilings come from row 2.
+	if _, err := pgw.Pool.Exec(ctx, `
+		INSERT INTO access_policies
+			(subject_id, public_model, rate_per_minute, max_concurrent, daily_tokens, default_model, default_embedding_model)
+		VALUES
+			('subject_multi_row', 'gateway-echo',   30, 3, 5000, 'gateway-echo',   NULL),
+			('subject_multi_row', 'gateway-echo-2', 60, 6, 9000, NULL,             'gateway-echo-2')`); err != nil {
+		t.Fatalf("insert subject_multi_row policies: %v", err)
+	}
+	// subject_row1_defaults: both defaults on row 1, both NULL on row 2 —
+	// row 1's slots must survive the later NULL rows.
+	if _, err := pgw.Pool.Exec(ctx, `
+		INSERT INTO access_policies
+			(subject_id, public_model, rate_per_minute, max_concurrent, default_model, default_embedding_model)
+		VALUES
+			('subject_row1_defaults', 'gateway-echo',   10, 1, 'gateway-echo',   'gateway-echo'),
+			('subject_row1_defaults', 'gateway-echo-2', 20, 2, NULL,             NULL)`); err != nil {
+		t.Fatalf("insert subject_row1_defaults policies: %v", err)
+	}
+	// subject_null_defaults: every row all-NULL — no default resolves and the
+	// model-less request keeps its stable 400 path; ceilings stay last-wins.
+	if _, err := pgw.Pool.Exec(ctx, `
+		INSERT INTO access_policies
+			(subject_id, public_model, rate_per_minute, max_concurrent)
+		VALUES
+			('subject_null_defaults', 'gateway-echo',   11, 1),
+			('subject_null_defaults', 'gateway-echo-2', 22, 2)`); err != nil {
+		t.Fatalf("insert subject_null_defaults policies: %v", err)
+	}
+	multiLimits, err := pgw.LoadLimits(ctx)
+	if err != nil {
+		t.Fatalf("load multi-row limits: %v", err)
+	}
+	if l := multiLimits["subject_multi_row"]; l.DefaultModel != "gateway-echo" || l.DefaultEmbeddingModel != "gateway-echo-2" {
+		t.Fatalf("multi-row defaults must be first-non-empty per slot, got %+v", l)
+	}
+	if l := multiLimits["subject_multi_row"]; l.RatePerMinute != 60 || l.MaxConcurrent != 6 || l.DailyTokens != 9000 {
+		t.Fatalf("multi-row ceilings must keep last-row-wins, got %+v", l)
+	}
+	if l := multiLimits["subject_row1_defaults"]; l.DefaultModel != "gateway-echo" || l.DefaultEmbeddingModel != "gateway-echo" {
+		t.Fatalf("row-1 defaults must survive NULL slots on later rows, got %+v", l)
+	}
+	if l := multiLimits["subject_row1_defaults"]; l.RatePerMinute != 20 || l.MaxConcurrent != 2 {
+		t.Fatalf("row1_defaults ceilings must keep last-row-wins, got %+v", l)
+	}
+	if l := multiLimits["subject_null_defaults"]; l.DefaultModel != "" || l.DefaultEmbeddingModel != "" {
+		t.Fatalf("all-NULL rows must keep no default (400 path unchanged), got %+v", l)
+	}
+	if l := multiLimits["subject_null_defaults"]; l.RatePerMinute != 22 {
+		t.Fatalf("null_defaults ceilings must keep last-row-wins, got %+v", l)
+	}
+	if _, err := pgw.Pool.Exec(ctx, `DELETE FROM access_policies WHERE subject_id IN
+		('subject_multi_row', 'subject_row1_defaults', 'subject_null_defaults')`); err != nil {
+		t.Fatalf("cleanup multi-row policies: %v", err)
+	}
+	if _, err := pgw.Pool.Exec(ctx, `DELETE FROM subjects WHERE id IN
+		('subject_multi_row', 'subject_row1_defaults', 'subject_null_defaults')`); err != nil {
+		t.Fatalf("cleanup multi-row subjects: %v", err)
+	}
+	if _, err := pgw.Pool.Exec(ctx, `DELETE FROM model_catalog WHERE public_name = 'gateway-echo-2'`); err != nil {
+		t.Fatalf("cleanup second model: %v", err)
+	}
+
 	// Model enable/disable persists atomically with its management op, and
 	// the runtime refresh path can re-read the row regardless of state.
 	if err := pgw.SetModelEnabledWithAudit(ctx, "gateway-echo", false, mgmt.AdminOp{

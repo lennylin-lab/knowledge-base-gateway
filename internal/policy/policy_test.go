@@ -40,6 +40,62 @@ func TestUnsetInputCeilingStaysZero(t *testing.T) {
 	}
 }
 
+// TestFoldPolicyRowsFirstNonEmptyDefaults pins issue #7: when a subject's
+// access_policies rows are folded in id order, the default-model slots take
+// the first non-empty value — a row with an empty slot never erases a default
+// declared on an earlier row, and the chat and embedding slots are judged
+// independently. Ceilings keep the historical last-row-wins projection.
+func TestFoldPolicyRowsFirstNonEmptyDefaults(t *testing.T) {
+	rows := []Limits{
+		{RatePerMinute: 10, MaxConcurrent: 1, DailyTokens: 100, MonthlyTokens: 1000,
+			MaxInputTokens: 512, MaxOutputTokens: 64,
+			DefaultModel: "chat-a"},
+		{RatePerMinute: 20, MaxConcurrent: 2},
+		{RatePerMinute: 30, MaxConcurrent: 3, DailyTokens: 300,
+			DefaultEmbeddingModel: "embed-c"},
+	}
+	var got Limits
+	for _, row := range rows {
+		got.FoldPolicyRow(row)
+	}
+	want := Limits{
+		RatePerMinute: 30, MaxConcurrent: 3, DailyTokens: 300,
+		DefaultModel: "chat-a", DefaultEmbeddingModel: "embed-c",
+	}
+	if got != want {
+		t.Fatalf("folded limits = %+v, want %+v", got, want)
+	}
+}
+
+// TestFoldPolicyRowsAllNullDefaultsStayEmpty pins the unchanged 400 path: a
+// subject whose rows all leave the slots NULL keeps no default, while the
+// ceilings still collapse to the last row.
+func TestFoldPolicyRowsAllNullDefaultsStayEmpty(t *testing.T) {
+	var got Limits
+	got.FoldPolicyRow(Limits{RatePerMinute: 5})
+	got.FoldPolicyRow(Limits{RatePerMinute: 7})
+	if got.DefaultModel != "" || got.DefaultEmbeddingModel != "" {
+		t.Fatalf("all-NULL rows must keep both slots empty, got %+v", got)
+	}
+	if got.RatePerMinute != 7 {
+		t.Fatalf("ceilings must keep last-row-wins, got %+v", got)
+	}
+}
+
+// TestFoldPolicyRowSingleRowIdentity pins that a one-row subject folds to
+// itself — the fix must not change single-row subjects at all.
+func TestFoldPolicyRowSingleRowIdentity(t *testing.T) {
+	row := Limits{
+		RatePerMinute: 9, MaxConcurrent: 4, DailyTokens: 50,
+		DefaultModel: "m", DefaultEmbeddingModel: "e",
+	}
+	var got Limits
+	got.FoldPolicyRow(row)
+	if got != row {
+		t.Fatalf("single row must fold to itself, got %+v want %+v", got, row)
+	}
+}
+
 // TestCatalogSetEntryAndRemove pins the management runtime-refresh primitives:
 // SetEntry inserts unknown models and replaces known ones (fresh capabilities
 // and configuration version), a disabled entry hides the model from Lookup,

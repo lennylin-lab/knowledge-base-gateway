@@ -158,6 +158,29 @@ type Limits struct {
 	DefaultEmbeddingModel string
 }
 
+// FoldPolicyRow folds one access_policies row into the subject's collapsed
+// limits. Rows must arrive in ascending id order (the loader's ORDER BY).
+// Ceilings keep the historical last-row-wins projection; the default-model
+// slots take the first non-empty value in id order across the subject's rows
+// — a row with an empty slot never erases a default declared on an earlier
+// row, and the chat and embedding slots are judged independently. The
+// PostgreSQL loader and any in-memory row source share this helper so the
+// collapse semantics cannot drift between modes.
+func (l *Limits) FoldPolicyRow(row Limits) {
+	l.RatePerMinute = row.RatePerMinute
+	l.MaxConcurrent = row.MaxConcurrent
+	l.DailyTokens = row.DailyTokens
+	l.MonthlyTokens = row.MonthlyTokens
+	l.MaxInputTokens = row.MaxInputTokens
+	l.MaxOutputTokens = row.MaxOutputTokens
+	if l.DefaultModel == "" {
+		l.DefaultModel = row.DefaultModel
+	}
+	if l.DefaultEmbeddingModel == "" {
+		l.DefaultEmbeddingModel = row.DefaultEmbeddingModel
+	}
+}
+
 // All returns every catalog entry (for router and readiness wiring).
 func (c *Catalog) All() []ModelInfo {
 	c.mu.RLock()
