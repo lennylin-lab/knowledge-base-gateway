@@ -278,3 +278,31 @@ Shipped the model-control-plane task (issue #4 features 1-3) and the per-provide
 ### Status
 
 [OK] **Completed**
+
+
+## Session 11: Control plane follow-ups: dimensions, defaults, ceilings
+<!-- trellis-session: v=2 fp=efd8deb2c921fe79 -->
+
+**Date**: 2026-09-17
+**Task**: Control plane follow-ups: dimensions, defaults, ceilings
+**Branch**: `master`
+
+### Summary
+
+Closed the three v1.3 rollout issues in one task. (1) issue #6: the gateway now injects the catalog-declared embedding_dim as the dimensions parameter into upstream openai embeddings requests (client-passed dimensions is structurally ignored, never forwarded); MRL upstreams (e.g. Qwen3) return the declared width -> 200, dimensions-ignoring upstreams still fail loud 500 embedding_dim_mismatch; injection and CheckEmbeddingDim share one catalog lookup so they cannot drift. (2) issue #7: LoadLimits folds multi-row subject policies through the shared policy.Limits.FoldPolicyRow — default_model/default_embedding_model take the first non-empty value in id order (slots independent), so a NULL on one row no longer erases defaults declared on another; pg and memory modes share the fold function. (3) issue #8 (server decision: short-term option 1, mid-term option 4): ceilings changed from last-row-wins to min-of-declared — NOT NULL columns min over all rows, nullable caps constrain only when declared, order-independent, single-row identity, adding a row can never raise a quota; /admin/policies rows gained an effective_limits block computed via LoadLimits (view/enforcement no drift, metadata-only); README documents the upgrade note that existing multi-row subjects' quotas may tighten. Spec: multi-row folding convention recorded in database-guidelines; folding decision point isolated in FoldPolicyRow for the future option-4 migration. Verified: issues #6/#7/#8 closed with evidence comments; gofmt/vet clean; -race suite with real PostgreSQL/Redis zero skips; replay 12/12; golden fixtures byte-identical.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `054454a` | fix: inject catalog embedding_dim into upstream embeddings requests |
+| `c6ade45` | fix: fold multi-row subject policies with first-non-empty defaults |
+| `e2ad49d` | docs: record multi-row policy folding semantics in backend specs |
+| `4236be5` | chore: add control-plane-followups task artifacts |
+| `86a3bed` | feat: fold policy ceilings to min-of-declared with effective view |
+| `284f2ec` | docs: document min-of-declared folding and upgrade note |
+| `5adbed5` | chore: record ceilings decision in task prd |
+
+### Status
+
+[OK] **Completed**
