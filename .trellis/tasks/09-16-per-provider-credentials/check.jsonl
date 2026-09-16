@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verify secret redaction and unchanged behavior without per-provider env."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify startup errors name variables, never values."}
