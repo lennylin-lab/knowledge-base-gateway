@@ -7,6 +7,8 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -381,6 +383,82 @@ func TestEmbeddingsDimMismatchIsConfigError(t *testing.T) {
 	if events[0].PromptTokens == nil {
 		t.Fatal("upstream usage must still be recorded: the provider did the work")
 	}
+}
+
+// openAIEmbedStub is a minimal OpenAI-compatible embeddings upstream. When
+// mrl is true it honors the upstream `dimensions` parameter and returns
+// vectors of the requested width (an MRL upstream); otherwise it ignores
+// dimensions and always returns its native width. The last request body is
+// recorded for request-side assertions.
+func openAIEmbedStub(t *testing.T, mrl bool, nativeWidth int) (*httptest.Server, *string) {
+	t.Helper()
+	var lastBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		lastBody = string(b)
+		var req struct {
+			Dimensions int `json:"dimensions"`
+		}
+		_ = json.Unmarshal(b, &req)
+		width := nativeWidth
+		if mrl && req.Dimensions > 0 {
+			width = req.Dimensions
+		}
+		vec := make([]float64, width)
+		for i := range vec {
+			vec[i] = 0.125
+		}
+		vecJSON, _ := json.Marshal(vec)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"object":"list","model":"upstream-embed","data":[{"object":"embedding","index":0,"embedding":%s}],"usage":{"prompt_tokens":3,"total_tokens":3}}`, vecJSON)
+	}))
+	t.Cleanup(func() { srv.CloseClientConnections(); srv.Close() })
+	return srv, &lastBody
+}
+
+func TestEmbeddingsInjectsDeclaredDimensions(t *testing.T) {
+	// Issue #6: the catalog-declared embedding_dim is injected upstream as
+	// `dimensions`, so an MRL upstream returns the declared width and passes
+	// the check. A client-passed dimensions field is ignored: not forwarded,
+	// not an error — the catalog stays the dimension authority.
+	caps := embedCaps
+	caps.EmbeddingDim = 4
+
+	t.Run("mrl upstream honors the injected dimension", func(t *testing.T) {
+		srv, lastBody := openAIEmbedStub(t, true, 8)
+		f := newEmbeddingsFixture(t, caps, provider.NewOpenAI(srv.URL, "sk-upstream-secret"), policy.Limits{})
+		rec := doEmbeddings(t, f.h, `{"model":"`+embedModel+`","input":"hello","dimensions":777}`, testKey, "req-emb-dim")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+		}
+		var resp embeddingsResponseOut
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Data) != 1 || len(resp.Data[0].Embedding) != 4 {
+			t.Fatalf("data = %+v, want exactly the declared width 4", resp.Data)
+		}
+		if !strings.Contains(*lastBody, `"dimensions":4`) {
+			t.Fatalf("upstream body must carry the declared dimension: %s", *lastBody)
+		}
+		if strings.Contains(*lastBody, "777") {
+			t.Fatalf("client-passed dimensions must never be forwarded: %s", *lastBody)
+		}
+	})
+
+	t.Run("upstream returning native width fails loud", func(t *testing.T) {
+		// An upstream that ignores dimensions returns its native width: the
+		// declaration/upstream mismatch stays a loud 500 config error.
+		srv, _ := openAIEmbedStub(t, false, 8)
+		f := newEmbeddingsFixture(t, caps, provider.NewOpenAI(srv.URL, "sk-upstream-secret"), policy.Limits{})
+		rec := doEmbeddings(t, f.h, embeddingsBody("hello"), testKey, "")
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "embedding_dim_mismatch") {
+			t.Fatalf("wrong code: %s", rec.Body.String())
+		}
+	})
 }
 
 func TestEmbeddingsRollbackSwitchRemovesRoute(t *testing.T) {

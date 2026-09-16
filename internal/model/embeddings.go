@@ -18,6 +18,13 @@ type EmbeddingsRequest struct {
 	Model       string
 	Input       []string
 	RequestID   string
+
+	// Dimensions carries the catalog-declared embedding_dim (0 = undeclared).
+	// Adapters that translate a dimensions parameter inject it into the
+	// upstream request so MRL upstreams return the declared width; the value
+	// always originates from the catalog — a client-passed dimensions field is
+	// never forwarded. Adapters without dimension support ignore it.
+	Dimensions int
 }
 
 // InputChars sums the text input size as the deterministic quota signal (the

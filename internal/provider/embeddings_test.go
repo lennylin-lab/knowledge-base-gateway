@@ -192,6 +192,36 @@ func TestOpenAIEmbeddingsTranslation(t *testing.T) {
 	}
 }
 
+func TestOpenAIEmbeddingsDimensionsInjection(t *testing.T) {
+	// The catalog-declared embedding_dim rides the upstream request as the
+	// `dimensions` field (issue #6); an undeclared dimension is omitted
+	// entirely, never sent as zero.
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"object":"list","model":"up-model","data":[{"object":"embedding","index":0,"embedding":[0.5]}],"usage":{"prompt_tokens":1,"total_tokens":1}}`)
+	}))
+	t.Cleanup(func() { srv.CloseClientConnections(); srv.Close() })
+	p := NewOpenAI(srv.URL, "sk-upstream-secret")
+
+	declared := embeddingsRequest("hello")
+	declared.Dimensions = 2560
+	if _, err := p.Embeddings(context.Background(), declared); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `"dimensions":2560`) {
+		t.Fatalf("declared dimension must be injected upstream: %s", body)
+	}
+	if _, err := p.Embeddings(context.Background(), embeddingsRequest("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(body, "dimensions") {
+		t.Fatalf("undeclared dimension must be omitted from the wire request: %s", body)
+	}
+}
+
 func TestAnthropicEmbeddingsUnsupported(t *testing.T) {
 	p := NewAnthropic("https://api.anthropic.com", "sk-ant-secret")
 	if caps := p.Capabilities("m"); caps.Embeddings {

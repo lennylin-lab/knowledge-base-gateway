@@ -138,10 +138,24 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer adm.release()
 
+	// Capability lookup once, before the provider call: the catalog-declared
+	// embedding_dim is the dimension authority. It is injected upstream as the
+	// `dimensions` parameter (MRL upstreams honor it and return the declared
+	// width) and re-checked against the response below, so declaration and
+	// enforcement share one value. A client-passed dimensions field is not
+	// represented in the wire type and is never forwarded.
+	declaredDim := 0
+	capsKnown := false
+	if caps, ok := h.Service.Capabilities(publicModel); ok {
+		capsKnown = true
+		declaredDim = caps.EmbeddingDim
+	}
+
 	ereq := model.EmbeddingsRequest{
 		PublicModel: publicModel,
 		RequestID:   requestID,
 		Input:       input,
+		Dimensions:  declaredDim,
 	}
 	resp, providerName, err := h.Service.Embeddings(r.Context(), adm.plan, ereq)
 	if err != nil {
@@ -160,8 +174,8 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// fails loud (500-class, nothing returned) — the upstream did the work,
 	// so the reported usage still settles — and never leaks vector content.
 	dimErr := error(nil)
-	if caps, ok := h.Service.Capabilities(publicModel); ok {
-		dimErr = model.CheckEmbeddingDim(caps.EmbeddingDim, resp)
+	if capsKnown {
+		dimErr = model.CheckEmbeddingDim(declaredDim, resp)
 	}
 	if dimErr != nil {
 		mapError(w, requestID, dimErr)

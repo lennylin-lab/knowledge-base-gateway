@@ -495,10 +495,13 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 
 // openaiWireEmbeddingsRequest is the embeddings wire request. The input is
 // always sent as a string array (the upstream accepts it for single and
-// batch inputs alike), so translation is total and lossless.
+// batch inputs alike), so translation is total and lossless. Dimensions is
+// the catalog-declared width injected on the gateway's authority (0/undeclared
+// is omitted); a client-supplied dimensions field never reaches this type.
 type openaiWireEmbeddingsRequest struct {
-	Model string   `json:"model"`
-	Input []string `json:"input"`
+	Model      string   `json:"model"`
+	Input      []string `json:"input"`
+	Dimensions int      `json:"dimensions,omitempty"`
 }
 
 type openaiWireEmbeddingsUsage struct {
@@ -521,7 +524,9 @@ type openaiWireEmbeddingsResponse struct {
 // OpenAI-compatible /embeddings endpoint. The API key is sent only here and
 // never logged. Usage is input-token only: completion tokens stay zero.
 func (o *OpenAI) Embeddings(ctx context.Context, req model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
-	body, err := json.Marshal(openaiWireEmbeddingsRequest{Model: req.Model, Input: req.Input})
+	body, err := json.Marshal(openaiWireEmbeddingsRequest{
+		Model: req.Model, Input: req.Input, Dimensions: req.Dimensions,
+	})
 	if err != nil {
 		return model.EmbeddingsResponse{}, &Error{Class: ClassInternal, Msg: "encode request"}
 	}
