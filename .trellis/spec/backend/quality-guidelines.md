@@ -147,6 +147,31 @@ order is structural now, not convention.
 `admit` — the principal is an input, and every new model-protocol handler
 (`chat`, `responses`, future ones) must call `authenticate` first.
 
+### Convention: New serving features are capability-matrix-gated and pre-provider rejected
+
+**What**: Every new model-serving feature (embeddings, retrieval profiles,
+future citations/vision-style additions) ships as a capability-matrix
+attribute first: a `Capabilities` field in `internal/model`, declared in the
+catalog (seeded in a migration), enforced in `model.CheckCapabilities` for its
+protocol label, and rejected with the stable `capability_not_supported` 400
+before any provider invocation. Endpoint-level rollback switches
+(`GATEWAY_RESPONSES_ENABLED`, `GATEWAY_EMBEDDINGS_ENABLED`) un-register the
+route independently; per-model enable/disable reuses the audited admin
+toggle. Directory-style attributes the gateway declares and clients read
+(e.g. `embedding_dim`, retrieval profiles) are additive JSONB/catalog data —
+the server reads them from discovery, never the reverse.
+
+**Why**: Capability rejection before the provider keeps un-deployed features
+unreachable per model even when the code ships; the matrix doubles as the
+rollout mechanism, and audit rows can be correlated with the declaration in
+force via `config_version`.
+
+**Boundary**: Never gate a feature only by configuration presence or route
+registration — the matrix is the enforcement point. Adapters without native
+support declare the capability false and return
+`model.ErrCapabilityNotSupported` as defense in depth (see Anthropic
+embeddings).
+
 ### Convention: Golden fixtures lock wire compatibility before refactors
 
 **What**: `internal/httpapi/testdata/golden/` pins the V1 chat wire shapes
