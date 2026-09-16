@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verify golden stability, contract-suite coverage of the new scenarios, no decoder weakening."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Verify loader collapse determinism and NULL handling on real PostgreSQL."}
