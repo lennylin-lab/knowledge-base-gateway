@@ -82,6 +82,23 @@ Fix the two integration findings from the v1.3 control plane rollout (issues
   dimension-authority philosophy.
 - Issue #7 first-non-empty-wins for defaults only; ceilings unchanged with a
   recorded follow-up issue.
+- **Ceilings decision (issue #8, server, 2026-09-16)**: short-term option 1 —
+  rate/ceiling fields fold to the **minimum declared value** per field
+  (order-independent, intersection semantics; adding a row can never raise
+  quotas). Mid-term option 4 (subject-level ceilings table) is a separate
+  future migration; per-model quotas noted as a future interface. Mitigation
+  for silent tightening: the admin policies view must make the folded
+  effective values visible (per-row effective annotation or per-subject
+  effective-limits block — implementer's choice, tested).
+
+## Scope Addendum (2026-09-16, post-#8 decision)
+
+- `FoldPolicyRow` ceiling fields change from last-row-wins to min-of-declared
+  (0/unset rows do not constrain: a field is only constrained by rows that
+  declare it); defaults keep first-non-empty-wins.
+- Admin policies view gains tightened-value visibility per the mitigation
+  above.
+- Spec folding convention (database-guidelines) updated accordingly.
 
 ## Open Questions (blocking)
 
