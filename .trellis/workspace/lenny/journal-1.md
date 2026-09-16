@@ -250,3 +250,31 @@ Closed the remaining staged gaps in two tasks. (1) streaming-structured-output-p
 ### Status
 
 [OK] **Completed**
+
+
+## Session 10: Model control plane, integrations docs, and issue triage
+<!-- trellis-session: v=2 fp=f11dfa88bc8fa9e5 -->
+
+**Date**: 2026-09-16
+**Task**: Model control plane, integrations docs, and issue triage
+**Branch**: `master`
+
+### Summary
+
+Shipped the model-control-plane task (issue #4 features 1-3) and the per-provider-credentials task (issue #5), plus integration docs and two integration-issue verifications. (1) model-control-plane: POST /v1/embeddings OpenAI-compatible proxy with capability-gated embeddings/embedding_dim (directory attribute; dim mismatch fails loud 500 embedding_dim_mismatch), shared admission pipeline with same-pool quota settle-to-usage, GATEWAY_EMBEDDINGS_ENABLED rollback flag, deterministic fake embeddings + openai adapter in the contract suite; migration 0005 (access_policies.default_model + default_embedding_model nullable FKs, model_catalog.retrieval_profile JSONB) with protocol-aware default backfill in admission and admin default-model mutation through the atomic mgmt-audit path; retrieval_profile surfaced in /v1/models/{model}; user decisions: dual slots day one, shared quota pool, model-level profiles. Check pass: zero defects. (2) Integration docs written into knowledge-base-server/docs: gateway-v1.3-integration.md (new) and a v1.3 pointer in gateway-v1.2-integration.md. (3) Issue triage: #2 retest feedback fixed (tool-call identity only on the opening stream fragment; encoder no longer repeats id/name; two-way regression pins) and #3 fixed (fake stream shards on rune boundaries; multi-byte UTF-8 regression tests; spec now requires multi-byte fixture content). (4) per-provider-credentials: credentialEnvName/resolveCredential resolve <KIND>_API_KEY__<PROVIDER_NAME> with kind-level fallback for openai+anthropic; both-missing startup failure names variables without values; double-openai-upstream deployment unblocked. Verified: closed issues #2/#3/#5 with evidence comments. Open follow-ups from the latest triage (NOT yet fixed): issue #6 embeddings drops the dimensions parameter (fix: inject catalog embedding_dim upstream) and issue #7 LoadLimits row collapsing makes any NULL default_model on the winning row kill subject backfill (fix: first-non-empty-wins; ceilings collapsing semantics flagged for a decision).
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1137abc` | feat: add embeddings proxy, subject default models, and retrieval profiles |
+| `03d8bd8` | docs: document embeddings, default models, and retrieval profiles |
+| `03d0fc6` | docs: capture capability-gating principle in backend specs |
+| `4841408` | chore: add model-control-plane task artifacts |
+| `16a37cd` | feat: resolve provider credentials per provider with kind-level fallback |
+| `7c48eae` | docs: document per-provider credential env convention |
+| `33f0eb0` | chore: add per-provider-credentials task artifacts |
+
+### Status
+
+[OK] **Completed**
