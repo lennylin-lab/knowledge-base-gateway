@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Admission pipeline ordering, contract suite, golden lock, staged-null and settle-exactly-once conventions bounding all three features."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Stable envelope, capability rejection pre-provider, quota vs infra-failure mapping for the embeddings protocol."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Additive migration 0005 rules, text-FK convention, cmd/migrate usage, never-fabricate persistence."}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Redaction rules for embeddings input/vector content (never logged or audited)."}
