@@ -167,6 +167,9 @@ output, 400/401/429/500, timeout, malformed) against every adapter, offline.
 **Why**: Capability or translation bugs in one adapter can't hide behind the
 routing core; a new adapter inherits the suite for free. Capability-unsupported
 must be rejected before provider invocation (call counters pin this).
+Fixture text must include multi-byte UTF-8 content (e.g. Chinese) — an
+ASCII-only suite let a byte-index sharding bug corrupt streamed CJK into
+U+FFFD unnoticed (issue #3).
 
 ### Convention: Quota reservation/settlement behind quota.Gate
 
