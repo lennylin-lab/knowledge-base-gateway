@@ -56,6 +56,7 @@ go run ./cmd/gateway
 | `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set |
 | `OPENAI_API_KEY` | – | Provider secret; required when provider is `openai` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
+| `<KIND>_API_KEY__<PROVIDER_NAME>` | – | Optional per-provider credential override; see "Per-provider credentials" below |
 | `GATEWAY_API_KEYS` | – | Dev-only: `id:subject:plaintext-key` comma-separated. Production keys live in PostgreSQL (`api_keys` table, salted hashes). |
 | `GATEWAY_MODELS` | – | Dev-only: `public-name:provider:upstream-model` comma-separated. Production catalog lives in PostgreSQL. |
 | `GATEWAY_MAX_RETRIES` | `2` | Finite retries for pre-output network/429/5xx/timeout failures |
@@ -66,6 +67,30 @@ go run ./cmd/gateway
 
 Request size limits: 1 MiB body, 64 messages, 32k characters per message
 (constants in `internal/config`).
+
+### Per-provider credentials
+
+Multiple providers of the same kind can use different credentials, e.g. an
+openai-kind chat upstream and an openai-kind embeddings upstream side by side,
+each with its own key. For every enabled `providers` row the gateway resolves
+the credential from `<KIND>_API_KEY__<PROVIDER_NAME>` first — provider name
+uppercased, non-alphanumerics mapped to `_` — and falls back to the kind-level
+`<KIND>_API_KEY` (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) when the
+per-provider variable is unset. Example: two openai-kind rows named `chat`
+and `openai-embed`, each with its own key, plus a fallback for everything
+else:
+
+```bash
+OPENAI_API_KEY=sk-kind-level...             # fallback for rows without their own variable
+OPENAI_API_KEY__CHAT=sk-chat-upstream...    # provider row "chat"
+OPENAI_API_KEY__OPENAI_EMBED=sk-embed-2...  # provider row "openai-embed"
+```
+
+`anthropic` rows work symmetrically (`ANTHROPIC_API_KEY__<PROVIDER_NAME>`),
+`fake` rows need no credential, and deployments without any per-provider
+variable behave exactly as before. An enabled row with neither variable
+refuses startup with an error naming the checked variables — never any
+value.
 
 ## Endpoints
 
@@ -165,10 +190,13 @@ the persisted configuration is authoritative: the development-only
 `GATEWAY_API_KEYS` and `GATEWAY_MODELS` lists are optional (a supplied value
 is still validated so a typo fails startup), and the legacy `GATEWAY_PROVIDER`
 selector is ignored. Every enabled `providers` row is credential-checked at
-startup — `fake` needs no secret, `openai` requires `OPENAI_API_KEY`, and
-`anthropic` requires `ANTHROPIC_API_KEY` — and a missing credential aborts
-startup before the server can report ready. Secrets are read from the process
-environment only and are never persisted, logged, or echoed in errors.
+startup — `fake` needs no secret, `openai` resolves
+`OPENAI_API_KEY__<PROVIDER_NAME>` with fallback to `OPENAI_API_KEY`, and
+`anthropic` resolves `ANTHROPIC_API_KEY__<PROVIDER_NAME>` with fallback to
+`ANTHROPIC_API_KEY` (see "Per-provider credentials" above) — and a missing
+credential aborts startup before the server can report ready. Secrets are read
+from the process environment only and are never persisted, logged, or echoed
+in errors.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -178,7 +206,7 @@ environment only and are never persisted, logged, or echoed in errors.
 | `GATEWAY_ADMIN_TOKEN` | – | Bearer token for the admin API (admin API disabled when unset) |
 | `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
 | `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | – | Anthropic credentials (env only) |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | – | Anthropic credentials (env only); per-provider override `ANTHROPIC_API_KEY__<PROVIDER_NAME>` |
 | `GATEWAY_ALLOW_INSECURE_BASE_URLS` | `false` | Development only: allow `http://` provider base URLs and loopback/private IP-literal hosts (e.g. `127.0.0.1`). Restricted IP destinations (link-local/cloud metadata, multicast, unspecified) stay rejected in every mode |
 
 ### Admin API
