@@ -233,6 +233,31 @@ bypass grants: a default pointing at a model the subject cannot use stays the
 non-leaky 403. Local development mode assigns slots with
 `GATEWAY_DEFAULT_MODELS="subject:chat-model[:embedding-model],..."`.
 
+### Multi-row policy folding
+
+A subject may hold one `access_policies` row per granted model; the gateway
+folds the rows into one effective policy per subject:
+
+- **Default-model slots** take the first non-empty value in row `id` order
+  (chat and embedding judged independently); a NULL slot on one row never
+  erases a default declared on another.
+- **Ceilings** (`rate_per_minute`, `max_concurrent`, `daily_tokens`,
+  `monthly_tokens`, `max_input_tokens`, `max_output_tokens`) take the
+  minimum declared value across the subject's rows — adding a row can never
+  raise a quota. A row without a cap does not constrain that field; if no
+  row declares a cap, the subject stays uncapped for it.
+
+The admin policies view (`GET /admin/policies`) attaches an
+`effective_limits` block to every row — the exact folded ceilings
+enforcement uses — so a tightening row is visible to operators rather than
+silent.
+
+Note for existing multi-row deployments: where a subject's rows declared
+different ceiling values, folding previously took the last row's values (by
+`id` order); after upgrading, the minimum declared value applies, which can
+lower the effective quotas of multi-row subjects. Single-row subjects are
+unaffected.
+
 ### Routing and reliability
 
 Public models route through `model_routes` (priority order) to a primary and

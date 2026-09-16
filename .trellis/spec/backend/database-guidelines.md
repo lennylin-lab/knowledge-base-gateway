@@ -32,18 +32,27 @@ naming.
 **What**: A subject may have one `access_policies` row per granted model.
 `LoadLimits` folds a subject's rows via `policy.Limits.FoldPolicyRow`:
 `default_model` / `default_embedding_model` take the **first non-empty
-value** in `id` order (chat and embedding slots judged independently), while
-rate/ceiling fields keep the historical last-row-wins projection.
+value** in `id` order (chat and embedding slots judged independently), and
+every rate/ceiling field (`rate_per_minute`, `max_concurrent`,
+`daily_tokens`, `monthly_tokens`, `max_input_tokens`, `max_output_tokens`)
+folds to the **minimum declared value** across the subject's rows (issue #8
+decision). A ceiling constrains only when a row declares it — a NULL/0 cap
+never constrains, and a field no row declares stays 0 (uncapped); the
+ceiling fold itself is order-independent.
 
 **Why**: Row-level NULLs must never erase defaults declared on another row
-(issue #7: any NULL on the winning row killed subject-level backfill);
-ceilings were left last-wins deliberately — changing them would silently
-resize existing deployments (recorded as a follow-up product decision).
+(issue #7: any NULL on the winning row killed subject-level backfill).
+Min-of-declared gives ceilings intersection semantics — adding a row can
+never raise a quota — and removes the ordering accident of last-row-wins,
+where the final row by `id` silently resized the subject.
 
 **Boundary**: Both pg and any in-memory row source must fold through the
-shared `FoldPolicyRow` so the modes cannot drift; the admin default-model
-mutation updates all of a subject's rows and can only set existing models,
-so it never conflicts with first-non-empty-wins.
+shared `FoldPolicyRow` so the modes cannot drift; the admin policies view
+attaches the folded block (`mgmt.EffectiveLimits`, computed through
+`LoadLimits`) to every row so tightening is visible to operators instead of
+silent; and the admin default-model mutation updates all of a subject's rows
+and can only set existing models, so it never conflicts with
+first-non-empty-wins.
 
 ### Common Mistake: Resolving the migrations dir with a relative path
 
