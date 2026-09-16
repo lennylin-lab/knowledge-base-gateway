@@ -94,6 +94,10 @@ func (u *streamUsageBlanket) Capabilities(m string) model.Capabilities {
 	return u.inner.Capabilities(m)
 }
 
+func (u *streamUsageBlanket) Embeddings(ctx context.Context, req model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return u.inner.Embeddings(ctx, req)
+}
+
 func (u *streamUsageBlanket) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	return u.inner.Complete(ctx, req)
 }

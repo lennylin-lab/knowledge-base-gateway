@@ -26,6 +26,16 @@ type ModelEntry struct {
 	Enabled       bool
 }
 
+// DefaultModelEntry names a subject's default models for local development
+// mode. Format in GATEWAY_DEFAULT_MODELS (comma separated):
+// "<subject>:<chat-model>[:<embedding-model>]". The embedding segment is
+// optional; a single-segment entry sets only the chat default.
+type DefaultModelEntry struct {
+	Subject        string
+	ChatModel      string
+	EmbeddingModel string
+}
+
 // Config is the validated process configuration.
 type Config struct {
 	Addr            string
@@ -58,7 +68,14 @@ type Config struct {
 
 	// V1.2 developer platform. ResponsesEnabled is the independent endpoint
 	// rollback switch; per-model gates live in the catalog capability matrix.
-	ResponsesEnabled bool
+	// V1.3 adds the same switch for the embeddings endpoint.
+	ResponsesEnabled  bool
+	EmbeddingsEnabled bool
+
+	// DefaultModels carries the local-development default-model assignments
+	// (GATEWAY_DEFAULT_MODELS). In database mode the access_policies columns
+	// are authoritative and this list is ignored.
+	DefaultModels []DefaultModelEntry
 }
 
 // FromEnv builds a Config from environment variables and validates it.
@@ -191,6 +208,37 @@ func FromEnv() (Config, error) {
 	// the endpoint independently of Chat Completions (documented rollback
 	// switch). Per-model gates live in the catalog capability matrix.
 	c.ResponsesEnabled = os.Getenv("GATEWAY_RESPONSES_ENABLED") != "false"
+
+	// V1.3 Embeddings endpoint: same default-enabled, independently togglable
+	// rollback switch. Per-model gates live in the catalog capability matrix
+	// (embeddings + embedding_dim).
+	c.EmbeddingsEnabled = os.Getenv("GATEWAY_EMBEDDINGS_ENABLED") != "false"
+
+	// GATEWAY_DEFAULT_MODELS="subject:chat-model[:embedding-model],..."
+	// Development-mode default-model assignments; in database mode the
+	// access_policies default columns are authoritative. A supplied value is
+	// parsed and validated in both modes so a typo fails startup.
+	if raw := os.Getenv("GATEWAY_DEFAULT_MODELS"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			fields := strings.SplitN(part, ":", 3)
+			switch len(fields) {
+			case 2:
+				c.DefaultModels = append(c.DefaultModels, DefaultModelEntry{Subject: fields[0], ChatModel: fields[1]})
+			case 3:
+				c.DefaultModels = append(c.DefaultModels, DefaultModelEntry{Subject: fields[0], ChatModel: fields[1], EmbeddingModel: fields[2]})
+			default:
+				return c, fmt.Errorf("GATEWAY_DEFAULT_MODELS entry %q must be <subject>:<chat-model>[:<embedding-model>]", part)
+			}
+			e := c.DefaultModels[len(c.DefaultModels)-1]
+			if e.Subject == "" || e.ChatModel == "" {
+				return c, fmt.Errorf("GATEWAY_DEFAULT_MODELS entry %q must name a subject and a chat model", part)
+			}
+		}
+	}
 	return c, nil
 }
 

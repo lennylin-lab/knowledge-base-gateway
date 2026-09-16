@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,6 +37,10 @@ func (f *flakyProvider) Capabilities(m string) model.Capabilities {
 		return f.inner.Capabilities(m)
 	}
 	return model.Capabilities{Chat: true, Responses: true, Stream: true, Tools: true, Usage: true}
+}
+
+func (f *flakyProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
 }
 
 func (f *flakyProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {

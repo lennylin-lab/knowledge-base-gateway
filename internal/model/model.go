@@ -213,6 +213,7 @@ type Event struct {
 type Capabilities struct {
 	Chat             bool `json:"chat,omitempty"`
 	Responses        bool `json:"responses,omitempty"`
+	Embeddings       bool `json:"embeddings,omitempty"`
 	Stream           bool `json:"stream,omitempty"`
 	Tools            bool `json:"tools,omitempty"`
 	StructuredOutput bool `json:"structured_output,omitempty"`
@@ -224,6 +225,11 @@ type Capabilities struct {
 	ContextTokens   int `json:"context_tokens,omitempty"`
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
 	MaxTools        int `json:"max_tools,omitempty"`
+	// EmbeddingDim is the fixed pgvector column width the catalog declares
+	// for this model (0 = undeclared). It is a directory attribute: the
+	// gateway declares it, clients read it; changing a model's dimension is
+	// a migration event, never a request-time negotiation.
+	EmbeddingDim int `json:"embedding_dim,omitempty"`
 }
 
 // Declared reports whether the catalog declares any capability explicitly.

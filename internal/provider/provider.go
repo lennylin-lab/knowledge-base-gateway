@@ -88,4 +88,11 @@ type Provider interface {
 	// adapter stops and reports it as a downstream failure; callers never
 	// retry after the first successful emit.
 	Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error
+	// Embeddings performs a non-streaming embeddings call. Vectors are
+	// returned exactly as the upstream produced them; the HTTP layer checks
+	// their width against the catalog-declared embedding_dim. Adapters whose
+	// upstream has no embeddings API return an error wrapping
+	// model.ErrCapabilityNotSupported (the capability matrix declares
+	// embeddings false for them by default).
+	Embeddings(ctx context.Context, req model.EmbeddingsRequest) (model.EmbeddingsResponse, error)
 }

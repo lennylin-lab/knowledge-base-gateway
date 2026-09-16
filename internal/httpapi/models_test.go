@@ -31,6 +31,9 @@ func newModelsFixture(t *testing.T) (*ModelsHandler, string, string) {
 			Capabilities: fullCaps, ConfigVersion: 2},
 		{PublicName: "beta", Provider: "fake", UpstreamModel: "up-beta", Enabled: true,
 			Capabilities: noResponsesCaps, ConfigVersion: 1},
+		{PublicName: "gamma", Provider: "fake", UpstreamModel: "up-gamma", Enabled: true,
+			Capabilities: embedCaps, ConfigVersion: 3,
+			RetrievalProfile: json.RawMessage(`{"vector_max_distance":0.35,"bm25_min_coverage":0.5}`)},
 		{PublicName: "disabled", Provider: "fake", UpstreamModel: "up-x", Enabled: false},
 	})
 	pol := policy.New()
@@ -67,10 +70,10 @@ func TestModelsListFilteredByAuthorization(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.Object != "list" || len(out.Data) != 2 {
+	if out.Object != "list" || len(out.Data) != 3 {
 		t.Fatalf("data = %+v (disabled models must be hidden)", out.Data)
 	}
-	if out.Data[0].ID != "alpha" || out.Data[1].ID != "beta" {
+	if out.Data[0].ID != "alpha" || out.Data[1].ID != "beta" || out.Data[2].ID != "gamma" {
 		t.Fatalf("ids = %+v", out.Data)
 	}
 	// The list shape must not carry provider or upstream names.
@@ -164,5 +167,51 @@ func TestModelsMethodGuard(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestModelsDetailRetrievalProfileAdditive(t *testing.T) {
+	h, full, _ := newModelsFixture(t)
+	// gamma declares a retrieval profile: the detail carries it verbatim,
+	// alongside the embeddings capability attributes.
+	rec := doModels(t, h, "/v1/models/gamma", full)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var d struct {
+		modelDetail
+		RetrievalProfile json.RawMessage `json:"retrieval_profile"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if string(d.RetrievalProfile) == "" || string(d.RetrievalProfile) == "null" {
+		t.Fatalf("retrieval_profile missing: %s", rec.Body.String())
+	}
+	var profile map[string]float64
+	if err := json.Unmarshal(d.RetrievalProfile, &profile); err != nil {
+		t.Fatalf("profile is not the declared JSON object: %s", d.RetrievalProfile)
+	}
+	if profile["vector_max_distance"] != 0.35 || profile["bm25_min_coverage"] != 0.5 {
+		t.Fatalf("profile content = %s", d.RetrievalProfile)
+	}
+	if !d.Capabilities.Embeddings || d.Capabilities.EmbeddingDim == 0 {
+		t.Fatalf("embeddings capability attributes missing: %+v", d.Capabilities)
+	}
+	found := false
+	for _, p := range d.Protocols {
+		if p == "embeddings" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("embeddings protocol missing from detail: %v", d.Protocols)
+	}
+
+	// alpha declares none: the field must be absent entirely (additive shape,
+	// not an explicit null).
+	rec = doModels(t, h, "/v1/models/alpha", full)
+	if strings.Contains(rec.Body.String(), "retrieval_profile") {
+		t.Fatalf("unset profile must be absent, got: %s", rec.Body.String())
 	}
 }

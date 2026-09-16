@@ -186,6 +186,11 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		for s := range subjects {
 			pol.AllowAll(s)
 		}
+		// Development-mode default models (GATEWAY_DEFAULT_MODELS). Database
+		// mode ignores this list; access_policies carries the slots there.
+		for _, d := range cfg.DefaultModels {
+			pol.SetDefault(d.Subject, d.ChatModel, d.EmbeddingModel)
+		}
 	}
 
 	// API keys: database mode reads them from PostgreSQL; otherwise dev keys
@@ -310,12 +315,35 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		return mgmt.ProviderRuntime{}, true
 	}
 
+	// Runtime refresh boundary for the audited default-model switch: reload
+	// the subject's persisted policy (limits and default-model slots) into
+	// the live process after the mutation committed. Development mode needs
+	// no boundary: the in-memory service mutates the shared policy directly.
+	var applyPolicyChange func(ctx context.Context, subject string) error
+	if dbw != nil {
+		applyPolicyChange = func(ctx context.Context, subject string) error {
+			limits, err := dbw.LoadLimits(ctx)
+			if err != nil {
+				return err
+			}
+			if l, ok := limits[subject]; ok {
+				pol.SetLimits(subject, l)
+			}
+			return nil
+		}
+	}
+
 	chat := &httpapi.ChatHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
 		Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxMsgs: cfg.MaxMessages, MaxChars: cfg.MaxMessageChars,
 	}
 	responses := &httpapi.ResponsesHandler{
+		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
+		Audit: auditSink, Metrics: reg,
+		MaxBody: cfg.MaxBodyBytes, MaxItems: cfg.MaxMessages * 2, MaxChars: cfg.MaxMessageChars,
+	}
+	embeddings := &httpapi.EmbeddingsHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
 		Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxItems: cfg.MaxMessages * 2, MaxChars: cfg.MaxMessageChars,
@@ -345,12 +373,17 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if !cfg.ResponsesEnabled {
 		responsesHandler = nil // documented rollback switch
 	}
+	var embeddingsHandler http.Handler = embeddings
+	if !cfg.EmbeddingsEnabled {
+		embeddingsHandler = nil // documented rollback switch
+	}
 	mux := httpapi.NewMux(chat, httpapi.Deps{
-		Logger:    logger,
-		ReadyFn:   ready,
-		Metrics:   reg.Handler(),
-		Responses: responsesHandler,
-		Models:    models,
+		Logger:     logger,
+		ReadyFn:    ready,
+		Metrics:    reg.Handler(),
+		Responses:  responsesHandler,
+		Embeddings: embeddingsHandler,
+		Models:     models,
 	})
 
 	// Bind both listeners synchronously so a port conflict is an ordinary
@@ -376,6 +409,7 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 			Handler: httpapi.NewAdminMux(httpapi.AdminDeps{
 				Manager: keyManager, Logger: logger, Token: cfg.AdminToken, Mgmt: mgmtSvc,
 				ApplyModelChange: applyModelChange, ProviderRuntime: providerRuntime,
+				ApplyPolicyChange: applyPolicyChange,
 			}),
 		}
 	}

@@ -4,9 +4,10 @@ package httpapi
 // is fixed and identical for every protocol, and authentication comes before
 // any body read:
 //
-//	authentication -> bounded decoding (caller) -> model/policy resolution
-//	-> capability precheck -> tool/schema validation -> input ceilings
-//	-> policy/model output clamps -> rate limit -> token quota reservation
+//	authentication -> bounded decoding (caller) -> default-model backfill
+//	-> model/policy resolution -> capability precheck -> tool/schema validation
+//	-> input ceilings -> policy/model output clamps -> rate limit
+//	-> token quota reservation
 //
 // Invalid, expired, and revoked keys therefore receive their 401 before the
 // caller drives any bounded parse work. Denials never reach a provider and
@@ -29,6 +30,31 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
 )
+
+// Protocol labels used by the admission pipeline and audit records. Existing
+// labels ("chat", "responses") keep their wire meaning.
+const (
+	protocolChat       = "chat"
+	protocolResponses  = "responses"
+	protocolEmbeddings = "embeddings"
+)
+
+// resolvePublicModel performs the default-model backfill for requests that
+// omit `model`: chat/responses fall back to the subject's default_model and
+// embeddings to default_embedding_model, before model resolution. An explicit
+// model keeps the current behavior. Neither a configured default nor an
+// explicit model is a stable 400 invalid_request.
+func resolvePublicModel(d admissionDeps, protocol, subject, requested string) (string, error) {
+	if requested != "" {
+		return requested, nil
+	}
+	if d.Policy != nil {
+		if def, ok := d.Policy.DefaultModelFor(subject, protocol); ok {
+			return def, nil
+		}
+	}
+	return "", fmt.Errorf("%w: model is required", model.ErrValidation)
+}
 
 // admissionDeps carries the collaborators shared by every model handler.
 type admissionDeps struct {
@@ -142,18 +168,20 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 		return &admitted{}, fmt.Errorf("%w: input exceeds the model context window", model.ErrValidation)
 	}
 
-	// 4. Output clamps: policy ceilings first, then model capability limits.
-	if d.Policy != nil {
-		if limits, ok := d.Policy.LimitsFor(subject); ok && limits.MaxOutputTokens > 0 {
-			if mreq.MaxTokens == nil || *mreq.MaxTokens > limits.MaxOutputTokens {
-				capped := limits.MaxOutputTokens
-				mreq.MaxTokens = &capped
+	// 4. Output clamps (chat/responses only: embeddings has no output budget).
+	if protocol != protocolEmbeddings {
+		if d.Policy != nil {
+			if limits, ok := d.Policy.LimitsFor(subject); ok && limits.MaxOutputTokens > 0 {
+				if mreq.MaxTokens == nil || *mreq.MaxTokens > limits.MaxOutputTokens {
+					capped := limits.MaxOutputTokens
+					mreq.MaxTokens = &capped
+				}
 			}
 		}
-	}
-	if caps.MaxOutputTokens > 0 && (mreq.MaxTokens == nil || *mreq.MaxTokens > caps.MaxOutputTokens) {
-		capped := caps.MaxOutputTokens
-		mreq.MaxTokens = &capped
+		if caps.MaxOutputTokens > 0 && (mreq.MaxTokens == nil || *mreq.MaxTokens > caps.MaxOutputTokens) {
+			capped := caps.MaxOutputTokens
+			mreq.MaxTokens = &capped
+		}
 	}
 
 	// 5. Rate/concurrency limits.
@@ -174,12 +202,20 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 
 	// 6. Token quota: reserve a deterministic bounded estimate before any
 	// provider invocation. Subjects without a configured budget skip quota.
+	// The reservation draws from the subject's single daily/monthly token
+	// pool for every protocol (chat, responses, embeddings share one budget).
 	qres := quota.Done
 	if d.Quota != nil && d.Policy != nil {
 		if limits, found := d.Policy.LimitsFor(subject); found {
 			ql := quota.Limits{DailyTokens: limits.DailyTokens, MonthlyTokens: limits.MonthlyTokens}
 			if ql.Configured() {
-				est := quota.Estimate(mreq.MaxTokens, limits.MaxOutputTokens, mreq.InputChars())
+				// Embeddings usage is input-token only, so the conservative
+				// reservation is the deterministic input estimate alone (no
+				// output reserve).
+				est := quota.InputTokens(mreq.InputChars())
+				if protocol != protocolEmbeddings {
+					est = quota.Estimate(mreq.MaxTokens, limits.MaxOutputTokens, mreq.InputChars())
+				}
 				res, qErr := d.Quota.Reserve(r.Context(), subject, ql, est, time.Now())
 				if qErr != nil {
 					var denial *quota.Error

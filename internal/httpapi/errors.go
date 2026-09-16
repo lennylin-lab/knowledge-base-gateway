@@ -72,6 +72,11 @@ func mapError(w http.ResponseWriter, requestID string, err error) {
 	case errors.Is(err, model.ErrCapabilityNotSupported):
 		// Declared capability rejected before any provider invocation.
 		writeError(w, requestID, http.StatusBadRequest, "invalid_request_error", "capability_not_supported", "the requested capability is not supported by this model")
+	case errors.Is(err, model.ErrEmbeddingDimMismatch):
+		// Gateway configuration error: the upstream vector width differs from
+		// the catalog declaration. 500-class, nothing returned, no vector or
+		// dimension internals echoed beyond the config problem itself.
+		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "embedding_dim_mismatch", "model embedding dimension does not match the configured declaration")
 	case errors.Is(err, errValidation):
 		writeError(w, requestID, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):

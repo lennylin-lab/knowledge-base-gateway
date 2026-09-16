@@ -73,16 +73,18 @@ func (d *DB) SetModelEnabledWithAudit(ctx context.Context, publicModel string, e
 }
 
 // ModelEntry reads one catalog row regardless of enabled state. The runtime
-// refresh path uses it to swap fresh rows (capabilities and configuration
-// version included) into the live catalog; found is false for unknown models.
+// refresh path uses it to swap fresh rows (capabilities, configuration
+// version, and retrieval profile included) into the live catalog; found is
+// false for unknown models.
 func (d *DB) ModelEntry(ctx context.Context, publicModel string) (policy.ModelInfo, bool, error) {
 	row := d.Pool.QueryRow(ctx, `
 		SELECT public_name, provider, upstream_model, enabled,
-		       COALESCE(capabilities, '{}'::jsonb), config_version
+		       COALESCE(capabilities, '{}'::jsonb), config_version, retrieval_profile
 		FROM model_catalog WHERE public_name = $1`, publicModel)
 	var m policy.ModelInfo
 	var caps []byte
-	if err := row.Scan(&m.PublicName, &m.Provider, &m.UpstreamModel, &m.Enabled, &caps, &m.ConfigVersion); err != nil {
+	var profile []byte
+	if err := row.Scan(&m.PublicName, &m.Provider, &m.UpstreamModel, &m.Enabled, &caps, &m.ConfigVersion, &profile); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return policy.ModelInfo{}, false, nil
 		}
@@ -90,6 +92,12 @@ func (d *DB) ModelEntry(ctx context.Context, publicModel string) (policy.ModelIn
 	}
 	if err := json.Unmarshal(caps, &m.Capabilities); err != nil {
 		return policy.ModelInfo{}, false, fmt.Errorf("model %s: parse capabilities: %w", m.PublicName, err)
+	}
+	if len(profile) > 0 && string(profile) != "null" {
+		if !json.Valid(profile) {
+			return policy.ModelInfo{}, false, fmt.Errorf("model %s: retrieval_profile is not valid JSON", m.PublicName)
+		}
+		m.RetrievalProfile = json.RawMessage(profile)
 	}
 	return m, true, nil
 }
@@ -155,11 +163,13 @@ func (d *DB) Providers(ctx context.Context) ([]mgmt.ProviderView, error) {
 	return out, nil
 }
 
-// Policies lists access_policies rows for one subject (or all when empty).
+// Policies lists access_policies rows for one subject (or all when empty),
+// including the subject's default-model slots.
 func (d *DB) Policies(ctx context.Context, subject string) ([]mgmt.PolicyView, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT subject_id, public_model, rate_per_minute, max_concurrent,
-		       COALESCE(daily_tokens, 0), COALESCE(monthly_tokens, 0)
+		       COALESCE(daily_tokens, 0), COALESCE(monthly_tokens, 0),
+		       COALESCE(default_model, ''), COALESCE(default_embedding_model, '')
 		FROM access_policies
 		WHERE ($1 = '' OR subject_id = $1)
 		ORDER BY subject_id, public_model
@@ -172,12 +182,56 @@ func (d *DB) Policies(ctx context.Context, subject string) ([]mgmt.PolicyView, e
 	for rows.Next() {
 		var v mgmt.PolicyView
 		if err := rows.Scan(&v.Subject, &v.PublicModel, &v.RatePerMinute, &v.MaxConcurrent,
-			&v.DailyTokens, &v.MonthlyTokens); err != nil {
+			&v.DailyTokens, &v.MonthlyTokens, &v.DefaultModel, &v.DefaultEmbeddingModel); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// SetDefaultModelWithAudit persists a default-model decision and its
+// management-operation audit record in one transaction: either both land or
+// neither does. The slots live on access_policies rows, so every row of the
+// subject is updated together and the subject's slots stay uniform. Unknown
+// subjects (no access_policies rows) and unknown models return
+// mgmt.ErrNotFound with nothing written. kind selects the slot: "chat" sets
+// default_model, "embedding" sets default_embedding_model.
+func (d *DB) SetDefaultModelWithAudit(ctx context.Context, subject, model, kind string, op mgmt.AdminOp) error {
+	column := map[string]string{"chat": "default_model", "embedding": "default_embedding_model"}[kind]
+	if column == "" {
+		return fmt.Errorf("unknown default-model kind %q", kind)
+	}
+	tx, err := d.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful Commit
+
+	// The target model must exist in the catalog (the FK would also reject
+	// the write, but an explicit check maps to a 404-class answer).
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM model_catalog WHERE public_name = $1)`, model).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return mgmt.ErrNotFound
+	}
+	// Parameterized identifiers are not possible for the column name, so the
+	// two known kinds branch on a validated, closed set.
+	query := fmt.Sprintf(`UPDATE access_policies SET %s = $2 WHERE subject_id = $1`, column)
+	ct, err := tx.Exec(ctx, query, subject, model)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return mgmt.ErrNotFound
+	}
+	if err := writeOp(ctx, tx, op); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // QueryAudit returns audit records matching the filter, newest first.

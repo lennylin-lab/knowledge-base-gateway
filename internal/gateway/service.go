@@ -245,6 +245,59 @@ func (s *Service) Complete(ctx context.Context, plan Plan, req model.Request) (m
 	return model.Response{}, plan.Primary(), lastErr
 }
 
+// Embeddings performs a non-streaming embeddings call under the same
+// attempt/breaker/retry discipline as Complete: embeddings are idempotent and
+// produce no output until the whole response arrives, so pre-output
+// network/429/5xx/timeout failures may retry and fail over within the total
+// deadline. The second return value names the provider that served (or last
+// attempted) the request for audit purposes.
+func (s *Service) Embeddings(ctx context.Context, plan Plan, req model.EmbeddingsRequest) (model.EmbeddingsResponse, string, error) {
+	ctx, cancel := s.withDeadline(ctx)
+	defer cancel()
+	var lastErr error
+	bo := s.newBackoff()
+	attempts := 0
+	for i, cand := range plan.Candidates {
+		creq := req
+		creq.Model = cand.UpstreamModel
+		maxTries := 1
+		if i == 0 {
+			maxTries = 1 + s.MaxRetries // bounded retries on the primary only
+		}
+		for try := 0; try < maxTries; try++ {
+			if attempts > 0 {
+				if err := waitBackoff(ctx, bo); err != nil {
+					return model.EmbeddingsResponse{}, cand.ProviderName, err
+				}
+			}
+			// Admit immediately before the attempt; Record always follows the
+			// call below, so an acquired permit is never orphaned.
+			if !s.Routes.AdmitRoute(plan.PublicModel, cand.ProviderName) {
+				break // breaker refused: fail over to the next candidate
+			}
+			attempts++
+			actx, acancel := attemptTimeout(ctx, cand.Timeout)
+			resp, err := cand.Provider.Embeddings(actx, creq)
+			acancel()
+			s.Routes.Record(plan.PublicModel, cand.ProviderName, err == nil)
+			if err == nil {
+				return resp, cand.ProviderName, nil
+			}
+			lastErr = err
+			if ctx.Err() != nil {
+				return model.EmbeddingsResponse{}, cand.ProviderName, ctx.Err()
+			}
+			if !provider.RetryEligible(err) {
+				return model.EmbeddingsResponse{}, cand.ProviderName, err
+			}
+		}
+	}
+	if lastErr == nil {
+		lastErr = ErrNoRoute
+	}
+	return model.EmbeddingsResponse{}, plan.Primary(), lastErr
+}
+
 // Stream performs a streaming completion under the configured total deadline.
 // Each attempt admits its route's breaker permit immediately before the
 // provider call and records the outcome immediately after, so half-open

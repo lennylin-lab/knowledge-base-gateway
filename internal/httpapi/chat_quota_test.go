@@ -31,6 +31,10 @@ func (u *usageOverride) Name() string { return u.inner.Name() }
 
 func (u *usageOverride) Capabilities(m string) model.Capabilities { return u.inner.Capabilities(m) }
 
+func (u *usageOverride) Embeddings(ctx context.Context, req model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return u.inner.Embeddings(ctx, req)
+}
+
 func (u *usageOverride) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	resp, err := u.inner.Complete(ctx, req)
 	if err != nil {
@@ -53,6 +57,10 @@ type streamFailOnce struct {
 func (f *streamFailOnce) Name() string { return f.inner.Name() }
 
 func (f *streamFailOnce) Capabilities(m string) model.Capabilities { return f.inner.Capabilities(m) }
+
+func (f *streamFailOnce) Embeddings(ctx context.Context, req model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return f.inner.Embeddings(ctx, req)
+}
 
 func (f *streamFailOnce) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	return f.inner.Complete(ctx, req)
@@ -83,6 +91,11 @@ type countingProvider struct {
 func (c *countingProvider) Name() string { return c.inner.Name() }
 
 func (c *countingProvider) Capabilities(m string) model.Capabilities { return c.inner.Capabilities(m) }
+
+func (c *countingProvider) Embeddings(ctx context.Context, req model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	c.calls++
+	return c.inner.Embeddings(ctx, req)
+}
 
 func (c *countingProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	c.calls++

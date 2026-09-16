@@ -7,6 +7,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,6 +48,10 @@ type callCounter struct {
 func (c *callCounter) Name() string { return c.inner.Name() }
 
 func (c *callCounter) Capabilities(m string) model.Capabilities { return c.inner.Capabilities(m) }
+
+func (c *callCounter) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
+}
 
 func (c *callCounter) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	*c.calls++
@@ -387,6 +392,10 @@ func (p *failBeforeEventProvider) Capabilities(m string) model.Capabilities {
 	return p.inner.Capabilities(m)
 }
 
+func (p *failBeforeEventProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
+}
+
 func (p *failBeforeEventProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	return p.inner.Complete(ctx, req)
 }
@@ -406,6 +415,10 @@ func (p *dieAfterFirstEventProvider) Name() string { return "die-after-first" }
 
 func (p *dieAfterFirstEventProvider) Capabilities(m string) model.Capabilities {
 	return p.inner.Capabilities(m)
+}
+
+func (p *dieAfterFirstEventProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
 }
 
 func (p *dieAfterFirstEventProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {
@@ -511,6 +524,10 @@ func (p *slowStreamProvider) sawCancel() bool {
 
 func (p *slowStreamProvider) Capabilities(m string) model.Capabilities {
 	return p.inner.Capabilities(m)
+}
+
+func (p *slowStreamProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
 }
 
 func (p *slowStreamProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {

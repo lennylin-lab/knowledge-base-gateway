@@ -8,14 +8,16 @@ import (
 
 // Deps bundles the collaborators needed by the operational endpoints. The
 // optional protocol handlers degrade independently: a nil Responses handler
-// disables /v1/responses (the documented rollback switch) without touching
-// Chat Completions.
+// disables /v1/responses and a nil Embeddings handler disables
+// /v1/embeddings (the documented rollback switches) without touching Chat
+// Completions.
 type Deps struct {
-	Logger    *slog.Logger
-	ReadyFn   func() bool
-	Metrics   http.Handler
-	Responses http.Handler // POST /v1/responses; nil disables the endpoint
-	Models    http.Handler // GET /v1/models, GET /v1/models/{model}
+	Logger     *slog.Logger
+	ReadyFn    func() bool
+	Metrics    http.Handler
+	Responses  http.Handler // POST /v1/responses; nil disables the endpoint
+	Embeddings http.Handler // POST /v1/embeddings; nil disables the endpoint
+	Models     http.Handler // GET /v1/models, GET /v1/models/{model}
 }
 
 // NewMux wires all routes.
@@ -41,6 +43,9 @@ func NewMux(chat http.Handler, deps Deps) *http.ServeMux {
 	mux.Handle("/v1/chat/completions", methodGuard(chat, http.MethodPost))
 	if deps.Responses != nil {
 		mux.Handle("/v1/responses", methodGuard(deps.Responses, http.MethodPost))
+	}
+	if deps.Embeddings != nil {
+		mux.Handle("/v1/embeddings", methodGuard(deps.Embeddings, http.MethodPost))
 	}
 	if deps.Models != nil {
 		mux.Handle("/v1/models", methodGuard(deps.Models, http.MethodGet))

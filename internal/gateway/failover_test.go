@@ -26,6 +26,10 @@ func (p *scriptedProvider) Capabilities(string) model.Capabilities {
 	return model.Capabilities{Chat: true, Responses: true, Stream: true, Tools: true, Usage: true}
 }
 
+func (p *scriptedProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
+}
+
 func (p *scriptedProvider) Complete(_ context.Context, _ model.Request) (model.Response, error) {
 	i := p.calls
 	p.calls++
@@ -176,6 +180,10 @@ func (p *deadlineProvider) Name() string { return p.name }
 func (p *deadlineProvider) Capabilities(string) model.Capabilities {
 	return model.Capabilities{Chat: true, Responses: true, Stream: true}
 }
+func (p *deadlineProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
+}
+
 func (p *deadlineProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {
 	return p.fn(ctx, req)
 }

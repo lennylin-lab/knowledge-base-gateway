@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -104,7 +105,8 @@ func (v *ProviderView) ApplyRuntime(rt ProviderRuntime) {
 	v.Health = HealthServing
 }
 
-// PolicyView is one subject/model grant with its ceilings.
+// PolicyView is one subject/model grant with its ceilings and the subject's
+// default-model slots (empty string = unset).
 type PolicyView struct {
 	Subject       string `json:"subject_id"`
 	PublicModel   string `json:"public_model"`
@@ -112,6 +114,10 @@ type PolicyView struct {
 	MaxConcurrent int    `json:"max_concurrent"`
 	DailyTokens   int64  `json:"daily_tokens"`
 	MonthlyTokens int64  `json:"monthly_tokens"`
+	DefaultModel  string `json:"default_model,omitempty"`
+	// DefaultEmbeddingModel is the slot backfilled into embeddings requests
+	// that omit `model`.
+	DefaultEmbeddingModel string `json:"default_embedding_model,omitempty"`
 }
 
 // AuditFilter bounds an audit or usage query; zero values are ignored.
@@ -185,6 +191,11 @@ type Service interface {
 	// land or neither does. A returned error means the mutation did not
 	// happen; the admin handler treats it as a failed operation.
 	SetModelEnabledWithAudit(ctx context.Context, publicModel string, enabled bool, op AdminOp) error
+	// SetDefaultModelWithAudit persists the subject's default-model slot
+	// (kind "chat" or "embedding") and its management-operation audit record
+	// as one atomic operation, with the same all-or-nothing semantics.
+	// Unknown subjects or models return ErrNotFound.
+	SetDefaultModelWithAudit(ctx context.Context, subject, model, kind string, op AdminOp) error
 	Providers(ctx context.Context) ([]ProviderView, error)
 	Policies(ctx context.Context, subject string) ([]PolicyView, error)
 	QueryAudit(ctx context.Context, f AuditFilter) ([]audit.Event, error)
@@ -242,6 +253,50 @@ func (m *MemoryService) SetModelEnabledWithAudit(_ context.Context, publicModel 
 	return nil
 }
 
+// SetDefaultModelWithAudit flips the in-memory policy's default-model slot
+// and appends the management-operation record under one lock, so the
+// dev-mode mutation is atomic and immediately live for admission. Unknown
+// models return ErrNotFound; unknown subjects (no grants, no wildcard, no
+// recorded limits) return ErrNotFound as their row-based store counterpart
+// does.
+func (m *MemoryService) SetDefaultModelWithAudit(_ context.Context, subject, model, kind string, op AdminOp) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch kind {
+	case "chat", "embedding":
+	default:
+		return fmt.Errorf("unknown default-model kind %q", kind)
+	}
+	exists := false
+	for _, info := range m.Catalog.All() {
+		if info.PublicName == model {
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	known := false
+	for _, s := range m.Policy.Subjects() {
+		if s == subject {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return ErrNotFound
+	}
+	switch kind {
+	case "chat":
+		m.Policy.SetDefault(subject, model, "")
+	case "embedding":
+		m.Policy.SetDefault(subject, "", model)
+	}
+	m.ops = append(m.ops, NormalizeOp(op))
+	return nil
+}
+
 // Providers returns the startup registry snapshot enriched with a recent
 // error summary from the in-memory audit sink. Health and breaker state are
 // runtime overlays (see AdminDeps.ProviderRuntime wiring), not store data.
@@ -280,7 +335,8 @@ func (m *MemoryService) Providers(_ context.Context) ([]ProviderView, error) {
 }
 
 // Policies summarizes the in-memory grant set; explicit policy rows are a
-// database-mode concept.
+// database-mode concept. The subject's default-model slots ride every row
+// (matching the row-based store's view shape).
 func (m *MemoryService) Policies(_ context.Context, subject string) ([]PolicyView, error) {
 	if m.Policy == nil {
 		return []PolicyView{}, nil
@@ -290,9 +346,13 @@ func (m *MemoryService) Policies(_ context.Context, subject string) ([]PolicyVie
 		if subject != "" && s != subject {
 			continue
 		}
+		defaults, _ := m.Policy.LimitsFor(s)
 		for _, info := range m.Catalog.All() {
 			if m.Policy.Permitted(s, info.PublicName) {
-				out = append(out, PolicyView{Subject: s, PublicModel: info.PublicName})
+				out = append(out, PolicyView{
+					Subject: s, PublicModel: info.PublicName,
+					DefaultModel: defaults.DefaultModel, DefaultEmbeddingModel: defaults.DefaultEmbeddingModel,
+				})
 			}
 		}
 	}

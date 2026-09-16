@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -23,9 +25,17 @@ import (
 //   - Text starting with "/refuse" produces a refusal output item.
 //   - A response specification wraps text output as {"echo": "<text>"},
 //     which satisfies object schemas with a required string "echo" property.
+//   - Embeddings return a fixed pseudo-random vector of exactly
+//     FakeEmbeddingDim floats derived from the input hash (stable across
+//     runs and processes, offline-testable). Usage is input-token only.
 //
 // Usage is always reported: prompt 10 tokens plus one token per output byte.
 type Fake struct{}
+
+// FakeEmbeddingDim is the vector width the fake provider declares and
+// returns. It matches the seeded catalog declaration (migration 0005) so
+// seeded deployments pass the dimension check.
+const FakeEmbeddingDim = 256
 
 func (Fake) Name() string { return "fake" }
 
@@ -33,9 +43,10 @@ func (Fake) Name() string { return "fake" }
 // and reasoning, so all documented flows run against the mock.
 func (Fake) Capabilities(string) model.Capabilities {
 	return model.Capabilities{
-		Chat: true, Responses: true, Stream: true, Tools: true,
+		Chat: true, Responses: true, Embeddings: true, Stream: true, Tools: true,
 		StructuredOutput: true, JSONMode: true, Usage: true,
 		ContextTokens: 8192, MaxOutputTokens: 2048, MaxTools: 8,
+		EmbeddingDim: FakeEmbeddingDim,
 	}
 }
 
@@ -170,6 +181,49 @@ func (f Fake) Stream(ctx context.Context, req model.Request, emit func(model.Eve
 	}
 	return emitErr(model.Event{Kind: model.EventCompleted, Response: &resp})
 }
+
+// fakeVector derives a deterministic pseudo-random vector from one text:
+// SHA-256 seeds a 64-bit xorshift generator whose output is mapped onto
+// [-1, 1). Identical inputs produce identical vectors across processes and
+// runs; different inputs produce different vectors.
+func fakeVector(text string, dim int) []float64 {
+	h := sha256.Sum256([]byte(text))
+	x := binary.LittleEndian.Uint64(h[:8])
+	out := make([]float64, dim)
+	for i := range out {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		out[i] = float64(x%2_000_001)/1_000_000.0 - 1.0
+	}
+	return out
+}
+
+// Embeddings returns the deterministic mock embeddings: one vector of
+// exactly FakeEmbeddingDim floats per input, and input-token-only usage
+// (prompt 10 tokens plus one token per four input bytes).
+func (Fake) Embeddings(ctx context.Context, req model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return model.EmbeddingsResponse{}, &Error{Class: ClassTimeout, Msg: "deadline exceeded"}
+	}
+	resp := model.EmbeddingsResponse{Object: "list", Model: req.Model}
+	chars := 0
+	for i, text := range req.Input {
+		chars += len(text)
+		resp.Data = append(resp.Data, model.Embedding{
+			Object: "embedding", Index: i, Embedding: fakeVector(text, FakeEmbeddingDim),
+		})
+	}
+	prompt := 10 + (chars+charsPerTokenGuess-1)/charsPerTokenGuess
+	resp.Usage = &model.Usage{
+		PromptTokens: prompt, CompletionTokens: 0, TotalTokens: prompt, Known: true,
+	}
+	return resp, nil
+}
+
+// charsPerTokenGuess mirrors the deterministic quota input approximation for
+// the mock's usage report (roughly four input bytes per token).
+const charsPerTokenGuess = 4
 
 // shardUTF8 emits s as fragments of at most chunk bytes, stepping fragment
 // ends back to a UTF-8 rune boundary so no fragment ever splits a multi-byte

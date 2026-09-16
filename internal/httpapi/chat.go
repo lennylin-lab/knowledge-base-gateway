@@ -197,15 +197,25 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(principal, err)
 		return
 	}
+
+	// 3. Default-model backfill: a request without `model` resolves the
+	// subject's default_model before model resolution; an explicit model
+	// keeps the current behavior, and neither default nor model is a stable
+	// 400 invalid_request.
+	publicModel, err := resolvePublicModel(deps, protocolChat, principal.SubjectID, req.Model)
+	if err != nil {
+		fail(principal, err)
+		return
+	}
 	mreq, err := req.toDomain(requestID)
 	if err != nil {
 		fail(principal, err)
 		return
 	}
 
-	// 3. Shared admission pipeline: model/policy -> capability precheck ->
+	// 4. Shared admission pipeline: model/policy -> capability precheck ->
 	// clamps -> rate limit -> quota.
-	adm, auditErr := admit(w, r, deps, "chat", req.Model, &mreq, principal)
+	adm, auditErr := admit(w, r, deps, protocolChat, publicModel, &mreq, principal)
 	if auditErr != nil {
 		fail(principal, auditErr)
 		return
@@ -213,12 +223,12 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer adm.release()
 
 	mreq.Model = adm.plan.Primary()
-	mreq.PublicModel = req.Model
+	mreq.PublicModel = publicModel
 	if !req.Stream {
-		h.complete(w, r, deps, requestID, traceID, principal, adm, req.Model, mreq, start)
+		h.complete(w, r, deps, requestID, traceID, principal, adm, publicModel, mreq, start)
 		return
 	}
-	h.stream(w, r, deps, requestID, traceID, principal, adm, req.Model, mreq, start)
+	h.stream(w, r, deps, requestID, traceID, principal, adm, publicModel, mreq, start)
 }
 
 // auditEvent assembles the metadata-only audit record. firstTokenMillis is
@@ -232,7 +242,7 @@ func (h *ChatHandler) auditEvent(requestID, traceID string, principal auth.Princ
 		PromptTokens: usageTokens(usage, true), CompletionTokens: usageTokens(usage, false),
 		FirstTokenMillis: firstTokenMillis,
 		Streaming:        streaming, CreatedAt: start, TraceID: traceID,
-		RouteAttempts: routeAttempts, Protocol: "chat",
+		RouteAttempts: routeAttempts, Protocol: protocolChat,
 	}
 }
 
@@ -341,9 +351,9 @@ func errorType(err error) string {
 }
 
 func validate(req *chatRequest, maxMsgs, maxChars int) error {
-	if req.Model == "" {
-		return fmt.Errorf("%w: model is required", errValidation)
-	}
+	// The model-required check lives in the default-model backfill
+	// (resolvePublicModel): requests without `model` first try the subject's
+	// configured default, and only fail when neither is configured.
 	if len(req.Messages) == 0 {
 		return fmt.Errorf("%w: messages must not be empty", errValidation)
 	}

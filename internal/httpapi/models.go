@@ -7,6 +7,7 @@ package httpapi
 // this boundary, and unknown and unauthorized models are indistinguishable.
 
 import (
+	"encoding/json"
 	"net/http"
 	"sort"
 	"strings"
@@ -32,14 +33,17 @@ type modelSummary struct {
 	OwnedBy string `json:"owned_by"`
 }
 
-// modelDetail is the detail shape: public capabilities and limits only.
+// modelDetail is the detail shape: public capabilities and limits only, plus
+// the catalog's retrieval profile when the row declares one (opaque JSON,
+// delivered verbatim; the gateway enforces no schema for it).
 type modelDetail struct {
-	ID            string             `json:"id"`
-	Object        string             `json:"object"`
-	Status        string             `json:"status"`
-	Protocols     []string           `json:"protocols"`
-	Capabilities  model.Capabilities `json:"capabilities"`
-	ConfigVersion int                `json:"config_version"`
+	ID               string             `json:"id"`
+	Object           string             `json:"object"`
+	Status           string             `json:"status"`
+	Protocols        []string           `json:"protocols"`
+	Capabilities     model.Capabilities `json:"capabilities"`
+	RetrievalProfile json.RawMessage    `json:"retrieval_profile,omitempty"`
+	ConfigVersion    int                `json:"config_version"`
 }
 
 func (h *ModelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -114,6 +118,12 @@ func (h *ModelsHandler) detail(w http.ResponseWriter, requestID string, principa
 	if caps.Responses {
 		d.Protocols = append(d.Protocols, "responses")
 	}
+	if caps.Embeddings {
+		d.Protocols = append(d.Protocols, "embeddings")
+	}
+	if len(info.RetrievalProfile) > 0 && string(info.RetrievalProfile) != "null" {
+		d.RetrievalProfile = info.RetrievalProfile
+	}
 	writeJSON(w, http.StatusOK, d)
 }
 
@@ -121,9 +131,10 @@ func (h *ModelsHandler) detail(w http.ResponseWriter, requestID string, principa
 // remaining field is documented public metadata.
 func publicCapabilities(c model.Capabilities) model.Capabilities {
 	return model.Capabilities{
-		Chat: c.Chat, Responses: c.Responses, Stream: c.Stream, Tools: c.Tools,
-		StructuredOutput: c.StructuredOutput, JSONMode: c.JSONMode,
+		Chat: c.Chat, Responses: c.Responses, Embeddings: c.Embeddings, Stream: c.Stream,
+		Tools: c.Tools, StructuredOutput: c.StructuredOutput, JSONMode: c.JSONMode,
 		Vision: c.Vision, Reasoning: c.Reasoning, Usage: c.Usage,
 		ContextTokens: c.ContextTokens, MaxOutputTokens: c.MaxOutputTokens, MaxTools: c.MaxTools,
+		EmbeddingDim: c.EmbeddingDim,
 	}
 }

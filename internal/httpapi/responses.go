@@ -341,8 +341,14 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(principal, errValidation)
 		return
 	}
-	if req.Model == "" {
-		fail(principal, fmt.Errorf("%w: model is required", errValidation))
+
+	// Default-model backfill: a request without `model` resolves the
+	// subject's default_model before model resolution; an explicit model
+	// keeps the current behavior, and neither default nor model is a stable
+	// 400 invalid_request.
+	publicModel, err := resolvePublicModel(deps, protocolResponses, principal.SubjectID, req.Model)
+	if err != nil {
+		fail(principal, err)
 		return
 	}
 	mreq, err := req.toDomain(requestID, h.MaxItems, h.MaxChars)
@@ -353,7 +359,7 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Shared admission pipeline: model/policy -> capability precheck ->
 	// clamps -> rate limit -> quota.
-	adm, auditErr := admit(w, r, deps, "responses", req.Model, &mreq, principal)
+	adm, auditErr := admit(w, r, deps, protocolResponses, publicModel, &mreq, principal)
 	if auditErr != nil {
 		fail(principal, auditErr)
 		return
@@ -362,10 +368,10 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	mreq.Model = adm.plan.Primary()
 	if !req.Stream {
-		h.complete(w, r, deps, requestID, traceID, principal, adm, req.Model, mreq, start)
+		h.complete(w, r, deps, requestID, traceID, principal, adm, publicModel, mreq, start)
 		return
 	}
-	h.stream(w, r, deps, requestID, traceID, principal, adm, req.Model, mreq, start)
+	h.stream(w, r, deps, requestID, traceID, principal, adm, publicModel, mreq, start)
 }
 
 // auditEvent assembles the metadata-only audit record. firstTokenMillis is
@@ -379,7 +385,7 @@ func (h *ResponsesHandler) auditEvent(requestID, traceID string, principal auth.
 		PromptTokens: usageTokens(usage, true), CompletionTokens: usageTokens(usage, false),
 		FirstTokenMillis: firstTokenMillis,
 		Streaming:        streaming, CreatedAt: start, TraceID: traceID,
-		RouteAttempts: routeAttempts, Protocol: "responses",
+		RouteAttempts: routeAttempts, Protocol: protocolResponses,
 	}
 }
 

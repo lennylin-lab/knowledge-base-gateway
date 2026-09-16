@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -38,6 +39,10 @@ func (p *flakyProvider) Name() string { return p.name }
 
 func (p *flakyProvider) Capabilities(m string) model.Capabilities {
 	return provider.Fake{}.Capabilities(m)
+}
+
+func (p *flakyProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
 }
 
 func (p *flakyProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {

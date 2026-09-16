@@ -36,12 +36,15 @@ func (o *OpenAI) Name() string { return "openai" }
 
 // Capabilities reports the adapter-level matrix for OpenAI-compatible
 // upstreams. Vision and reasoning require dedicated message shapes the
-// adapter does not translate yet, so they stay off.
+// adapter does not translate yet, so they stay off. The embeddings dimension
+// mirrors the deployment default (text-embedding width); catalog
+// declarations may narrow or override it.
 func (o *OpenAI) Capabilities(string) model.Capabilities {
 	return model.Capabilities{
-		Chat: true, Responses: true, Stream: true, Tools: true,
+		Chat: true, Responses: true, Embeddings: true, Stream: true, Tools: true,
 		StructuredOutput: true, JSONMode: true, Usage: true,
 		ContextTokens: 128_000, MaxOutputTokens: 16_384, MaxTools: model.DefaultMaxTools,
+		EmbeddingDim: 1536,
 	}
 }
 
@@ -486,4 +489,78 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 	}
 	out.Usage = usage
 	return emitErr(model.Event{Kind: model.EventCompleted, Response: &out})
+}
+
+// --- Embeddings ------------------------------------------------------------
+
+// openaiWireEmbeddingsRequest is the embeddings wire request. The input is
+// always sent as a string array (the upstream accepts it for single and
+// batch inputs alike), so translation is total and lossless.
+type openaiWireEmbeddingsRequest struct {
+	Model string   `json:"model"`
+	Input []string `json:"input"`
+}
+
+type openaiWireEmbeddingsUsage struct {
+	PromptTokens int `json:"prompt_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
+type openaiWireEmbeddingsResponse struct {
+	Object string `json:"object"`
+	Model  string `json:"model"`
+	Data   []struct {
+		Object    string    `json:"object"`
+		Index     int       `json:"index"`
+		Embedding []float64 `json:"embedding"`
+	} `json:"data"`
+	Usage *openaiWireEmbeddingsUsage `json:"usage"`
+}
+
+// Embeddings performs a non-streaming embeddings call against the
+// OpenAI-compatible /embeddings endpoint. The API key is sent only here and
+// never logged. Usage is input-token only: completion tokens stay zero.
+func (o *OpenAI) Embeddings(ctx context.Context, req model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	body, err := json.Marshal(openaiWireEmbeddingsRequest{Model: req.Model, Input: req.Input})
+	if err != nil {
+		return model.EmbeddingsResponse{}, &Error{Class: ClassInternal, Msg: "encode request"}
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.BaseURL+"/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return model.EmbeddingsResponse{}, &Error{Class: ClassInternal, Msg: "build request"}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+o.APIKey)
+	resp, err := o.Client.Do(httpReq)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return model.EmbeddingsResponse{}, &Error{Class: ClassTimeout, Msg: "request canceled or deadline exceeded"}
+		}
+		return model.EmbeddingsResponse{}, &Error{Class: ClassNetwork, Msg: "upstream connection failed"}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return model.EmbeddingsResponse{}, classifyStatus(resp.StatusCode)
+	}
+	var wire openaiWireEmbeddingsResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&wire); err != nil {
+		return model.EmbeddingsResponse{}, &Error{Class: ClassServer, Msg: "malformed upstream response"}
+	}
+	out := model.EmbeddingsResponse{Object: wire.Object, Model: wire.Model}
+	if out.Object == "" {
+		out.Object = "list"
+	}
+	for _, d := range wire.Data {
+		out.Data = append(out.Data, model.Embedding{
+			Object: d.Object, Index: d.Index, Embedding: d.Embedding,
+		})
+	}
+	if wire.Usage != nil {
+		out.Usage = &model.Usage{
+			PromptTokens: wire.Usage.PromptTokens,
+			TotalTokens:  wire.Usage.TotalTokens,
+			Known:        true,
+		}
+	}
+	return out, nil
 }

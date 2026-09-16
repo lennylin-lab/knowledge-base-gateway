@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -16,6 +17,10 @@ func (slowProvider) Name() string { return "slow" }
 
 func (s slowProvider) Capabilities(string) model.Capabilities {
 	return model.Capabilities{Chat: true, Responses: true, Stream: true}
+}
+
+func (s slowProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
 }
 
 func (s slowProvider) Complete(ctx context.Context, _ model.Request) (model.Response, error) {

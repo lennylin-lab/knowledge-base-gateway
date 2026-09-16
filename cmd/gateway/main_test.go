@@ -96,8 +96,8 @@ func migrateToHead(t *testing.T, dsn string) {
 		t.Fatalf("migrate up: %v", err)
 	}
 	version, dirty, err := m.Version()
-	if err != nil || version != 4 || dirty {
-		t.Fatalf("schema version = %d (dirty=%v) err=%v, want 4 (dirty=false)", version, dirty, err)
+	if err != nil || version != 5 || dirty {
+		t.Fatalf("schema version = %d (dirty=%v) err=%v, want 5 (dirty=false)", version, dirty, err)
 	}
 }
 

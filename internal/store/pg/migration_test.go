@@ -104,7 +104,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	requireVersion(t, m, 4, false)
+	requireVersion(t, m, 5, false)
 	if err := m.Up(); !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("second up must be a no-op, got %v", err)
 	}
@@ -204,7 +204,9 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("cost must stay null while no pricing data exists: %v", chatRow.CostMicros)
 	}
 
-	// V1.2: the seeded model declares its full capability matrix.
+	// V1.2: the seeded model declares its full capability matrix, and the
+	// model-control-plane migration (0005) adds embeddings with a declared
+	// dimension plus a demo retrieval profile.
 	catalog, err := pgw.LoadCatalog(ctx)
 	if err != nil {
 		t.Fatalf("load catalog: %v", err)
@@ -218,6 +220,19 @@ func TestMigrationsAndStores(t *testing.T) {
 	}
 	if caps.Vision || caps.Reasoning {
 		t.Fatalf("seed capabilities must not claim vision/reasoning: %+v", caps)
+	}
+	if !caps.Embeddings || caps.EmbeddingDim != 256 {
+		t.Fatalf("0005 must seed embeddings with a declared dim: %+v", caps)
+	}
+	if len(catalog[0].RetrievalProfile) == 0 {
+		t.Fatal("0005 must seed a demo retrieval profile")
+	}
+	var profile map[string]float64
+	if err := json.Unmarshal(catalog[0].RetrievalProfile, &profile); err != nil {
+		t.Fatalf("retrieval profile = %s", catalog[0].RetrievalProfile)
+	}
+	if profile["vector_max_distance"] == 0 {
+		t.Fatalf("retrieval profile content = %s", catalog[0].RetrievalProfile)
 	}
 	if catalog[0].ConfigVersion < 1 {
 		t.Fatalf("config version not loaded: %d", catalog[0].ConfigVersion)
@@ -270,6 +285,19 @@ func TestMigrationsAndStores(t *testing.T) {
 		 VALUES ('subject_input_cap', 'gateway-echo', 30, 2, 5000, 4096, 256)`); err != nil {
 		t.Fatalf("insert policy: %v", err)
 	}
+
+	// Default-model slots: the atomic mutation writes the column and the
+	// management-op row in one transaction; the loader carries the slots.
+	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo", "chat", mgmt.AdminOp{
+		Action: "default_model_chat", Target: "subject_input_cap", Detail: json.RawMessage(`{"model":"gateway-echo","kind":"chat"}`),
+	}); err != nil {
+		t.Fatalf("set chat default: %v", err)
+	}
+	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo", "embedding", mgmt.AdminOp{
+		Action: "default_model_embedding", Target: "subject_input_cap",
+	}); err != nil {
+		t.Fatalf("set embedding default: %v", err)
+	}
 	limits, err := pgw.LoadLimits(ctx)
 	if err != nil {
 		t.Fatalf("load limits: %v", err)
@@ -277,9 +305,50 @@ func TestMigrationsAndStores(t *testing.T) {
 	if l := limits["subject_input_cap"]; l.MaxInputTokens != 4096 || l.MaxOutputTokens != 256 || l.DailyTokens != 5000 {
 		t.Fatalf("subject_input_cap limits = %+v", l)
 	}
-	if l := limits["subject_default"]; l.MaxInputTokens != 0 || l.MaxOutputTokens != 0 {
-		t.Fatalf("NULL ceilings must load as zero, got %+v", l)
+	if l := limits["subject_input_cap"]; l.DefaultModel != "gateway-echo" || l.DefaultEmbeddingModel != "gateway-echo" {
+		t.Fatalf("default slots = %+v", l)
 	}
+	if l := limits["subject_default"]; l.DefaultModel != "" || l.DefaultEmbeddingModel != "" {
+		t.Fatalf("NULL defaults must load as empty, got %+v", l)
+	}
+	policies, err2 := pgw.Policies(ctx, "subject_input_cap")
+	if err2 != nil || len(policies) == 0 || policies[0].DefaultModel != "gateway-echo" || policies[0].DefaultEmbeddingModel != "gateway-echo" {
+		t.Fatalf("policies view defaults = %+v err=%v", policies, err2)
+	}
+	// Atomicity: a failing audit insert must roll the slot write back. The
+	// attempted write targets a different model, so a successful commit would
+	// be observable in the slot value.
+	if _, err := pgw.Pool.Exec(ctx,
+		`INSERT INTO model_catalog (public_name, provider, upstream_model, capabilities)
+		 VALUES ('gateway-echo-2', 'fake-primary', 'echo-model-2', '{}')`); err != nil {
+		t.Fatalf("insert second model: %v", err)
+	}
+	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo-2", "chat", mgmt.AdminOp{
+		Action: "default_model_chat", Target: "subject_input_cap", Detail: json.RawMessage(`not-valid-json`),
+	}); err == nil {
+		t.Fatal("atomic default-model mutation must fail when the audit insert fails")
+	}
+	fresh, err := pgw.LoadLimits(ctx)
+	if err != nil {
+		t.Fatalf("reload limits: %v", err)
+	}
+	if l := fresh["subject_input_cap"]; l.DefaultModel != "gateway-echo" {
+		t.Fatalf("failed mutation must not overwrite the slot: %+v", l)
+	}
+	if _, err := pgw.Pool.Exec(ctx, `DELETE FROM model_catalog WHERE public_name = 'gateway-echo-2'`); err != nil {
+		t.Fatalf("cleanup second model: %v", err)
+	}
+	// Unknown model and unknown subject fail without writing anything.
+	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "no-such-model", "chat", mgmt.AdminOp{Action: "default_model_chat"}); err != mgmt.ErrNotFound {
+		t.Fatalf("unknown model must be ErrNotFound, got %v", err)
+	}
+	if err := pgw.SetDefaultModelWithAudit(ctx, "no-such-subject", "gateway-echo", "chat", mgmt.AdminOp{Action: "default_model_chat"}); err != mgmt.ErrNotFound {
+		t.Fatalf("unknown subject must be ErrNotFound, got %v", err)
+	}
+	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo", "weird", mgmt.AdminOp{Action: "x"}); err == nil {
+		t.Fatal("unknown kind must fail")
+	}
+
 	if _, err := pgw.Pool.Exec(ctx, `DELETE FROM access_policies WHERE subject_id = 'subject_input_cap'`); err != nil {
 		t.Fatalf("cleanup policy: %v", err)
 	}
@@ -324,16 +393,36 @@ func TestMigrationsAndStores(t *testing.T) {
 	}
 	// Both atomic toggles and the explicit op are recorded; the aborted
 	// mutation above is not.
+	// Both atomic toggles and the explicit op are recorded; the aborted
+	// mutations above are not. The two default-model mutations from the 0005
+	// coverage above bring the total to 5.
 	ops, err := pgw.Ops(ctx, 10)
-	if err != nil || len(ops) != 3 || ops[0].Action != "model_disable" || ops[0].Target != "gateway-echo" {
-		t.Fatalf("ops = %+v err=%v, want 3 with the explicit disable newest", ops, err)
+	if err != nil || len(ops) != 5 || ops[0].Action != "model_disable" || ops[0].Target != "gateway-echo" {
+		t.Fatalf("ops = %+v err=%v, want 5 with the explicit disable newest", ops, err)
 	}
 	if ops[0].AdminSubject == "" {
 		t.Fatal("management op must default its admin subject")
 	}
 
-	// Roll back 0004 through the tool and confirm the first-token column is
-	// gone, then re-apply it.
+	// Roll back 0005 through the tool and confirm the model-control-plane
+	// artifacts are gone.
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0005: %v", err)
+	}
+	requireVersion(t, m, 4, false)
+	var controlPlaneArtifacts int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT (SELECT count(*) FROM information_schema.columns
+		        WHERE table_name='access_policies' AND column_name IN ('default_model','default_embedding_model'))
+		     + (SELECT count(*) FROM information_schema.columns
+		        WHERE table_name='model_catalog' AND column_name='retrieval_profile')`).Scan(&controlPlaneArtifacts); err != nil {
+		t.Fatalf("0005 down check: %v", err)
+	}
+	if controlPlaneArtifacts != 0 {
+		t.Fatal("0005 down migration left default-model or retrieval_profile columns behind")
+	}
+
+	// Roll back 0004 and confirm the first-token column is gone.
 	if err := m.Steps(-1); err != nil {
 		t.Fatalf("roll back 0004: %v", err)
 	}
@@ -347,14 +436,11 @@ func TestMigrationsAndStores(t *testing.T) {
 	if firstTokenCols != 0 {
 		t.Fatal("0004 down migration left first_token_millis behind")
 	}
-	if err := m.Up(); err != nil {
-		t.Fatalf("re-apply 0004: %v", err)
-	}
-	requireVersion(t, m, 4, false)
 
-	// Roll back 0003 through the tool and confirm the new artifacts are gone.
-	if err := m.Steps(-2); err != nil {
-		t.Fatalf("roll back two versions: %v", err)
+	// Roll back 0003 and confirm the V1.2 artifacts are gone while the V1.1
+	// columns remain.
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0003: %v", err)
 	}
 	requireVersion(t, m, 2, false)
 	var artifacts int
@@ -375,7 +461,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("re-up: %v", err)
 	}
-	requireVersion(t, m, 4, false)
+	requireVersion(t, m, 5, false)
 }
 
 // int64Ptr is a test helper for optional audit fields.

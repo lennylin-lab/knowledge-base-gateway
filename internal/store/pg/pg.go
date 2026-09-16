@@ -252,11 +252,14 @@ type RouteConfig struct {
 }
 
 // LoadCatalog reads enabled catalog entries including their declared
-// capability matrix and configuration version. Capabilities is the public
-// routing constraint; empty JSONB means the adapter-level matrix applies.
+// capability matrix, configuration version, and retrieval profile.
+// Capabilities is the public routing constraint; empty JSONB means the
+// adapter-level matrix applies. RetrievalProfile is opaque catalog JSON
+// (nil when the row declares none) surfaced verbatim through model
+// discovery.
 func (d *DB) LoadCatalog(ctx context.Context) ([]policy.ModelInfo, error) {
 	rows, err := d.Pool.Query(ctx,
-		`SELECT public_name, provider, upstream_model, enabled, COALESCE(capabilities, '{}'::jsonb), config_version
+		`SELECT public_name, provider, upstream_model, enabled, COALESCE(capabilities, '{}'::jsonb), config_version, retrieval_profile
 		 FROM model_catalog WHERE enabled`)
 	if err != nil {
 		return nil, err
@@ -266,11 +269,18 @@ func (d *DB) LoadCatalog(ctx context.Context) ([]policy.ModelInfo, error) {
 	for rows.Next() {
 		var m policy.ModelInfo
 		var caps []byte
-		if err := rows.Scan(&m.PublicName, &m.Provider, &m.UpstreamModel, &m.Enabled, &caps, &m.ConfigVersion); err != nil {
+		var profile []byte
+		if err := rows.Scan(&m.PublicName, &m.Provider, &m.UpstreamModel, &m.Enabled, &caps, &m.ConfigVersion, &profile); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(caps, &m.Capabilities); err != nil {
 			return nil, fmt.Errorf("model %s: parse capabilities: %w", m.PublicName, err)
+		}
+		if len(profile) > 0 && string(profile) != "null" {
+			if !json.Valid(profile) {
+				return nil, fmt.Errorf("model %s: retrieval_profile is not valid JSON", m.PublicName)
+			}
+			m.RetrievalProfile = json.RawMessage(profile)
 		}
 		out = append(out, m)
 	}
@@ -324,14 +334,19 @@ func (d *DB) LoadProviders(ctx context.Context) ([]ProviderConfig, error) {
 	return out, rows.Err()
 }
 
-// LoadLimits reads per-subject policy limits. max_input_tokens is the
-// subject-level input ceiling enforced before any provider invocation.
+// LoadLimits reads per-subject policy limits and default-model slots.
+// max_input_tokens is the subject-level input ceiling enforced before any
+// provider invocation; the default slots backfill requests that omit
+// `model`. Rows are ordered by subject and id so the per-subject projection
+// is deterministic, and the default-model mutation keeps the slots uniform
+// across a subject's rows.
 func (d *DB) LoadLimits(ctx context.Context) (map[string]policy.Limits, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT subject_id, rate_per_minute, max_concurrent,
 		       COALESCE(daily_tokens, 0), COALESCE(monthly_tokens, 0),
-		       COALESCE(max_input_tokens, 0), COALESCE(max_output_tokens, 0)
-		FROM access_policies`)
+		       COALESCE(max_input_tokens, 0), COALESCE(max_output_tokens, 0),
+		       COALESCE(default_model, ''), COALESCE(default_embedding_model, '')
+		FROM access_policies ORDER BY subject_id, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +356,8 @@ func (d *DB) LoadLimits(ctx context.Context) (map[string]policy.Limits, error) {
 		var subject string
 		var l policy.Limits
 		if err := rows.Scan(&subject, &l.RatePerMinute, &l.MaxConcurrent,
-			&l.DailyTokens, &l.MonthlyTokens, &l.MaxInputTokens, &l.MaxOutputTokens); err != nil {
+			&l.DailyTokens, &l.MonthlyTokens, &l.MaxInputTokens, &l.MaxOutputTokens,
+			&l.DefaultModel, &l.DefaultEmbeddingModel); err != nil {
 			return nil, err
 		}
 		out[subject] = l

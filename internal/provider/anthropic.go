@@ -526,3 +526,11 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 	}
 	return &Error{Class: ClassNetwork, Msg: "upstream stream ended without message_stop"}
 }
+
+// Embeddings is not implemented for Anthropic upstreams: the Messages API
+// has no embeddings surface. The adapter-level capability matrix declares
+// embeddings false, so requests are rejected before any provider call; this
+// guard is defense in depth and wraps the stable capability sentinel.
+func (a *Anthropic) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, fmt.Errorf("%w: embeddings protocol", model.ErrCapabilityNotSupported)
+}

@@ -31,6 +31,13 @@ type AdminDeps struct {
 	// persisted and audited, and the response makes clear the refresh — not
 	// the mutation — failed.
 	ApplyModelChange func(ctx context.Context, publicModel string, enabled bool) error
+	// ApplyPolicyChange is the runtime refresh boundary for the subject
+	// default-model mutation. It runs after the persisted mutation and its
+	// audit record committed atomically, and reloads the subject's policy
+	// (limits and default-model slots) into the running process. Failure
+	// semantics mirror ApplyModelChange: refresh_failed means the change is
+	// committed and audited but the live process may be divergent.
+	ApplyPolicyChange func(ctx context.Context, subject string) error
 	// ProviderRuntime reports live per-provider breaker state so
 	// /admin/providers reflects the running process instead of the registry
 	// alone. A false ok leaves the store-reported fields untouched.
@@ -108,6 +115,7 @@ func NewAdminMux(deps AdminDeps) *http.ServeMux {
 		mux.HandleFunc("/admin/models/", mgmtGuard)
 		mux.HandleFunc("/admin/providers", mgmtGuard)
 		mux.HandleFunc("/admin/policies", mgmtGuard)
+		mux.HandleFunc("/admin/policies/", mgmtGuard)
 		mux.HandleFunc("/admin/audit", mgmtGuard)
 		mux.HandleFunc("/admin/usage", mgmtGuard)
 		mux.HandleFunc("/admin/management-log", mgmtGuard)
@@ -163,6 +171,15 @@ func handleManagement(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"model": name, "status": map[bool]string{true: "enabled", false: "disabled"}[enable]})
+
+	case strings.HasPrefix(r.URL.Path, "/admin/policies/") && strings.HasSuffix(r.URL.Path, "/default-model") && r.Method == http.MethodPost:
+		// /admin/policies/{subject}/default-model: body {model, kind}.
+		subject := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/admin/policies/"), "/default-model")
+		if subject == "" || strings.Contains(subject, "/") {
+			writeError(w, newRequestID(), http.StatusBadRequest, "invalid_request_error", "invalid_path", "use /admin/policies/{subject}/default-model")
+			return
+		}
+		handleSetDefaultModel(w, r, deps, subject)
 
 	case r.URL.Path == "/admin/providers" && r.Method == http.MethodGet:
 		providers, err := deps.Mgmt.Providers(ctx)
@@ -224,6 +241,54 @@ func handleManagement(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
 	default:
 		writeError(w, newRequestID(), http.StatusNotFound, "not_found", "not_found", "unknown management endpoint")
 	}
+}
+
+// defaultModelBody is the default-model mutation payload: kind selects the
+// slot ("chat" → default_model, "embedding" → default_embedding_model).
+type defaultModelBody struct {
+	Model string `json:"model"`
+	Kind  string `json:"kind"`
+}
+
+// handleSetDefaultModel applies the subject default-model mutation through
+// the atomic mutation + management-audit path (the pattern of the model
+// enable/disable switch), refreshing the running policy only after the
+// transaction committed. Detail records the slot and model names only.
+func handleSetDefaultModel(w http.ResponseWriter, r *http.Request, deps AdminDeps, subject string) {
+	var body defaultModelBody
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&body); err != nil || body.Model == "" || body.Kind == "" {
+		writeError(w, newRequestID(), http.StatusBadRequest, "invalid_request_error", "invalid_request", "model and kind are required")
+		return
+	}
+	if body.Kind != "chat" && body.Kind != "embedding" {
+		writeError(w, newRequestID(), http.StatusBadRequest, "invalid_request_error", "invalid_request", "kind must be chat or embedding")
+		return
+	}
+	detail, _ := json.Marshal(map[string]string{"model": body.Model, "kind": body.Kind})
+	err := deps.Mgmt.SetDefaultModelWithAudit(r.Context(), subject, body.Model, body.Kind, mgmt.AdminOp{
+		CreatedAt: time.Now(),
+		Action:    "default_model_" + body.Kind,
+		Target:    subject,
+		Detail:    detail,
+	})
+	if err != nil {
+		if errors.Is(err, mgmt.ErrNotFound) {
+			writeError(w, newRequestID(), http.StatusNotFound, "not_found", "not_found", "subject or model not found")
+			return
+		}
+		writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "update_failed", "could not update the subject default model")
+		return
+	}
+	// Runtime refresh after persistence; failure semantics mirror the model
+	// toggle (refresh_failed with the audit evidence committed).
+	if deps.ApplyPolicyChange != nil {
+		if err := deps.ApplyPolicyChange(r.Context(), subject); err != nil {
+			deps.Logger.Error("management runtime refresh failed", "target", subject, "error", err)
+			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "refresh_failed", "default model saved but the runtime refresh failed")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"subject": subject, "kind": body.Kind, "default_model": body.Model})
 }
 
 func queryTime(raw string) time.Time {

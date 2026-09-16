@@ -189,7 +189,7 @@ func ValidateToolCallArguments(args string) error {
 }
 
 // CheckCapabilities enforces the capability matrix for a request. protocol is
-// "chat" or "responses". It returns an error wrapping
+// "chat", "responses", or "embeddings". It returns an error wrapping
 // ErrCapabilityNotSupported naming the first unsupported feature, so handlers
 // can reject before routing to a provider.
 func CheckCapabilities(caps Capabilities, protocol string, req Request) error {
@@ -201,6 +201,10 @@ func CheckCapabilities(caps Capabilities, protocol string, req Request) error {
 	case "responses":
 		if !caps.Responses {
 			return fmt.Errorf("%w: responses protocol", ErrCapabilityNotSupported)
+		}
+	case "embeddings":
+		if !caps.Embeddings {
+			return fmt.Errorf("%w: embeddings protocol", ErrCapabilityNotSupported)
 		}
 	default:
 		return fmt.Errorf("%w: unknown protocol", ErrValidation)

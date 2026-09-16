@@ -14,6 +14,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,10 @@ type badArgsStreamProvider struct{}
 func (p *badArgsStreamProvider) Name() string { return "bad-args" }
 
 func (p *badArgsStreamProvider) Capabilities(string) model.Capabilities { return fullCaps }
+
+func (p *badArgsStreamProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
+}
 
 func (p *badArgsStreamProvider) Complete(context.Context, model.Request) (model.Response, error) {
 	return model.Response{}, &provider.Error{Class: provider.ClassInternal, Msg: "not used"}

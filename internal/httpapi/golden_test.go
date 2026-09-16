@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"net/http"
 	"net/http/httptest"
@@ -203,6 +204,10 @@ func (f *failingStreamProvider) Name() string { return "failing-stream" }
 
 func (f *failingStreamProvider) Capabilities(m string) model.Capabilities {
 	return f.inner.Capabilities(m)
+}
+
+func (f *failingStreamProvider) Embeddings(context.Context, model.EmbeddingsRequest) (model.EmbeddingsResponse, error) {
+	return model.EmbeddingsResponse{}, errors.New("embeddings not implemented by this test stub")
 }
 
 func (f *failingStreamProvider) Complete(ctx context.Context, req model.Request) (model.Response, error) {

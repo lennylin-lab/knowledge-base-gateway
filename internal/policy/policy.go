@@ -3,6 +3,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"maps"
 	"slices"
 	"sync"
@@ -61,14 +62,17 @@ type Catalog struct {
 // ModelInfo describes one catalog entry. Capabilities is the public model
 // capability matrix; when Declared is false the gateway derives the matrix
 // from the provider adapter. ConfigVersion versions the capability/route
-// configuration for audit correlation.
+// configuration for audit correlation. RetrievalProfile is opaque catalog
+// JSON (retrieval thresholds consumed by clients); nil when the row declares
+// none.
 type ModelInfo struct {
-	PublicName    string
-	Provider      string
-	UpstreamModel string
-	Enabled       bool
-	Capabilities  model.Capabilities
-	ConfigVersion int
+	PublicName       string
+	Provider         string
+	UpstreamModel    string
+	Enabled          bool
+	Capabilities     model.Capabilities
+	ConfigVersion    int
+	RetrievalProfile json.RawMessage
 }
 
 // NewCatalog builds a catalog from entries.
@@ -136,7 +140,8 @@ func (p *Policy) Permitted(subject, publicModel string) bool {
 	return ok
 }
 
-// Limits are per-subject rate, concurrency, and token ceilings.
+// Limits are per-subject rate, concurrency, and token ceilings, plus the
+// subject's default-model slots. Zero-value ceilings mean unset.
 type Limits struct {
 	RatePerMinute   int
 	MaxConcurrent   int
@@ -144,6 +149,13 @@ type Limits struct {
 	MonthlyTokens   int64
 	MaxInputTokens  int // zero means unset; rejects oversized inputs before any provider work
 	MaxOutputTokens int // zero means unset; caps request max_tokens
+
+	// DefaultModel / DefaultEmbeddingModel are the subject's default-model
+	// slots ("" = unset). Requests omitting `model` backfill the matching
+	// slot before model resolution: chat/responses use DefaultModel,
+	// embeddings uses DefaultEmbeddingModel. An explicit model always wins.
+	DefaultModel          string
+	DefaultEmbeddingModel string
 }
 
 // All returns every catalog entry (for router and readiness wiring).
@@ -164,6 +176,49 @@ func (p *Policy) LimitsFor(subject string) (Limits, bool) {
 	defer p.mu.RUnlock()
 	l, ok := p.limits[subject]
 	return l, ok
+}
+
+// DefaultModelFor returns the subject's configured default model for the
+// protocol: chat/responses resolve default_model, embeddings resolves
+// default_embedding_model. ok is false when the slot is unset.
+func (p *Policy) DefaultModelFor(subject, protocol string) (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	l, ok := p.limits[subject]
+	if !ok {
+		return "", false
+	}
+	switch protocol {
+	case "embeddings":
+		if l.DefaultEmbeddingModel == "" {
+			return "", false
+		}
+		return l.DefaultEmbeddingModel, true
+	default:
+		if l.DefaultModel == "" {
+			return "", false
+		}
+		return l.DefaultModel, true
+	}
+}
+
+// SetDefault records the subject's default-model slots without touching its
+// ceilings (used by the local development wiring; the PostgreSQL loader
+// carries both slots on Limits directly).
+func (p *Policy) SetDefault(subject, chatModel, embeddingModel string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.limits == nil {
+		p.limits = map[string]Limits{}
+	}
+	l := p.limits[subject]
+	if chatModel != "" {
+		l.DefaultModel = chatModel
+	}
+	if embeddingModel != "" {
+		l.DefaultEmbeddingModel = embeddingModel
+	}
+	p.limits[subject] = l
 }
 
 // SetLimits records per-subject limits loaded from persisted policy.

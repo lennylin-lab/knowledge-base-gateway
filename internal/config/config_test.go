@@ -17,6 +17,7 @@ var configEnvVars = []string{
 	"GATEWAY_DATABASE_URL", "GATEWAY_LIMITS_MODE", "GATEWAY_REDIS_ADDR",
 	"GATEWAY_ADMIN_TOKEN", "GATEWAY_ADMIN_ADDR",
 	"GATEWAY_ALLOW_INSECURE_BASE_URLS", "GATEWAY_RESPONSES_ENABLED",
+	"GATEWAY_EMBEDDINGS_ENABLED", "GATEWAY_DEFAULT_MODELS",
 }
 
 func setEnv(t *testing.T, kv map[string]string) {
@@ -53,6 +54,64 @@ func TestFromEnvValid(t *testing.T) {
 	}
 	if !cfg.ResponsesEnabled {
 		t.Error("ResponsesEnabled must default to true; GATEWAY_RESPONSES_ENABLED=false is the rollback switch")
+	}
+	if !cfg.EmbeddingsEnabled {
+		t.Error("EmbeddingsEnabled must default to true; GATEWAY_EMBEDDINGS_ENABLED=false is the rollback switch")
+	}
+}
+
+func TestEmbeddingsEnabledFlag(t *testing.T) {
+	cases := map[string]bool{
+		"false": false,
+		"true":  true,
+		"FALSE": true, // only the exact string "false" disables
+		"":      true,
+	}
+	for raw, want := range cases {
+		setEnv(t, map[string]string{
+			"GATEWAY_API_KEYS":           "key-1:tenant-a:sk-abc",
+			"GATEWAY_MODELS":             "gpt-a:fake:gpt-a",
+			"GATEWAY_EMBEDDINGS_ENABLED": raw,
+		})
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+		if cfg.EmbeddingsEnabled != want {
+			t.Errorf("GATEWAY_EMBEDDINGS_ENABLED=%q: EmbeddingsEnabled = %v, want %v", raw, cfg.EmbeddingsEnabled, want)
+		}
+	}
+}
+
+func TestDefaultModelsParsing(t *testing.T) {
+	setEnv(t, map[string]string{
+		"GATEWAY_API_KEYS":       "key-1:tenant-a:sk-abc",
+		"GATEWAY_MODELS":         "gpt-a:fake:gpt-a,e:fake:e",
+		"GATEWAY_DEFAULT_MODELS": "tenant-a:gpt-a:e, tenant-b:gpt-a",
+	})
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.DefaultModels) != 2 {
+		t.Fatalf("defaults = %+v", cfg.DefaultModels)
+	}
+	first := cfg.DefaultModels[0]
+	if first.Subject != "tenant-a" || first.ChatModel != "gpt-a" || first.EmbeddingModel != "e" {
+		t.Errorf("first entry = %+v", first)
+	}
+	second := cfg.DefaultModels[1]
+	if second.Subject != "tenant-b" || second.ChatModel != "gpt-a" || second.EmbeddingModel != "" {
+		t.Errorf("second entry = %+v (embedding slot optional)", second)
+	}
+
+	setEnv(t, map[string]string{
+		"GATEWAY_API_KEYS":       "key-1:tenant-a:sk-abc",
+		"GATEWAY_MODELS":         "gpt-a:fake:gpt-a",
+		"GATEWAY_DEFAULT_MODELS": "tenant-a",
+	})
+	if _, err := FromEnv(); err == nil {
+		t.Error("a default-model entry without a chat model must fail startup")
 	}
 }
 
