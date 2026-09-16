@@ -159,20 +159,40 @@ type Limits struct {
 }
 
 // FoldPolicyRow folds one access_policies row into the subject's collapsed
-// limits. Rows must arrive in ascending id order (the loader's ORDER BY).
-// Ceilings keep the historical last-row-wins projection; the default-model
-// slots take the first non-empty value in id order across the subject's rows
-// — a row with an empty slot never erases a default declared on an earlier
-// row, and the chat and embedding slots are judged independently. The
-// PostgreSQL loader and any in-memory row source share this helper so the
-// collapse semantics cannot drift between modes.
+// limits (issue #8 decision). Rows must arrive in ascending id order (the
+// loader's ORDER BY) for the default slots; the ceiling fold itself is
+// order-independent. Ceiling fields take the **minimum declared value**
+// across the subject's rows — intersection semantics, so adding a row can
+// never raise a quota. Per the Limits zero-means-unset convention, a ceiling
+// constrains only when the row declares it (> 0): the NOT NULL columns
+// (rate_per_minute, max_concurrent) declare a value on every row, while the
+// nullable columns (daily/monthly tokens, max_input/output tokens) declare
+// nothing after their NULL→0 COALESCE — a row without a cap does not cap the
+// subject, and if no row declares a cap the field stays zero (uncapped).
+// The default-model slots take the first non-empty value in id order across
+// the subject's rows — a row with an empty slot never erases a default
+// declared on an earlier row, and the chat and embedding slots are judged
+// independently. The PostgreSQL loader and any in-memory row source share
+// this helper so the collapse semantics cannot drift between modes.
 func (l *Limits) FoldPolicyRow(row Limits) {
-	l.RatePerMinute = row.RatePerMinute
-	l.MaxConcurrent = row.MaxConcurrent
-	l.DailyTokens = row.DailyTokens
-	l.MonthlyTokens = row.MonthlyTokens
-	l.MaxInputTokens = row.MaxInputTokens
-	l.MaxOutputTokens = row.MaxOutputTokens
+	if row.RatePerMinute > 0 && (l.RatePerMinute == 0 || row.RatePerMinute < l.RatePerMinute) {
+		l.RatePerMinute = row.RatePerMinute
+	}
+	if row.MaxConcurrent > 0 && (l.MaxConcurrent == 0 || row.MaxConcurrent < l.MaxConcurrent) {
+		l.MaxConcurrent = row.MaxConcurrent
+	}
+	if row.DailyTokens > 0 && (l.DailyTokens == 0 || row.DailyTokens < l.DailyTokens) {
+		l.DailyTokens = row.DailyTokens
+	}
+	if row.MonthlyTokens > 0 && (l.MonthlyTokens == 0 || row.MonthlyTokens < l.MonthlyTokens) {
+		l.MonthlyTokens = row.MonthlyTokens
+	}
+	if row.MaxInputTokens > 0 && (l.MaxInputTokens == 0 || row.MaxInputTokens < l.MaxInputTokens) {
+		l.MaxInputTokens = row.MaxInputTokens
+	}
+	if row.MaxOutputTokens > 0 && (l.MaxOutputTokens == 0 || row.MaxOutputTokens < l.MaxOutputTokens) {
+		l.MaxOutputTokens = row.MaxOutputTokens
+	}
 	if l.DefaultModel == "" {
 		l.DefaultModel = row.DefaultModel
 	}

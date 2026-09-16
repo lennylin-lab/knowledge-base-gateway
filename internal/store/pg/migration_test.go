@@ -356,11 +356,13 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("cleanup subject: %v", err)
 	}
 
-	// Multi-row policy collapse (issue #7): a subject with several
+	// Multi-row policy collapse (issue #7 + issue #8): a subject with several
 	// access_policies rows keeps defaults declared on any of them — the
 	// loader takes the first non-empty slot value in id order, chat and
-	// embedding judged independently — while ceilings keep the historical
-	// last-row-wins projection. Rows are inserted in ascending id order.
+	// embedding judged independently — while each ceiling folds to the
+	// minimum declared value across the rows (a NULL cap on one row does not
+	// constrain; a field no row declares stays zero/uncapped). Rows are
+	// inserted in ascending id order.
 	if _, err := pgw.Pool.Exec(ctx,
 		`INSERT INTO model_catalog (public_name, provider, upstream_model, capabilities)
 		 VALUES ('gateway-echo-2', 'fake-primary', 'echo-model-2', '{}')`); err != nil {
@@ -372,13 +374,15 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("insert multi-row subjects: %v", err)
 	}
 	// subject_multi_row: chat default on row 1 (NULL later), embedding default
-	// on row 2 (NULL on row 1) — both must resolve; ceilings come from row 2.
+	// on row 2 (NULL on row 1) — both must resolve; ceilings fold to the
+	// minimum declared (row 1), and max_input_tokens declared only on row 2
+	// must constrain even though row 1 leaves it NULL (NULL passthrough).
 	if _, err := pgw.Pool.Exec(ctx, `
 		INSERT INTO access_policies
-			(subject_id, public_model, rate_per_minute, max_concurrent, daily_tokens, default_model, default_embedding_model)
+			(subject_id, public_model, rate_per_minute, max_concurrent, daily_tokens, max_input_tokens, default_model, default_embedding_model)
 		VALUES
-			('subject_multi_row', 'gateway-echo',   30, 3, 5000, 'gateway-echo',   NULL),
-			('subject_multi_row', 'gateway-echo-2', 60, 6, 9000, NULL,             'gateway-echo-2')`); err != nil {
+			('subject_multi_row', 'gateway-echo',   30, 3, 5000, NULL, 'gateway-echo',   NULL),
+			('subject_multi_row', 'gateway-echo-2', 60, 6, 9000, 2048, NULL,             'gateway-echo-2')`); err != nil {
 		t.Fatalf("insert subject_multi_row policies: %v", err)
 	}
 	// subject_row1_defaults: both defaults on row 1, both NULL on row 2 —
@@ -391,8 +395,9 @@ func TestMigrationsAndStores(t *testing.T) {
 			('subject_row1_defaults', 'gateway-echo-2', 20, 2, NULL,             NULL)`); err != nil {
 		t.Fatalf("insert subject_row1_defaults policies: %v", err)
 	}
-	// subject_null_defaults: every row all-NULL — no default resolves and the
-	// model-less request keeps its stable 400 path; ceilings stay last-wins.
+	// subject_null_defaults: every row all-NULL for the optional slots — no
+	// default resolves and the model-less request keeps its stable 400 path;
+	// the NOT NULL ceilings fold to the minimum of the declared values.
 	if _, err := pgw.Pool.Exec(ctx, `
 		INSERT INTO access_policies
 			(subject_id, public_model, rate_per_minute, max_concurrent)
@@ -408,20 +413,43 @@ func TestMigrationsAndStores(t *testing.T) {
 	if l := multiLimits["subject_multi_row"]; l.DefaultModel != "gateway-echo" || l.DefaultEmbeddingModel != "gateway-echo-2" {
 		t.Fatalf("multi-row defaults must be first-non-empty per slot, got %+v", l)
 	}
-	if l := multiLimits["subject_multi_row"]; l.RatePerMinute != 60 || l.MaxConcurrent != 6 || l.DailyTokens != 9000 {
-		t.Fatalf("multi-row ceilings must keep last-row-wins, got %+v", l)
+	if l := multiLimits["subject_multi_row"]; l.RatePerMinute != 30 || l.MaxConcurrent != 3 || l.DailyTokens != 5000 {
+		t.Fatalf("multi-row ceilings must fold to the minimum declared, got %+v", l)
+	}
+	if l := multiLimits["subject_multi_row"]; l.MaxInputTokens != 2048 {
+		t.Fatalf("a cap declared on one row must constrain despite NULLs on others, got %+v", l)
 	}
 	if l := multiLimits["subject_row1_defaults"]; l.DefaultModel != "gateway-echo" || l.DefaultEmbeddingModel != "gateway-echo" {
 		t.Fatalf("row-1 defaults must survive NULL slots on later rows, got %+v", l)
 	}
-	if l := multiLimits["subject_row1_defaults"]; l.RatePerMinute != 20 || l.MaxConcurrent != 2 {
-		t.Fatalf("row1_defaults ceilings must keep last-row-wins, got %+v", l)
+	if l := multiLimits["subject_row1_defaults"]; l.RatePerMinute != 10 || l.MaxConcurrent != 1 {
+		t.Fatalf("row1_defaults ceilings must fold to the minimum declared, got %+v", l)
+	}
+	if l := multiLimits["subject_row1_defaults"]; l.DailyTokens != 0 || l.MonthlyTokens != 0 || l.MaxInputTokens != 0 || l.MaxOutputTokens != 0 {
+		t.Fatalf("nullable caps no row declares must stay zero (uncapped), got %+v", l)
 	}
 	if l := multiLimits["subject_null_defaults"]; l.DefaultModel != "" || l.DefaultEmbeddingModel != "" {
 		t.Fatalf("all-NULL rows must keep no default (400 path unchanged), got %+v", l)
 	}
-	if l := multiLimits["subject_null_defaults"]; l.RatePerMinute != 22 {
-		t.Fatalf("null_defaults ceilings must keep last-row-wins, got %+v", l)
+	if l := multiLimits["subject_null_defaults"]; l.RatePerMinute != 11 || l.MaxConcurrent != 1 {
+		t.Fatalf("null_defaults ceilings must fold to the minimum declared, got %+v", l)
+	}
+
+	// The admin policies view must expose the folded effective ceilings per
+	// row (issue #8 mitigation), identical on every row of the subject and
+	// equal to what LoadLimits enforces.
+	multiPolicies, err := pgw.Policies(ctx, "subject_multi_row")
+	if err != nil || len(multiPolicies) != 2 {
+		t.Fatalf("multi-row policies view = %+v err=%v", multiPolicies, err)
+	}
+	wantEffective := mgmt.EffectiveLimits{
+		RatePerMinute: 30, MaxConcurrent: 3, DailyTokens: 5000,
+		MonthlyTokens: 0, MaxInputTokens: 2048, MaxOutputTokens: 0,
+	}
+	for _, p := range multiPolicies {
+		if p.EffectiveLimits != wantEffective {
+			t.Fatalf("policies view effective limits = %+v, want %+v", p.EffectiveLimits, wantEffective)
+		}
 	}
 	if _, err := pgw.Pool.Exec(ctx, `DELETE FROM access_policies WHERE subject_id IN
 		('subject_multi_row', 'subject_row1_defaults', 'subject_null_defaults')`); err != nil {

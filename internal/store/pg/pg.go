@@ -338,11 +338,13 @@ func (d *DB) LoadProviders(ctx context.Context) ([]ProviderConfig, error) {
 // max_input_tokens is the subject-level input ceiling enforced before any
 // provider invocation; the default slots backfill requests that omit
 // `model`. Rows are ordered by subject and id so the per-subject projection
-// is deterministic: ceilings keep the last-row-wins projection, while the
-// default-model slots take the first non-empty value in id order across the
-// subject's rows — a row with a NULL slot never erases a default declared on
-// another row of the same subject. The default-model mutation keeps the
-// slots uniform across a subject's rows.
+// is deterministic: ceilings fold to the minimum declared value per field
+// (issue #8 — a row without a cap does not constrain it, and a field no row
+// declares stays zero/uncapped), while the default-model slots take the
+// first non-empty value in id order across the subject's rows — a row with
+// a NULL slot never erases a default declared on another row of the same
+// subject. The default-model mutation keeps the slots uniform across a
+// subject's rows.
 func (d *DB) LoadLimits(ctx context.Context) (map[string]policy.Limits, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT subject_id, rate_per_minute, max_concurrent,

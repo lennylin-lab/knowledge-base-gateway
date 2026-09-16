@@ -44,14 +44,14 @@ func TestUnsetInputCeilingStaysZero(t *testing.T) {
 // access_policies rows are folded in id order, the default-model slots take
 // the first non-empty value — a row with an empty slot never erases a default
 // declared on an earlier row, and the chat and embedding slots are judged
-// independently. Ceilings keep the historical last-row-wins projection.
+// independently. Ceilings fold to the minimum declared value (issue #8).
 func TestFoldPolicyRowsFirstNonEmptyDefaults(t *testing.T) {
 	rows := []Limits{
-		{RatePerMinute: 10, MaxConcurrent: 1, DailyTokens: 100, MonthlyTokens: 1000,
-			MaxInputTokens: 512, MaxOutputTokens: 64,
+		{RatePerMinute: 30, MaxConcurrent: 3, DailyTokens: 300,
 			DefaultModel: "chat-a"},
 		{RatePerMinute: 20, MaxConcurrent: 2},
-		{RatePerMinute: 30, MaxConcurrent: 3, DailyTokens: 300,
+		{RatePerMinute: 10, MaxConcurrent: 1, DailyTokens: 100, MonthlyTokens: 1000,
+			MaxInputTokens: 512, MaxOutputTokens: 64,
 			DefaultEmbeddingModel: "embed-c"},
 	}
 	var got Limits
@@ -59,7 +59,8 @@ func TestFoldPolicyRowsFirstNonEmptyDefaults(t *testing.T) {
 		got.FoldPolicyRow(row)
 	}
 	want := Limits{
-		RatePerMinute: 30, MaxConcurrent: 3, DailyTokens: 300,
+		RatePerMinute: 10, MaxConcurrent: 1, DailyTokens: 100,
+		MonthlyTokens: 1000, MaxInputTokens: 512, MaxOutputTokens: 64,
 		DefaultModel: "chat-a", DefaultEmbeddingModel: "embed-c",
 	}
 	if got != want {
@@ -67,9 +68,51 @@ func TestFoldPolicyRowsFirstNonEmptyDefaults(t *testing.T) {
 	}
 }
 
+// TestFoldPolicyRowsMinOfDeclaredCeilings pins the issue #8 ceiling fold:
+// each ceiling is the minimum declared across the subject's rows regardless
+// of row order; a row that leaves a nullable cap unset does not cap the
+// subject (passthrough), and a field no row declares stays zero (uncapped).
+func TestFoldPolicyRowsMinOfDeclaredCeilings(t *testing.T) {
+	rows := []Limits{
+		{RatePerMinute: 30, MaxConcurrent: 4, DailyTokens: 500, MonthlyTokens: 9000},
+		{RatePerMinute: 10, MaxConcurrent: 2},
+		{RatePerMinute: 20, MaxConcurrent: 8, MaxInputTokens: 2048},
+	}
+	want := Limits{
+		RatePerMinute: 10, MaxConcurrent: 2, DailyTokens: 500,
+		MonthlyTokens: 9000, MaxInputTokens: 2048, MaxOutputTokens: 0,
+	}
+	// Ascending id order and a shuffled order must fold identically: the
+	// ceiling fold is order-independent.
+	shuffled := []Limits{rows[2], rows[0], rows[1]}
+	for name, set := range map[string][]Limits{"id-order": rows, "shuffled": shuffled} {
+		var got Limits
+		for _, row := range set {
+			got.FoldPolicyRow(row)
+		}
+		if got != want {
+			t.Fatalf("%s: folded limits = %+v, want %+v", name, got, want)
+		}
+	}
+	// A tighter row arriving after looser ones must tighten: adding a row can
+	// never raise a quota.
+	var tightened Limits
+	tightened.FoldPolicyRow(rows[0])
+	tightened.FoldPolicyRow(Limits{RatePerMinute: 5, MaxConcurrent: 1, DailyTokens: 100})
+	if tightened.RatePerMinute != 5 || tightened.MaxConcurrent != 1 || tightened.DailyTokens != 100 {
+		t.Fatalf("later tighter row must tighten every declared ceiling, got %+v", tightened)
+	}
+	if tightened.MonthlyTokens != 9000 {
+		t.Fatalf("ceilings the tighter row does not declare must keep earlier values, got %+v", tightened)
+	}
+	if tightened.MaxInputTokens != 0 || tightened.MaxOutputTokens != 0 {
+		t.Fatalf("fields no row declares must stay zero, got %+v", tightened)
+	}
+}
+
 // TestFoldPolicyRowsAllNullDefaultsStayEmpty pins the unchanged 400 path: a
 // subject whose rows all leave the slots NULL keeps no default, while the
-// ceilings still collapse to the last row.
+// ceilings fold to the minimum declared value.
 func TestFoldPolicyRowsAllNullDefaultsStayEmpty(t *testing.T) {
 	var got Limits
 	got.FoldPolicyRow(Limits{RatePerMinute: 5})
@@ -77,8 +120,8 @@ func TestFoldPolicyRowsAllNullDefaultsStayEmpty(t *testing.T) {
 	if got.DefaultModel != "" || got.DefaultEmbeddingModel != "" {
 		t.Fatalf("all-NULL rows must keep both slots empty, got %+v", got)
 	}
-	if got.RatePerMinute != 7 {
-		t.Fatalf("ceilings must keep last-row-wins, got %+v", got)
+	if got.RatePerMinute != 5 {
+		t.Fatalf("ceilings must fold to the minimum declared, got %+v", got)
 	}
 }
 

@@ -164,8 +164,16 @@ func (d *DB) Providers(ctx context.Context) ([]mgmt.ProviderView, error) {
 }
 
 // Policies lists access_policies rows for one subject (or all when empty),
-// including the subject's default-model slots.
+// including the subject's default-model slots. Every row also carries the
+// subject's folded effective ceilings (issue #8 mitigation: min-of-declared
+// folding must be visible to operators, not silent). The effective block is
+// computed through LoadLimits so the view and the enforcement path fold the
+// rows through the exact same code.
 func (d *DB) Policies(ctx context.Context, subject string) ([]mgmt.PolicyView, error) {
+	limits, err := d.LoadLimits(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := d.Pool.Query(ctx, `
 		SELECT subject_id, public_model, rate_per_minute, max_concurrent,
 		       COALESCE(daily_tokens, 0), COALESCE(monthly_tokens, 0),
@@ -185,6 +193,7 @@ func (d *DB) Policies(ctx context.Context, subject string) ([]mgmt.PolicyView, e
 			&v.DailyTokens, &v.MonthlyTokens, &v.DefaultModel, &v.DefaultEmbeddingModel); err != nil {
 			return nil, err
 		}
+		v.EffectiveLimits = mgmt.EffectiveLimitsFrom(limits[v.Subject])
 		out = append(out, v)
 	}
 	return out, rows.Err()

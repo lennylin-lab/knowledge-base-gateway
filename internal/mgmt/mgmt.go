@@ -105,8 +105,10 @@ func (v *ProviderView) ApplyRuntime(rt ProviderRuntime) {
 	v.Health = HealthServing
 }
 
-// PolicyView is one subject/model grant with its ceilings and the subject's
-// default-model slots (empty string = unset).
+// PolicyView is one subject/model grant with its row ceilings and the
+// subject's default-model slots (empty string = unset). The row ceilings are
+// what the access_policies row declares; EffectiveLimits is what the gateway
+// actually enforces after folding all of the subject's rows.
 type PolicyView struct {
 	Subject       string `json:"subject_id"`
 	PublicModel   string `json:"public_model"`
@@ -118,6 +120,36 @@ type PolicyView struct {
 	// DefaultEmbeddingModel is the slot backfilled into embeddings requests
 	// that omit `model`.
 	DefaultEmbeddingModel string `json:"default_embedding_model,omitempty"`
+	// EffectiveLimits is the subject's folded policy (identical on every row
+	// of the same subject): each ceiling is the minimum declared across the
+	// subject's access_policies rows (issue #8), so a tightening row is
+	// visible to operators instead of silently resizing the subject. Zero
+	// means the subject has no cap for that field (unlimited). Metadata only.
+	EffectiveLimits EffectiveLimits `json:"effective_limits"`
+}
+
+// EffectiveLimits is the per-subject folded ceiling block exposed on every
+// PolicyView row. Build it with EffectiveLimitsFrom so the view can never
+// drift from the enforcement semantics in policy.Limits.FoldPolicyRow.
+type EffectiveLimits struct {
+	RatePerMinute   int   `json:"rate_per_minute"`
+	MaxConcurrent   int   `json:"max_concurrent"`
+	DailyTokens     int64 `json:"daily_tokens"`
+	MonthlyTokens   int64 `json:"monthly_tokens"`
+	MaxInputTokens  int   `json:"max_input_tokens"`
+	MaxOutputTokens int   `json:"max_output_tokens"`
+}
+
+// EffectiveLimitsFrom projects folded enforcement limits into the view block.
+func EffectiveLimitsFrom(l policy.Limits) EffectiveLimits {
+	return EffectiveLimits{
+		RatePerMinute:   l.RatePerMinute,
+		MaxConcurrent:   l.MaxConcurrent,
+		DailyTokens:     l.DailyTokens,
+		MonthlyTokens:   l.MonthlyTokens,
+		MaxInputTokens:  l.MaxInputTokens,
+		MaxOutputTokens: l.MaxOutputTokens,
+	}
 }
 
 // AuditFilter bounds an audit or usage query; zero values are ignored.
@@ -336,7 +368,9 @@ func (m *MemoryService) Providers(_ context.Context) ([]ProviderView, error) {
 
 // Policies summarizes the in-memory grant set; explicit policy rows are a
 // database-mode concept. The subject's default-model slots ride every row
-// (matching the row-based store's view shape).
+// (matching the row-based store's view shape), and the effective-limits
+// block carries the subject's folded ceilings — in this mode the policy
+// service already holds the folded Limits.
 func (m *MemoryService) Policies(_ context.Context, subject string) ([]PolicyView, error) {
 	if m.Policy == nil {
 		return []PolicyView{}, nil
@@ -347,11 +381,13 @@ func (m *MemoryService) Policies(_ context.Context, subject string) ([]PolicyVie
 			continue
 		}
 		defaults, _ := m.Policy.LimitsFor(s)
+		effective := EffectiveLimitsFrom(defaults)
 		for _, info := range m.Catalog.All() {
 			if m.Policy.Permitted(s, info.PublicName) {
 				out = append(out, PolicyView{
 					Subject: s, PublicModel: info.PublicName,
 					DefaultModel: defaults.DefaultModel, DefaultEmbeddingModel: defaults.DefaultEmbeddingModel,
+					EffectiveLimits: effective,
 				})
 			}
 		}

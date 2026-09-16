@@ -30,7 +30,8 @@ type adminFixture struct {
 	sink *audit.MemorySink
 	svc  *gateway.Service // live resolution path for refresh assertions
 	cap  *policy.Catalog
-	deps AdminDeps // rebuild the mux with extra wiring via newMux
+	pol  *policy.Policy // subject grants/limits backing the policies view
+	deps AdminDeps      // rebuild the mux with extra wiring via newMux
 }
 
 func newAdminFixture(t *testing.T) *adminFixture {
@@ -51,7 +52,7 @@ func newAdminFixture(t *testing.T) *adminFixture {
 		{Name: "fake", Kind: "fake", Enabled: true},
 	})
 	deps := AdminDeps{Manager: manager, Logger: nil, Token: adminToken, Mgmt: service}
-	return &adminFixture{mux: NewAdminMux(deps), mgmt: service, sink: sink, svc: svc, cap: catalog, deps: deps}
+	return &adminFixture{mux: NewAdminMux(deps), mgmt: service, sink: sink, svc: svc, cap: catalog, pol: pol, deps: deps}
 }
 
 // newMux replaces the fixture's admin mux with new deps (e.g. a runtime
@@ -204,12 +205,35 @@ func TestAdminAuditAndUsageQueries(t *testing.T) {
 
 func TestAdminPoliciesEndpoint(t *testing.T) {
 	f := newAdminFixture(t)
+	// Effective-limits visibility (issue #8 mitigation): the view must expose
+	// the subject's folded ceilings so a tightening multi-row policy is
+	// visible to operators instead of silently resizing the subject.
+	f.pol.SetLimits("subject_default", policy.Limits{
+		RatePerMinute: 30, MaxConcurrent: 2, DailyTokens: 5000, MaxInputTokens: 2048,
+	})
 	rec := doAdmin(f, http.MethodGet, "/admin/policies?subject=subject_default", adminToken, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("policies: %d body = %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "gateway-echo") {
 		t.Fatalf("policy rows missing: %s", rec.Body.String())
+	}
+	var out struct {
+		Policies []mgmt.PolicyView `json:"policies"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Policies) != 1 {
+		t.Fatalf("policies = %+v", out.Policies)
+	}
+	// The effective block mirrors the folded enforcement limits; undeclared
+	// caps stay zero (uncapped), never a fabricated value.
+	want := mgmt.EffectiveLimits{
+		RatePerMinute: 30, MaxConcurrent: 2, DailyTokens: 5000, MaxInputTokens: 2048,
+	}
+	if got := out.Policies[0].EffectiveLimits; got != want {
+		t.Fatalf("effective limits = %+v, want %+v", got, want)
 	}
 }
 
