@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -510,20 +511,67 @@ func newProviderFromRegistry(cfg config.Config, kind, name, baseURL string) (pro
 	}
 	switch kind {
 	case "openai":
-		if cfg.OpenAIKey == "" {
-			return nil, fmt.Errorf("provider %s: OPENAI_API_KEY must be set for openai kind", name)
+		key, err := resolveCredential(kind, name, cfg.OpenAIKey)
+		if err != nil {
+			return nil, err
 		}
-		return provider.NewOpenAI(baseURL, cfg.OpenAIKey), nil
+		return provider.NewOpenAI(baseURL, key), nil
 	case "anthropic":
-		if cfg.AnthropicKey == "" {
-			return nil, fmt.Errorf("provider %s: ANTHROPIC_API_KEY must be set for anthropic kind", name)
+		key, err := resolveCredential(kind, name, cfg.AnthropicKey)
+		if err != nil {
+			return nil, err
 		}
-		return provider.NewAnthropic(baseURL, cfg.AnthropicKey), nil
+		return provider.NewAnthropic(baseURL, key), nil
 	case "fake":
 		return provider.Fake{}, nil
 	default:
 		return nil, fmt.Errorf("provider %s: unsupported kind %q", name, kind)
 	}
+}
+
+// credentialEnvName derives the per-provider credential environment variable
+// for one registry row: <KIND>_API_KEY__<PROVIDER_NAME>. The provider name is
+// uppercased with every non-alphanumeric rune mapped to '_', so registry
+// names like "openai-embed" or "eu.chat" become valid variable names
+// (OPENAI_API_KEY__OPENAI_EMBED, OPENAI_API_KEY__EU_CHAT). The mapping is
+// ASCII-only on purpose: environment variable names are ASCII on every
+// supported platform.
+func credentialEnvName(kind, name string) string {
+	sanitize := func(s string) string {
+		var b strings.Builder
+		b.Grow(len(s))
+		for _, r := range s {
+			switch {
+			case r >= 'a' && r <= 'z':
+				b.WriteRune(r - 'a' + 'A')
+			case (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+				b.WriteRune(r)
+			default:
+				b.WriteByte('_')
+			}
+		}
+		return b.String()
+	}
+	return sanitize(kind) + "_API_KEY__" + sanitize(name)
+}
+
+// resolveCredential returns the API key for one provider registry row. The
+// per-provider variable <KIND>_API_KEY__<PROVIDER_NAME> wins when set;
+// otherwise the kind-level credential loaded by internal/config
+// (<KIND>_API_KEY) applies, which keeps development mode zero-config
+// (GATEWAY_PROVIDER=openai uses the literal name "openai" and resolves
+// through the fallback). When neither is present the error names both
+// checked variables — never any value.
+func resolveCredential(kind, name, kindKey string) (string, error) {
+	perProvider := credentialEnvName(kind, name)
+	if v := os.Getenv(perProvider); v != "" {
+		return v, nil
+	}
+	if kindKey != "" {
+		return kindKey, nil
+	}
+	return "", fmt.Errorf("provider %s: %s or %s_API_KEY must be set for %s kind",
+		name, perProvider, strings.ToUpper(kind), kind)
 }
 
 // providerViews snapshots the provider registry for the dev-mode management

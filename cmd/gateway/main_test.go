@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +24,8 @@ import (
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/config"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	pgstore "github.com/knowledge-base/knowledge-base-gateway/internal/store/pg"
 )
 
@@ -623,5 +627,309 @@ func TestDatabaseModeAdminToggleAffectsLiveServing(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("run after graceful cancel: %v", err)
+	}
+}
+
+// TestCredentialEnvName pins the per-provider variable naming convention:
+// <KIND>_API_KEY__<PROVIDER_NAME> with the provider name uppercased and every
+// non-alphanumeric rune mapped to '_'.
+func TestCredentialEnvName(t *testing.T) {
+	tests := []struct {
+		kind, name, want string
+	}{
+		{"openai", "chat", "OPENAI_API_KEY__CHAT"},
+		{"openai", "openai", "OPENAI_API_KEY__OPENAI"}, // dev-mode selector name
+		{"openai", "openai-embed", "OPENAI_API_KEY__OPENAI_EMBED"},
+		{"anthropic", "eu.claude", "ANTHROPIC_API_KEY__EU_CLAUDE"},
+		{"openai", "Embed V2", "OPENAI_API_KEY__EMBED_V2"},
+	}
+	for _, tt := range tests {
+		if got := credentialEnvName(tt.kind, tt.name); got != tt.want {
+			t.Errorf("credentialEnvName(%q, %q) = %q, want %q", tt.kind, tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestNewProviderFromRegistryPerProviderCredential pins credential resolution
+// for one registry row: the per-provider variable wins over the kind-level
+// credential, the kind-level fallback keeps deployments without per-provider
+// variables behaving exactly as before, the name mapping applies through the
+// real env lookup for both kinds, and both-absent refuses startup naming the
+// checked variables without ever echoing a value.
+func TestNewProviderFromRegistryPerProviderCredential(t *testing.T) {
+	tests := []struct {
+		name         string
+		kind         string
+		provName     string
+		baseURL      string
+		setupEnv     map[string]string
+		openAIKey    string
+		anthropicKey string
+		wantKey      string
+		wantErr      []string
+	}{
+		{
+			name: "per-provider openai variable wins over kind level",
+			kind: "openai", provName: "chat", baseURL: "https://chat.example.test",
+			setupEnv:  map[string]string{"OPENAI_API_KEY__CHAT": "per-provider-chat-key"},
+			openAIKey: "kind-level-openai-key",
+			wantKey:   "per-provider-chat-key",
+		},
+		{
+			name: "openai falls back to kind level when per-provider unset",
+			kind: "openai", provName: "chat", baseURL: "https://chat.example.test",
+			// Empty counts as unset: pins hermeticity against ambient env.
+			setupEnv:  map[string]string{"OPENAI_API_KEY__CHAT": ""},
+			openAIKey: "kind-level-openai-key",
+			wantKey:   "kind-level-openai-key",
+		},
+		{
+			name: "openai name with hyphen maps to underscore",
+			kind: "openai", provName: "openai-embed", baseURL: "https://embed.example.test",
+			setupEnv: map[string]string{"OPENAI_API_KEY__OPENAI_EMBED": "embed-key"},
+			wantKey:  "embed-key",
+		},
+		{
+			name: "anthropic name with dot maps to underscore",
+			kind: "anthropic", provName: "eu.claude", baseURL: "https://eu.example.test",
+			setupEnv:     map[string]string{"ANTHROPIC_API_KEY__EU_CLAUDE": "eu-key"},
+			anthropicKey: "kind-level-anthropic-key",
+			wantKey:      "eu-key",
+		},
+		{
+			name: "anthropic falls back to kind level",
+			kind: "anthropic", provName: "claude", baseURL: "https://claude.example.test",
+			setupEnv:     map[string]string{"ANTHROPIC_API_KEY__CLAUDE": ""},
+			anthropicKey: "kind-level-anthropic-key",
+			wantKey:      "kind-level-anthropic-key",
+		},
+		{
+			name: "both absent refuses openai naming both variables",
+			kind: "openai", provName: "fresh", baseURL: "https://fresh.example.test",
+			wantErr: []string{"OPENAI_API_KEY__FRESH", "OPENAI_API_KEY"},
+		},
+		{
+			name: "both absent refuses anthropic naming both variables",
+			kind: "anthropic", provName: "fresh", baseURL: "https://fresh.example.test",
+			wantErr: []string{"ANTHROPIC_API_KEY__FRESH", "ANTHROPIC_API_KEY"},
+		},
+	}
+	const (
+		perProviderValue = "per-provider-chat-key"
+		kindLevelValue   = "kind-level-openai-key"
+	)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.setupEnv {
+				t.Setenv(k, v)
+			}
+			cfg := config.Config{OpenAIKey: tt.openAIKey, AnthropicKey: tt.anthropicKey}
+			p, err := newProviderFromRegistry(cfg, tt.kind, tt.provName, tt.baseURL)
+			if len(tt.wantErr) > 0 {
+				if err == nil {
+					t.Fatal("newProviderFromRegistry must fail when both variables are absent")
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q must name checked variable %q", err, want)
+					}
+				}
+				for _, secret := range []string{perProviderValue, kindLevelValue} {
+					if strings.Contains(err.Error(), secret) {
+						t.Errorf("error must never echo a credential value, got %q", err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("newProviderFromRegistry: %v", err)
+			}
+			switch keyed := p.(type) {
+			case *provider.OpenAI:
+				if keyed.APIKey != tt.wantKey {
+					t.Errorf("OpenAI APIKey = %q, want %q", keyed.APIKey, tt.wantKey)
+				}
+			case *provider.Anthropic:
+				if keyed.APIKey != tt.wantKey {
+					t.Errorf("Anthropic APIKey = %q, want %q", keyed.APIKey, tt.wantKey)
+				}
+			default:
+				t.Fatalf("unexpected provider type %T", p)
+			}
+		})
+	}
+
+	// The fake kind stays credential-free: seeded internal:// rows validate
+	// with no environment at all.
+	t.Run("fake needs no credential", func(t *testing.T) {
+		p, err := newProviderFromRegistry(config.Config{}, "fake", "seeded-fake", "internal://fake")
+		if err != nil {
+			t.Fatalf("fake provider: %v", err)
+		}
+		if _, ok := p.(provider.Fake); !ok {
+			t.Fatalf("want provider.Fake, got %T", p)
+		}
+	})
+}
+
+// authRecorder records Authorization headers under a mutex so the handler
+// goroutine and the test goroutine never race.
+type authRecorder struct {
+	mu       sync.Mutex
+	headerss []string
+}
+
+func (a *authRecorder) add(v string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.headerss = append(a.headerss, v)
+}
+
+func (a *authRecorder) all() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.headerss...)
+}
+
+// stubOpenAIUpstream starts an httptest server answering OpenAI chat
+// completion requests and recording the Authorization header of every call.
+func stubOpenAIUpstream(t *testing.T) (url string, rec *authRecorder) {
+	t.Helper()
+	rec = &authRecorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.add(r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-stub","object":"chat.completion","created":1,`+
+			`"model":"stub","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},`+
+			`"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, rec
+}
+
+// TestPerProviderCredentialReachesUpstream proves the resolved per-provider
+// credential is the one actually sent upstream: two openai-kind registry rows
+// with different OPENAI_API_KEY__<NAME> variables each dial their own stub
+// upstream carrying their own Bearer token, while the kind-level fallback key
+// is never used.
+func TestPerProviderCredentialReachesUpstream(t *testing.T) {
+	chatURL, chatAuth := stubOpenAIUpstream(t)
+	embedURL, embedAuth := stubOpenAIUpstream(t)
+
+	// The kind-level key is a decoy: if resolution regressed to kind-level
+	// only, both stubs would see it instead of the per-provider keys.
+	cfg := config.Config{OpenAIKey: "kind-level-fallback-key", AllowInsecure: true}
+	t.Setenv("OPENAI_API_KEY__CHAT_UPSTREAM", "chat-key-1")
+	t.Setenv("OPENAI_API_KEY__EMBED_UPSTREAM", "embed-key-2")
+
+	chatProvider, err := newProviderFromRegistry(cfg, "openai", "chat-upstream", chatURL)
+	if err != nil {
+		t.Fatalf("chat provider: %v", err)
+	}
+	embedProvider, err := newProviderFromRegistry(cfg, "openai", "embed-upstream", embedURL)
+	if err != nil {
+		t.Fatalf("embed provider: %v", err)
+	}
+
+	req := model.Request{Model: "stub", Input: []model.InputItem{{Role: "user", Text: "ping"}}}
+	ctx := context.Background()
+	for _, p := range []provider.Provider{chatProvider, embedProvider} {
+		if _, err := p.Complete(ctx, req); err != nil {
+			t.Fatalf("%s complete: %v", p.Name(), err)
+		}
+	}
+
+	if got := chatAuth.all(); len(got) != 1 || got[0] != "Bearer chat-key-1" {
+		t.Errorf("chat upstream authorization = %v, want [Bearer chat-key-1]", got)
+	}
+	if got := embedAuth.all(); len(got) != 1 || got[0] != "Bearer embed-key-2" {
+		t.Errorf("embed upstream authorization = %v, want [Bearer embed-key-2]", got)
+	}
+	for _, got := range append(chatAuth.all(), embedAuth.all()...) {
+		if strings.Contains(got, "kind-level-fallback-key") {
+			t.Errorf("kind-level fallback key must never reach an upstream that declares its own credential, got %q", got)
+		}
+	}
+}
+
+// TestDatabaseStartupPerProviderCredentials proves the convention against a
+// real PostgreSQL registry: an enabled openai row with neither the
+// per-provider nor the kind-level variable aborts startup naming both checked
+// variables (never a value), while two openai rows with different base URLs
+// start healthy when one resolves its own OPENAI_API_KEY__<NAME> variable and
+// the other falls back to the kind-level key.
+func TestDatabaseStartupPerProviderCredentials(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping database-backed per-provider credential test")
+	}
+	ctx := context.Background()
+	lockTestDatabase(t, dsn)
+	migrateToHead(t, dsn)
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("pool connect: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	logger := quietLogger()
+
+	// Both absent: startup refuses before any listener exists, naming the
+	// per-provider variable and the kind-level fallback, leaking neither a
+	// value nor the DSN.
+	seedProvider(t, db, "cred-chat", "openai", "https://cred-chat.example.test")
+	err = run(ctx, dbStartupConfig(t, dsn), logger)
+	if err == nil {
+		t.Fatal("startup must fail when neither the per-provider nor the kind-level variable is set")
+	}
+	if !strings.Contains(err.Error(), "OPENAI_API_KEY__CRED_CHAT") || !strings.Contains(err.Error(), "OPENAI_API_KEY") {
+		t.Errorf("error must name both checked variables, got: %v", err)
+	}
+	if strings.Contains(err.Error(), dsn) || strings.Contains(err.Error(), "postgres://") {
+		t.Errorf("error must not include the database DSN, got: %v", err)
+	}
+
+	// Mixed resolution in one process: cred-chat resolves from its own
+	// per-provider variable while cred-embed falls back to the kind-level
+	// key. Startup succeeds and /readyz reports ready.
+	t.Setenv("OPENAI_API_KEY__CRED_CHAT", "per-provider-chat-key")
+	seedProvider(t, db, "cred-embed", "openai", "https://cred-embed.example.test")
+	cfg := dbStartupConfig(t, dsn)
+	cfg.OpenAIKey = "kind-level-openai-key"
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(runCtx, cfg, logger) }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(10 * time.Second)
+	ready := false
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, rerr := client.Get("http://" + cfg.Addr + "/readyz")
+		if rerr == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				if !strings.Contains(string(body), "ready") {
+					t.Fatalf("readyz body = %q, want ready status", body)
+				}
+				ready = true
+				break
+			}
+			lastErr = errors.New(resp.Status)
+		} else {
+			lastErr = rerr
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	cancel()
+	if runErr := <-done; runErr != nil {
+		t.Fatalf("run with per-provider credentials: %v", runErr)
+	}
+	if !ready {
+		t.Fatalf("server never reported ready within deadline, last error: %v", lastErr)
 	}
 }
