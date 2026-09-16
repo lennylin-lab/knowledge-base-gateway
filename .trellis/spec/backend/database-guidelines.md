@@ -27,6 +27,24 @@ gated on `TEST_DATABASE_URL`. New migrations must also keep
 `TestMigrationFilesParse` passing: complete up/down pairs, golang-migrate
 naming.
 
+### Convention: Multi-row subject policies fold deterministically
+
+**What**: A subject may have one `access_policies` row per granted model.
+`LoadLimits` folds a subject's rows via `policy.Limits.FoldPolicyRow`:
+`default_model` / `default_embedding_model` take the **first non-empty
+value** in `id` order (chat and embedding slots judged independently), while
+rate/ceiling fields keep the historical last-row-wins projection.
+
+**Why**: Row-level NULLs must never erase defaults declared on another row
+(issue #7: any NULL on the winning row killed subject-level backfill);
+ceilings were left last-wins deliberately — changing them would silently
+resize existing deployments (recorded as a follow-up product decision).
+
+**Boundary**: Both pg and any in-memory row source must fold through the
+shared `FoldPolicyRow` so the modes cannot drift; the admin default-model
+mutation updates all of a subject's rows and can only set existing models,
+so it never conflicts with first-non-empty-wins.
+
 ### Common Mistake: Resolving the migrations dir with a relative path
 
 **Symptom**: Migration tests skip in CI (no `TEST_DATABASE_URL`), then fail
