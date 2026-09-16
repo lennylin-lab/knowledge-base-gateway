@@ -44,14 +44,33 @@ curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8080/v1/models/gateway-
 
 `/v1/models` lists only models your subject is authorized to use; details
 include the public capability matrix, context/output limits, supported
-protocols, status, and configuration version. Provider names, upstream model
-names, and URLs are never exposed.
+protocols, status, and configuration version. Models that declare the
+embeddings capability also expose `embedding_dim` and (when the catalog row
+declares one) an opaque `retrieval_profile` JSON object of retrieval
+thresholds — read it from discovery; the server's env values remain the
+fallback so the server still starts when the gateway is down. Provider
+names, upstream model names, and URLs are never exposed.
 
 ## 3. Call the protocols
 
 - Chat Completions (non-streaming and SSE): `docs/examples/scripts/chat.sh`
 - Responses (non-streaming, SSE, tool calling, structured output):
   `docs/examples/scripts/responses.sh`
+- Embeddings (V1.3): `client.embeddings.create(model, input)` with the same
+  `base_url`, or plain HTTP:
+
+  ```bash
+  curl -s localhost:8080/v1/embeddings \
+    -H "Authorization: Bearer $KEY" \
+    -d '{"model":"gateway-echo","input":"hello"}'
+  ```
+
+  The mock provider returns a deterministic vector of exactly the declared
+  `embedding_dim` width (input-hash derived, stable across runs), so
+  offline tests are reproducible. Usage is input-token only and settles
+  into the subject's shared daily/monthly token pool. Requests omitting
+  `model` use the subject's `default_embedding_model` (set through the
+  admin API or `GATEWAY_DEFAULT_MODELS`).
 - Python (OpenAI SDK through `base_url`): `docs/examples/python_openai_sdk.py`
 - Python (plain HTTP): `docs/examples/python_client.py`
 - Go: `docs/examples/go_client.go`

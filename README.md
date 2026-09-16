@@ -60,6 +60,9 @@ go run ./cmd/gateway
 | `GATEWAY_MODELS` | – | Dev-only: `public-name:provider:upstream-model` comma-separated. Production catalog lives in PostgreSQL. |
 | `GATEWAY_MAX_RETRIES` | `2` | Finite retries for pre-output network/429/5xx/timeout failures |
 | `GATEWAY_RATE_PER_MINUTE` | `120` | Per-subject request rate (fixed window) |
+| `GATEWAY_RESPONSES_ENABLED` | `true` | Set `false` to disable `/v1/responses` (rollback switch) |
+| `GATEWAY_EMBEDDINGS_ENABLED` | `true` | Set `false` to disable `/v1/embeddings` (rollback switch) |
+| `GATEWAY_DEFAULT_MODELS` | – | Dev-only default models: `subject:chat-model[:embedding-model]` comma-separated. Production slots live in `access_policies`. |
 
 Request size limits: 1 MiB body, 64 messages, 32k characters per message
 (constants in `internal/config`).
@@ -70,8 +73,13 @@ Request size limits: 1 MiB body, 64 messages, 32k characters per message
 - `POST /v1/responses` — Responses-compatible protocol (V1.2): text, tool
   calling, JSON mode / structured output, SSE events; disable with
   `GATEWAY_RESPONSES_ENABLED=false` (independent rollback switch)
+- `POST /v1/embeddings` — OpenAI-compatible embeddings proxy (V1.3): string
+  or string-array input, `object: "list"` envelope, input-token-only usage;
+  disable with `GATEWAY_EMBEDDINGS_ENABLED=false` (independent rollback
+  switch)
 - `GET /v1/models`, `GET /v1/models/{model}` — caller-filtered model
-  discovery with public capability/limit metadata only (V1.2)
+  discovery with public capability/limit metadata only (V1.2); the detail
+  adds `retrieval_profile` when the catalog row declares one (V1.3)
 - `GET /healthz` — liveness, no dependency checks
 - `GET /readyz` — configuration and wiring validated
 - `GET /metrics` — Prometheus text format emitted by the official
@@ -79,8 +87,8 @@ Request size limits: 1 MiB body, 64 messages, 32k characters per message
 
 Capability enforcement is a routing constraint: features a model's catalog
 declaration does not allow (tools, structured output, JSON mode, streaming,
-vision, reasoning, the Responses protocol itself) are rejected with 400
-`capability_not_supported` before any provider is contacted.
+vision, reasoning, the Responses or Embeddings protocol itself) are rejected
+with 400 `capability_not_supported` before any provider is contacted.
 
 ## Error envelope
 
@@ -181,6 +189,21 @@ Token-gated (`Authorization: Bearer $GATEWAY_ADMIN_TOKEN`):
 - `GET /admin/keys?subject=svc` — metadata only (prefix, status, timestamps)
 - `POST /admin/keys/{id}/rotate` — new plaintext, old key revoked
 - `POST /admin/keys/{id}/revoke`
+- `POST /admin/policies/{subject}/default-model` `{"model":"...","kind":"chat"|"embedding"}` — sets the
+  subject's default model slot (V1.3); commits atomically with its
+  management-audit record and refreshes the running policy without a restart
+
+### Default models (V1.3)
+
+`access_policies.default_model` and `access_policies.default_embedding_model`
+(nullable FKs into `model_catalog`) carry per-subject defaults. Requests that
+omit `model` are backfilled before model resolution: chat/responses use the
+chat slot, embeddings use the embedding slot. An explicit `model` always wins
+(A/B testing and escape hatches); a request with neither a configured default
+nor a `model` field gets the stable 400 `invalid_request`. Defaults never
+bypass grants: a default pointing at a model the subject cannot use stays the
+non-leaky 403. Local development mode assigns slots with
+`GATEWAY_DEFAULT_MODELS="subject:chat-model[:embedding-model],..."`.
 
 ### Routing and reliability
 
@@ -378,6 +401,41 @@ Docs: `docs/developer-quickstart.md` (mock provider setup, examples),
 `docs/api-versioning.md` (compatibility, deprecation, flags),
 `docs/examples/` (curl, Python, OpenAI SDK, Go — the same request samples
 the automated smoke tests run).
+
+## V1.3: model control plane
+
+V1.3 makes the gateway the single control plane for model-related
+configuration, additively and per-model gated like every protocol before it:
+
+- **Embeddings proxy** (`POST /v1/embeddings`) — OpenAI-compatible
+  passthrough (`model`, `input` string or string array; `object: "list"`
+  response with `data[].embedding` and input-token-only `usage`) served by
+  the same auth/admission/rate-limit/quota/audit pipeline. Vectors come from
+  the provider adapter; the fake provider returns a deterministic
+  input-hash-derived vector of exactly the declared `embedding_dim` width.
+  A vector whose width differs from the catalog declaration is a gateway
+  configuration error (500 `embedding_dim_mismatch`): it fails loud and
+  never returns a wrong-width vector. Vector and input content never reach
+  logs or audit. The capability matrix gains `embeddings` and
+  `embedding_dim` (the directory attribute: pgvector width is fixed per
+  model, the gateway declares it and clients read it), and the endpoint is
+  independently togglable per model and via
+  `GATEWAY_EMBEDDINGS_ENABLED=false`.
+- **Subject default models** — see "Default models" above. Both slots ship
+  in migration 0005, and the admin mutation goes through the atomic
+  mutation + management-audit path with live runtime refresh.
+- **Retrieval profiles** — `model_catalog.retrieval_profile` JSONB (nullable)
+  holds an opaque JSON object of retrieval thresholds (the server's
+  `SEARCH_*` family) attached to the catalog model row. It rides model
+  discovery: `GET /v1/models/{model}` includes `retrieval_profile` when the
+  row declares one; the list stays unchanged. Profiles are catalog data:
+  changes bump `config_version` and are owned by SQL/catalog tooling (no
+  admin mutation surface). Server env values remain the fallback so the
+  server still starts standalone when the gateway is down.
+- **Shared token pool** — embeddings usage settles into the subject's
+  existing daily/monthly token pool (one budget, no new policy columns),
+  settling exactly once to the reported input-token total; unknown usage
+  keeps the conservative reservation.
 
 ## Design notes and known limitations
 

@@ -89,3 +89,23 @@ class GatewayClient:
 `internal/e2e/e2e_test.go` in this repository exercises the exact contract a
 client sees: failover on upstream 5xx, SSE termination, the error envelope
 with echoed `X-Request-ID`, 401 for invalid keys, and `Retry-After` on 429.
+
+## V1.3 additive notes (embeddings, default models, retrieval profiles)
+
+The chat contract above is unchanged. Additive surfaces:
+
+- `POST /v1/embeddings` — OpenAI-compatible embeddings: `{"model":...,
+  "input": "text" | ["a","b"]}` returns `{"object":"list","data":[{"object":
+  "embedding","index":0,"embedding":[...]}],"model":...,"usage":
+  {"prompt_tokens":N,"total_tokens":N}}`. Usage is input-token only and
+  settles into the same daily/monthly token pool as chat. Chat-only fields
+  (`stream`, `tools`, `response_format`, ...) are rejected with 400.
+- Requests may omit `model`: chat/responses backfill the subject's
+  `default_model`, embeddings backfill `default_embedding_model`. Omitting
+  `model` requires a configured default; otherwise the stable 400
+  `invalid_request` applies.
+- `GET /v1/models/{model}` gained `capabilities.embeddings`,
+  `capabilities.embedding_dim` (the fixed vector width for the model — read
+  it from discovery, keep `KB_EMBEDDING_DIM` only as an offline escape
+  hatch), and `retrieval_profile` when the catalog row declares one. All are
+  absent rather than null when undeclared.

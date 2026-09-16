@@ -8,8 +8,9 @@ Both public model protocols are part of stable **V1**:
 |---|---|---|---|
 | `/v1/chat/completions` | POST | V1 | Stable. The request/response shapes, SSE termination (`data: [DONE]`), error envelope, and request-ID behavior are frozen; see `docs/gateway-client-contract.md`. |
 | `/v1/responses` | POST | V1.2 | Stable for the documented MVP fields (see below). New fields are added additively. |
-| `/v1/models`, `/v1/models/{model}` | GET | V1.2 | Stable, read-only. |
-| `/admin/*` | any | V1 / V1.2 | Internal, token-gated, not a public contract; changes are announced but not versioned. |
+| `/v1/embeddings` | POST | V1.3 | Stable for the documented fields (`model`, `input` string or string array). Unknown request fields are ignored (the Chat Completions policy); chat-only fields (`stream`, `tools`, `response_format`, `messages`, `instructions`, `max_tokens`, `max_output_tokens`, `text`, `tool_choice`) are rejected with 400 `invalid_request`. |
+| `/v1/models`, `/v1/models/{model}` | GET | V1.2 | Stable, read-only. The detail gained `capabilities.embeddings`, `capabilities.embedding_dim`, `protocols: "embeddings"`, and `retrieval_profile` additively in V1.3 (absent when undeclared). |
+| `/admin/*` | any | V1 / V1.2 / V1.3 | Internal, token-gated, not a public contract; changes are announced but not versioned. |
 
 The error envelope `{"error":{type, code, message, request_id}}` and the HTTP
 status mapping are frozen across both protocols for all of V1.
@@ -73,16 +74,29 @@ JSONB) and enforced **before** a provider is called: unsupported features
 return `400 capability_not_supported`. This matrix doubles as the rollout
 mechanism:
 
-- A capability (for example `responses` or `structured_output`) can be
+- A capability (for example `responses`, `structured_output`, or V1.3's
+  `embeddings` with its `embedding_dim` directory attribute) can be
   enabled per model, then per tenant through grants; nothing is enabled by
   configuration accident.
-- The Responses endpoint has an independent kill switch:
-  `GATEWAY_RESPONSES_ENABLED=false` disables `/v1/responses` without
-  touching Chat Completions.
+- The Responses and Embeddings endpoints each have an independent kill
+  switch: `GATEWAY_RESPONSES_ENABLED=false` and
+  `GATEWAY_EMBEDDINGS_ENABLED=false` disable the endpoint without touching
+  Chat Completions.
 - Capability/adapter configuration versions are recorded per catalog row
   (`config_version`) and surfaced in `/v1/models/{model}` and the admin
   model view, so audit rows can be correlated with the declaration that was
-  in force.
+  in force. Retrieval profiles are catalog data in the same spirit: the
+  gateway delivers `retrieval_profile` verbatim from the row, enforces no
+  schema, and treats a `config_version` bump as the change record.
+
+## Default models (V1.3)
+
+Requests may omit `model`: chat/responses backfill the subject's
+`access_policies.default_model` and embeddings backfill
+`default_embedding_model` before model resolution. The explicit `model`
+semantics are unchanged, and requests with neither default nor model keep
+the stable 400 `invalid_request`. Audit rows record the resolved model, so
+consumers of the audit trail need no special casing.
 
 ## Deprecation
 
