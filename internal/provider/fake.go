@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
@@ -146,32 +147,47 @@ func (f Fake) Stream(ctx context.Context, req model.Request, emit func(model.Eve
 			ToolCall: &model.ToolCall{ID: call.ID, Name: call.Name}}); err != nil {
 			return err
 		}
-		for i := 0; i < len(call.Arguments); i += 8 {
-			if err := ctx.Err(); err != nil {
-				return &Error{Class: ClassTimeout, Msg: "deadline exceeded"}
-			}
-			end := min(i+8, len(call.Arguments))
-			if err := emitErr(model.Event{Kind: model.EventArgsDelta, ToolIndex: 0, Delta: call.Arguments[i:end]}); err != nil {
-				return err
-			}
+		// Shard on rune boundaries: a byte-aligned cut would split multi-byte
+		// UTF-8 sequences and irreversibly corrupt them into U+FFFD.
+		if err := shardUTF8(ctx, call.Arguments, func(d string) error {
+			return emitErr(model.Event{Kind: model.EventArgsDelta, ToolIndex: 0, Delta: d})
+		}); err != nil {
+			return err
 		}
 		if err := emitErr(model.Event{Kind: model.EventArgsDone, ToolIndex: 0, ToolCall: call}); err != nil {
 			return err
 		}
 	default:
 		text := resp.Text()
-		for i := 0; i < len(text); i += 8 {
-			if err := ctx.Err(); err != nil {
-				return &Error{Class: ClassTimeout, Msg: "deadline exceeded"}
-			}
-			end := min(i+8, len(text))
-			if err := emitErr(model.Event{Kind: model.EventTextDelta, Delta: text[i:end]}); err != nil {
-				return err
-			}
+		if err := shardUTF8(ctx, text, func(d string) error {
+			return emitErr(model.Event{Kind: model.EventTextDelta, Delta: d})
+		}); err != nil {
+			return err
 		}
 		if err := emitErr(model.Event{Kind: model.EventTextDone, Text: text}); err != nil {
 			return err
 		}
 	}
 	return emitErr(model.Event{Kind: model.EventCompleted, Response: &resp})
+}
+
+// shardUTF8 emits s as fragments of at most chunk bytes, stepping fragment
+// ends back to a UTF-8 rune boundary so no fragment ever splits a multi-byte
+// sequence: every fragment is valid UTF-8 and concatenation is byte-exact.
+func shardUTF8(ctx context.Context, s string, emit func(string) error) error {
+	const chunk = 8
+	for i := 0; i < len(s); {
+		if err := ctx.Err(); err != nil {
+			return &Error{Class: ClassTimeout, Msg: "deadline exceeded"}
+		}
+		end := min(i+chunk, len(s))
+		for end < len(s) && !utf8.RuneStart(s[end]) {
+			end--
+		}
+		if err := emit(s[i:end]); err != nil {
+			return err
+		}
+		i = end
+	}
+	return nil
 }
