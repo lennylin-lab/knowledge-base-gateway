@@ -53,27 +53,29 @@ func TestValidateResponseSpec(t *testing.T) {
 	schema := json.RawMessage(`{"type":"object","required":["echo"],"properties":{"echo":{"type":"string"}}}`)
 
 	spec := &ResponseSpec{Mode: ModeJSONSchema, Name: "answer", Schema: schema}
-	if err := ValidateResponseSpec(spec, fullCaps); err != nil {
+	if err := ValidateResponseSpec(spec, fullCaps, "chat"); err != nil {
 		t.Fatalf("valid spec rejected: %v", err)
 	}
-	if err := ValidateResponseSpec(spec, noStructured); !errors.Is(err, ErrCapabilityNotSupported) {
+	if err := ValidateResponseSpec(spec, noStructured, "chat"); !errors.Is(err, ErrCapabilityNotSupported) {
 		t.Fatalf("structured output on unsupported model must be capability error, got %v", err)
 	}
-	if err := ValidateResponseSpec(&ResponseSpec{Mode: ModeJSONSchema}, fullCaps); err == nil {
+	if err := ValidateResponseSpec(&ResponseSpec{Mode: ModeJSONSchema}, fullCaps, "chat"); err == nil {
 		t.Error("json_schema without schema must be rejected")
 	}
-	if err := ValidateResponseSpec(&ResponseSpec{Mode: "bogus"}, fullCaps); err == nil {
+	if err := ValidateResponseSpec(&ResponseSpec{Mode: "bogus"}, fullCaps, "chat"); err == nil {
 		t.Error("unknown mode must be rejected")
 	}
 	if err := ValidateResponseSpec(&ResponseSpec{
 		Mode: ModeJSONSchema, Schema: json.RawMessage(`{"$schema":"https://evil.example/x"}`),
-	}, fullCaps); err == nil {
+	}, fullCaps, "chat"); err == nil {
 		t.Error("unknown schema dialect must be rejected")
 	}
-	if err := ValidateResponseSpec(&ResponseSpec{Mode: ModeJSON}, noJSONMode); !errors.Is(err, ErrCapabilityNotSupported) {
+	if err := ValidateResponseSpec(&ResponseSpec{Mode: ModeJSON}, noJSONMode, "responses"); !errors.Is(err, ErrCapabilityNotSupported) {
 		t.Error("json mode on unsupported model must be capability error")
+	} else if got := err.Error(); got != "model does not declare capability 'json_mode' (protocol responses)" {
+		t.Errorf("capability message format drifted: %q", got)
 	}
-	if err := ValidateResponseSpec(nil, Capabilities{}); err != nil {
+	if err := ValidateResponseSpec(nil, Capabilities{}, "chat"); err != nil {
 		t.Error("nil spec is always valid")
 	}
 }
@@ -99,6 +101,41 @@ func TestCheckCapabilities(t *testing.T) {
 	}
 	if err := CheckCapabilities(Capabilities{Chat: true}, "chat", Request{Stream: true}); !errors.Is(err, ErrCapabilityNotSupported) {
 		t.Errorf("stream on non-streaming model must be capability error, got %v", err)
+	}
+}
+
+// TestCapabilityErrorMessageFormat pins the self-describing capability error
+// format per protocol and per capability key. The message is content-free:
+// capability key + protocol name only. Clients may match it, so format drift
+// is a contract change.
+func TestCapabilityErrorMessageFormat(t *testing.T) {
+	cases := []struct {
+		caps     Capabilities
+		protocol string
+		req      Request
+		want     string
+	}{
+		{Capabilities{}, "chat", Request{}, "model does not declare capability 'chat' (protocol chat)"},
+		{Capabilities{}, "responses", Request{}, "model does not declare capability 'responses' (protocol responses)"},
+		{Capabilities{}, "embeddings", Request{}, "model does not declare capability 'embeddings' (protocol embeddings)"},
+		{Capabilities{Chat: true}, "chat", Request{Stream: true}, "model does not declare capability 'stream' (protocol chat)"},
+		{Capabilities{Chat: true}, "chat", Request{Tools: []ToolDefinition{{Name: "x"}}}, "model does not declare capability 'tools' (protocol chat)"},
+		{Capabilities{Chat: true}, "chat", Request{ResponseSpec: &ResponseSpec{Mode: ModeJSON}}, "model does not declare capability 'json_mode' (protocol chat)"},
+		{Capabilities{Chat: true, Responses: true}, "responses", Request{ResponseSpec: &ResponseSpec{Mode: ModeJSONSchema}}, "model does not declare capability 'structured_output' (protocol responses)"},
+	}
+	for _, tc := range cases {
+		err := CheckCapabilities(tc.caps, tc.protocol, tc.req)
+		if err == nil {
+			t.Errorf("%s/%s: expected capability rejection", tc.protocol, tc.want)
+			continue
+		}
+		if err.Error() != tc.want {
+			t.Errorf("%s/%s: message = %q, want %q", tc.protocol, tc.want, err.Error(), tc.want)
+		}
+		var capErr *CapabilityError
+		if !errors.As(err, &capErr) {
+			t.Errorf("%s: error is not *CapabilityError: %T", tc.want, err)
+		}
 	}
 }
 

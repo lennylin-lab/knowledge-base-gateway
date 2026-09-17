@@ -51,6 +51,10 @@ thresholds — read it from discovery; the server's env values remain the
 fallback so the server still starts when the gateway is down. Provider
 names, upstream model names, and URLs are never exposed.
 
+The full capability matrix — every key, its semantics, defaults when
+undeclared, which surfaces gate on it, and the extension protocol for new
+keys — is documented in `docs/capabilities.md`.
+
 ## 3. Call the protocols
 
 - Chat Completions (non-streaming and SSE): `docs/examples/scripts/chat.sh`
@@ -127,7 +131,7 @@ Errors use one stable envelope on both protocols:
 |---|---|---|
 | 401 | `invalid_api_key`, `api_key_expired`, `api_key_revoked` | rotate key (admin API), fail fast |
 | 403 | `model_not_allowed` | unknown and disallowed models are indistinguishable |
-| 400 | `invalid_request`, `capability_not_supported`, `upstream_rejected_request` | fix payload; capability errors mean the model's matrix does not allow the feature |
+| 400 | `invalid_request`, `capability_not_supported`, `upstream_rejected_request` | fix payload; capability errors mean the model's matrix does not allow the feature — the message names the capability key and protocol (see `docs/capabilities.md`) |
 | 429 | `rate_limit_exceeded`, `quota_exceeded` (with `Retry-After`) | back off; quota clears at the next UTC day/month boundary |
 | 503 | `upstream_unavailable`, `upstream_rate_limited`, `no_route_available`, `limiter_unavailable` | retry with backoff; `limiter_unavailable` has no `Retry-After` |
 | 504 | `upstream_timeout` | retry allowed |

@@ -1,6 +1,9 @@
 package policy
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // TestLimitsRoundTripIncludingMaxInputTokens pins AC2: the in-memory policy
 // limits can represent the persisted access_policies.max_input_tokens column
@@ -136,6 +139,38 @@ func TestFoldPolicyRowSingleRowIdentity(t *testing.T) {
 	got.FoldPolicyRow(row)
 	if got != row {
 		t.Fatalf("single row must fold to itself, got %+v want %+v", got, row)
+	}
+}
+
+// TestResolverLimitsForPooledBehavior pins that Resolver.LimitsFor — the
+// admission layer's single limit-resolution seam — returns exactly the
+// subject's pooled limits today: identical for every public model (quota is
+// subject-pooled, per-model overrides are reserved, not implemented), and the
+// zero Limits with a nil error for subjects without an explicit policy, so
+// callers skip gating exactly as before the seam existed.
+func TestResolverLimitsForPooledBehavior(t *testing.T) {
+	p := New()
+	r := NewResolver(p)
+	ctx := context.Background()
+
+	got, err := r.LimitsFor(ctx, "subject-1", "model-a")
+	if err != nil {
+		t.Fatalf("no-policy subject must resolve without error, got %v", err)
+	}
+	if got != (Limits{}) {
+		t.Fatalf("no-policy subject must resolve to zero limits, got %+v", got)
+	}
+
+	want := Limits{RatePerMinute: 10, MaxConcurrent: 2, DailyTokens: 1000, MonthlyTokens: 9000, MaxOutputTokens: 64}
+	p.SetLimits("subject-1", want)
+	for _, m := range []string{"model-a", "model-b", "embed-c"} {
+		got, err = r.LimitsFor(ctx, "subject-1", m)
+		if err != nil {
+			t.Fatalf("%s: resolver error %v", m, err)
+		}
+		if got != want {
+			t.Fatalf("%s: limits = %+v, want the subject's pooled %+v (model-independent)", m, got, want)
+		}
 	}
 }
 

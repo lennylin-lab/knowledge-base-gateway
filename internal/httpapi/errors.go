@@ -70,8 +70,17 @@ func mapError(w http.ResponseWriter, requestID string, err error) {
 		// Deliberately non-leaky: missing vs forbidden are indistinguishable.
 		writeError(w, requestID, http.StatusForbidden, "permission_error", "model_not_allowed", "the requested model is not available for this principal")
 	case errors.Is(err, model.ErrCapabilityNotSupported):
-		// Declared capability rejected before any provider invocation.
-		writeError(w, requestID, http.StatusBadRequest, "invalid_request_error", "capability_not_supported", "the requested capability is not supported by this model")
+		// Declared capability rejected before any provider invocation. The
+		// message is self-describing and content-free (capability key +
+		// protocol name); the envelope shape stays frozen. Admissions-layer
+		// rejections carry a *model.CapabilityError; provider-sourced
+		// capability failures keep the generic message.
+		msg := "the requested capability is not supported by this model"
+		var capErr *model.CapabilityError
+		if errors.As(err, &capErr) {
+			msg = capErr.Error()
+		}
+		writeError(w, requestID, http.StatusBadRequest, "invalid_request_error", "capability_not_supported", msg)
 	case errors.Is(err, model.ErrEmbeddingDimMismatch):
 		// Gateway configuration error: the upstream vector width differs from
 		// the catalog declaration. 500-class, nothing returned, no vector or

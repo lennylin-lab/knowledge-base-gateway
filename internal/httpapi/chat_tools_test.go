@@ -145,6 +145,11 @@ func TestChatCapabilityRejectionBeforeProvider(t *testing.T) {
 		"json_mode": `{"model":"gpt-test","messages":[{"role":"user","content":"x"}],"response_format":{"type":"json_object"}}`,
 		"schema":    `{"model":"gpt-test","messages":[{"role":"user","content":"x"}],"response_format":{"type":"json_schema","json_schema":{"name":"s","schema":{"type":"object"}}}}`,
 	}
+	wantCap := map[string]string{
+		"tools":     "capability 'tools'",
+		"json_mode": "capability 'json_mode'",
+		"schema":    "capability 'structured_output'",
+	}
 	for name, body := range cases {
 		rec := doChat(t, h, body, testKey, "")
 		if rec.Code != http.StatusBadRequest {
@@ -153,6 +158,9 @@ func TestChatCapabilityRejectionBeforeProvider(t *testing.T) {
 		}
 		if !strings.Contains(rec.Body.String(), "capability_not_supported") {
 			t.Errorf("%s: wrong code: %s", name, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), wantCap[name]) {
+			t.Errorf("%s: message must name the failed capability: %s", name, rec.Body.String())
 		}
 	}
 }

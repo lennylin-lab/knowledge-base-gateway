@@ -566,6 +566,9 @@ func TestResponsesCapabilityRejectionBeforeProvider(t *testing.T) {
 		if env.Error.Code != "capability_not_supported" {
 			t.Errorf("%s: code = %q", name, env.Error.Code)
 		}
+		if !strings.Contains(env.Error.Message, "capability '"+name+"'") {
+			t.Errorf("%s: message must name the failed capability: %q", name, env.Error.Message)
+		}
 	}
 	if *f.calls != 0 {
 		t.Errorf("capability-rejected requests reached the provider (%d calls)", *f.calls)

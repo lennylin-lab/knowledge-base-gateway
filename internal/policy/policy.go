@@ -3,6 +3,7 @@
 package policy
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
 	"slices"
@@ -199,6 +200,33 @@ func (l *Limits) FoldPolicyRow(row Limits) {
 	if l.DefaultEmbeddingModel == "" {
 		l.DefaultEmbeddingModel = row.DefaultEmbeddingModel
 	}
+}
+
+// Resolver resolves the effective limit set for one admission decision. It
+// exists so limit composition has exactly one code path the HTTP layer calls.
+type Resolver struct {
+	p *Policy
+}
+
+// NewResolver wraps a Policy as a limit resolver.
+func NewResolver(p *Policy) *Resolver { return &Resolver{p: p} }
+
+// LimitsFor resolves the limits that gate one request for subject on
+// publicModel. It is **the single composition point for per-model limit
+// overrides**: today it returns exactly the subject's pooled limits (the
+// min-folded ceilings from FoldPolicyRow, issue #8 semantics — untouched
+// here), and the model dimension is deliberately unused. A future per-model
+// quota feature (e.g. model_quota_overrides[public_model]) composes its
+// override HERE and nowhere else; until that feature is designed, quota
+// keying stays subject-pooled (reserving the seam is not implementing it).
+//
+// When the subject has no explicit policy, the zero Limits are returned with
+// a nil error: every ceiling reads as unset, so callers skip gating — the
+// same outcome as today's "not found" path. A non-nil error is reserved for
+// resolver infrastructure failures and must fail closed at the caller.
+func (r *Resolver) LimitsFor(ctx context.Context, subject, publicModel string) (Limits, error) {
+	l, _ := r.p.LimitsFor(subject)
+	return l, nil
 }
 
 // All returns every catalog entry (for router and readiness wiring).

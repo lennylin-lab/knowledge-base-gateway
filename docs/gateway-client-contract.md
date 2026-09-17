@@ -109,3 +109,8 @@ The chat contract above is unchanged. Additive surfaces:
   it from discovery, keep `KB_EMBEDDING_DIM` only as an offline escape
   hatch), and `retrieval_profile` when the catalog row declares one. All are
   absent rather than null when undeclared.
+
+Capability errors (`capability_not_supported`) name the failed capability key
+and protocol in their message, e.g.
+`model does not declare capability 'tools' (protocol chat)`. The full matrix
+and key semantics: `docs/capabilities.md`.

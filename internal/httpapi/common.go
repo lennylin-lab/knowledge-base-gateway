@@ -206,32 +206,39 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 	// pool for every protocol (chat, responses, embeddings share one budget).
 	qres := quota.Done
 	if d.Quota != nil && d.Policy != nil {
-		if limits, found := d.Policy.LimitsFor(subject); found {
-			ql := quota.Limits{DailyTokens: limits.DailyTokens, MonthlyTokens: limits.MonthlyTokens}
-			if ql.Configured() {
-				// Embeddings usage is input-token only, so the conservative
-				// reservation is the deterministic input estimate alone (no
-				// output reserve).
-				est := quota.InputTokens(mreq.InputChars())
-				if protocol != protocolEmbeddings {
-					est = quota.Estimate(mreq.MaxTokens, limits.MaxOutputTokens, mreq.InputChars())
-				}
-				res, qErr := d.Quota.Reserve(r.Context(), subject, ql, est, time.Now())
-				if qErr != nil {
-					var denial *quota.Error
-					if errors.As(qErr, &denial) {
-						if d.Metrics != nil {
-							d.Metrics.IncRateLimit(publicModel)
-						}
-						if denial.RetryAfter > 0 {
-							w.Header().Set("Retry-After", fmt.Sprintf("%d", int(denial.RetryAfter.Seconds())+1))
-						}
-					}
-					release()
-					return &admitted{}, qErr
-				}
-				qres = res
+		// Limit resolution goes through policy.Resolver.LimitsFor — the
+		// single composition point for any future per-model quota override.
+		limits, lErr := policy.NewResolver(d.Policy).LimitsFor(r.Context(), subject, publicModel)
+		if lErr != nil {
+			// Resolver infrastructure failure: fail closed after releasing
+			// the limiter slot; never reserve against unknown limits.
+			release()
+			return &admitted{}, lErr
+		}
+		ql := quota.Limits{DailyTokens: limits.DailyTokens, MonthlyTokens: limits.MonthlyTokens}
+		if ql.Configured() {
+			// Embeddings usage is input-token only, so the conservative
+			// reservation is the deterministic input estimate alone (no
+			// output reserve).
+			est := quota.InputTokens(mreq.InputChars())
+			if protocol != protocolEmbeddings {
+				est = quota.Estimate(mreq.MaxTokens, limits.MaxOutputTokens, mreq.InputChars())
 			}
+			res, qErr := d.Quota.Reserve(r.Context(), subject, ql, est, time.Now())
+			if qErr != nil {
+				var denial *quota.Error
+				if errors.As(qErr, &denial) {
+					if d.Metrics != nil {
+						d.Metrics.IncRateLimit(publicModel)
+					}
+					if denial.RetryAfter > 0 {
+						w.Header().Set("Retry-After", fmt.Sprintf("%d", int(denial.RetryAfter.Seconds())+1))
+					}
+				}
+				release()
+				return &admitted{}, qErr
+			}
+			qres = res
 		}
 	}
 	return &admitted{plan: plan, qres: qres, release: release}, nil

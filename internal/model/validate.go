@@ -12,6 +12,21 @@ import (
 // provider invocation with a stable capability_not_supported error.
 var ErrCapabilityNotSupported = errors.New("capability not supported")
 
+// CapabilityError is a capability-matrix rejection that names the failed
+// capability key and the protocol it was requested on. The message is
+// content-free (capability key + protocol name only) and is what the HTTP
+// layer surfaces verbatim as the capability_not_supported error message.
+type CapabilityError struct {
+	Capability string // capability matrix key, e.g. "tools" or "json_mode"
+	Protocol   string // "chat", "responses", or "embeddings"
+}
+
+func (e *CapabilityError) Error() string {
+	return fmt.Sprintf("model does not declare capability '%s' (protocol %s)", e.Capability, e.Protocol)
+}
+
+func (e *CapabilityError) Unwrap() error { return ErrCapabilityNotSupported }
+
 // ErrValidation is the domain validation failure; HTTP layers map it to a
 // 400-class invalid_request envelope without leaking internals.
 var ErrValidation = errors.New("invalid request")
@@ -116,19 +131,21 @@ func ValidateTools(tools []ToolDefinition, maxTools int) error {
 
 // ValidateResponseSpec checks the structured-output specification: mode enum,
 // schema size, object shape, depth, and a known JSON Schema dialect when
-// declared. Caps gate whether the modes are permitted at all.
-func ValidateResponseSpec(spec *ResponseSpec, caps Capabilities) error {
+// declared. Caps gate whether the modes are permitted at all. protocol is the
+// requesting protocol label, carried onto capability rejections so the client
+// message names it.
+func ValidateResponseSpec(spec *ResponseSpec, caps Capabilities, protocol string) error {
 	if spec == nil {
 		return nil
 	}
 	switch spec.Mode {
 	case ModeJSON:
 		if !caps.JSONMode {
-			return fmt.Errorf("%w: json_mode", ErrCapabilityNotSupported)
+			return &CapabilityError{Capability: "json_mode", Protocol: protocol}
 		}
 	case ModeJSONSchema:
 		if !caps.StructuredOutput {
-			return fmt.Errorf("%w: structured_output", ErrCapabilityNotSupported)
+			return &CapabilityError{Capability: "structured_output", Protocol: protocol}
 		}
 		if len(spec.Schema) == 0 {
 			return fmt.Errorf("%w: response_format json_schema requires a schema", ErrValidation)
@@ -190,32 +207,33 @@ func ValidateToolCallArguments(args string) error {
 
 // CheckCapabilities enforces the capability matrix for a request. protocol is
 // "chat", "responses", or "embeddings". It returns an error wrapping
-// ErrCapabilityNotSupported naming the first unsupported feature, so handlers
-// can reject before routing to a provider.
+// ErrCapabilityNotSupported (a *CapabilityError naming the failed key and the
+// protocol) so handlers can reject before routing to a provider with a
+// self-describing, content-free message.
 func CheckCapabilities(caps Capabilities, protocol string, req Request) error {
 	switch protocol {
 	case "chat":
 		if !caps.Chat {
-			return fmt.Errorf("%w: chat protocol", ErrCapabilityNotSupported)
+			return &CapabilityError{Capability: "chat", Protocol: protocol}
 		}
 	case "responses":
 		if !caps.Responses {
-			return fmt.Errorf("%w: responses protocol", ErrCapabilityNotSupported)
+			return &CapabilityError{Capability: "responses", Protocol: protocol}
 		}
 	case "embeddings":
 		if !caps.Embeddings {
-			return fmt.Errorf("%w: embeddings protocol", ErrCapabilityNotSupported)
+			return &CapabilityError{Capability: "embeddings", Protocol: protocol}
 		}
 	default:
 		return fmt.Errorf("%w: unknown protocol", ErrValidation)
 	}
 	if req.Stream && !caps.Stream {
-		return fmt.Errorf("%w: stream", ErrCapabilityNotSupported)
+		return &CapabilityError{Capability: "stream", Protocol: protocol}
 	}
 	if len(req.Tools) > 0 && !caps.Tools {
-		return fmt.Errorf("%w: tools", ErrCapabilityNotSupported)
+		return &CapabilityError{Capability: "tools", Protocol: protocol}
 	}
-	if err := ValidateResponseSpec(req.ResponseSpec, caps); err != nil {
+	if err := ValidateResponseSpec(req.ResponseSpec, caps, protocol); err != nil {
 		return err
 	}
 	return nil

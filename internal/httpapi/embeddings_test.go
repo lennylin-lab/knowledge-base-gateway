@@ -201,6 +201,9 @@ func TestEmbeddingsCapabilityRejectedPreProvider(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "capability_not_supported") {
 		t.Fatalf("wrong code: %s", rec.Body.String())
 	}
+	if !strings.Contains(rec.Body.String(), "capability 'embeddings'") {
+		t.Fatalf("message must name the failed capability: %s", rec.Body.String())
+	}
 	if f.embedCalls != 0 || p.calls != 0 {
 		t.Fatalf("provider embeddings calls = %d/%d, want 0", f.embedCalls, p.calls)
 	}
