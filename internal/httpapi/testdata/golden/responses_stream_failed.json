@@ -1,0 +1,1 @@
+{"code":"temporary_error","response":{"created":0,"error":{"code":"temporary_error","message":"the upstream is temporarily unavailable"},"id":"\u003cid\u003e","model":"golden-model","object":"response","output":null,"status":"failed"},"type":"response.failed"}

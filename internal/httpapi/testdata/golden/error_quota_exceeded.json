@@ -1,0 +1,1 @@
+{"error":{"code":"quota_exceeded","message":"token quota exceeded for this subject","request_id":"req_golden_quota","type":"rate_limit_error"}}

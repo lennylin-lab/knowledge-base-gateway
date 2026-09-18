@@ -1,0 +1,1 @@
+{"error":{"code":"capability_not_supported","message":"model does not declare capability 'responses' (protocol responses)","request_id":"req_golden_cap_1","type":"invalid_request_error"}}
