@@ -1,0 +1,2 @@
+{"file":"docs/v1.4-operations-and-async-roadmap.md","reason":"Migration order and V1.3 compatibility requirements."}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Applied migration immutability and real PostgreSQL lifecycle conventions."}

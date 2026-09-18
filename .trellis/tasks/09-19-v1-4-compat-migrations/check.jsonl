@@ -1,0 +1,2 @@
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Golden, CI, migration, race, and integration quality gates."}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Verify schema, down ordering, and source-of-truth constraints."}
