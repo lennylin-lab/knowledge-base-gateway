@@ -289,6 +289,25 @@ if [ "${migrate_exit:-}" != "0" ]; then
 fi
 log "ok: migration job completed (exit 0)"
 
+# --- Migration version assertion ------------------------------------------------
+# The applied schema_migrations version must equal the highest migration file
+# in the repository, so a migration silently failing to apply (or a stale
+# image shipping an old migrations directory) fails the smoke instead of
+# serving against a partially migrated schema. Mirrors the derivation in
+# .github/workflows/ci.yml; POSTGRES_USER/POSTGRES_DB defaults match
+# docker-compose.yml.
+expected_version=$((10#$(find "$ROOT/migrations" -maxdepth 1 -name '*.up.sql' \
+  | sed -E 's|.*/([0-9]+)_.*|\1|' | sort -n | tail -1)))
+applied_version=$(docker compose -f "$ROOT/docker-compose.yml" exec -T postgres \
+  psql -U "${POSTGRES_USER:-gateway}" -d "${POSTGRES_DB:-gateway}" -t -A -c \
+  "SELECT version FROM schema_migrations" 2>/dev/null | head -1)
+applied_version=$((10#${applied_version:-0}))
+if [ "$applied_version" -ne "$expected_version" ]; then
+  log "schema version mismatch: applied ${applied_version}, migrations dir declares ${expected_version}"
+  exit 2
+fi
+log "ok: schema at version ${applied_version}"
+
 # --- Liveness, then readiness (each phase gets its own WAIT_SECONDS budget) ---
 if ! wait_for "$SMOKE_URL/healthz" 200 "$(( $(date +%s) + WAIT_SECONDS ))"; then
   exit 3
@@ -320,7 +339,7 @@ if [ "${responses_status:-0}" -ne 0 ]; then
   exit "$responses_status"
 fi
 
-log "PASS: migration completed, /healthz and /readyz verified, outage and recovery behavior confirmed, chat and responses paths verified"
+log "PASS: migration completed at the expected version, /healthz and /readyz verified, outage and recovery behavior confirmed, chat and responses paths verified"
 if [ "$TEARDOWN" -eq 1 ]; then
   log "tearing down stack and volumes (--down)"
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true

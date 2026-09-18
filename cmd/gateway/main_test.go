@@ -20,6 +20,7 @@ import (
 
 	"github.com/golang-migrate/migrate/v4"
 	pgx5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
+	"github.com/golang-migrate/migrate/v4/source"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
@@ -78,9 +79,39 @@ func lockTestDatabase(t *testing.T, dsn string) {
 	})
 }
 
+// latestMigrationVersion walks the repository migrations directory through
+// the same source driver cmd/migrate uses and returns the highest version.
+// Deriving the expectation keeps this test honest when new migration pairs
+// land: no hardcoded version to forget at the next schema change.
+func latestMigrationVersion(t *testing.T) uint {
+	t.Helper()
+	d, err := source.Open("file://" + migrationsDir(t))
+	if err != nil {
+		t.Fatalf("open migrations dir: %v", err)
+	}
+	defer d.Close()
+	version, err := d.First()
+	if err != nil {
+		t.Fatalf("no first migration: %v", err)
+	}
+	for {
+		next, err := d.Next(version)
+		if errors.Is(err, os.ErrNotExist) {
+			return version
+		}
+		if err != nil {
+			t.Fatalf("next after %d: %v", version, err)
+		}
+		version = next
+	}
+}
+
 // migrateToHead drives the same golang-migrate instance as cmd/migrate until
 // the schema is at the latest version. It never drops anything: the shared
 // test database may hold state from other tests, which must keep working.
+// The gateway binary under test is the pre-V1.4-feature binary; starting it
+// against the migrated head proves the additive V1.4 schema stays compatible
+// with existing (flag-off) behavior.
 func migrateToHead(t *testing.T, dsn string) {
 	t.Helper()
 	mdb, err := sql.Open("pgx", dsn)
@@ -99,9 +130,10 @@ func migrateToHead(t *testing.T, dsn string) {
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("migrate up: %v", err)
 	}
+	want := latestMigrationVersion(t)
 	version, dirty, err := m.Version()
-	if err != nil || version != 5 || dirty {
-		t.Fatalf("schema version = %d (dirty=%v) err=%v, want 5 (dirty=false)", version, dirty, err)
+	if err != nil || version != want || dirty {
+		t.Fatalf("schema version = %d (dirty=%v) err=%v, want %d (dirty=false)", version, dirty, err, want)
 	}
 }
 

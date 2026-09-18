@@ -11,6 +11,12 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
+// wantMigrationVersions is the exact number of expected migration versions.
+// It is asserted as an equality so an accidentally copied or half-deleted
+// migration file fails the parse test; bump it when landing a new migration
+// pair.
+const wantMigrationVersions = 9
+
 // migrationsDirURL resolves the repository migrations directory to an
 // absolute file:// URL, which is how golang-migrate's file source parses it.
 func migrationsDirURL(t *testing.T) string {
@@ -52,8 +58,8 @@ func TestMigrationFilesParse(t *testing.T) {
 		versions = append(versions, next)
 		version = next
 	}
-	if len(versions) != 5 {
-		t.Fatalf("expected exactly 5 migration versions, got %v", versions)
+	if len(versions) != wantMigrationVersions {
+		t.Fatalf("expected exactly %d migration versions, got %v", wantMigrationVersions, versions)
 	}
 
 	for _, v := range versions {

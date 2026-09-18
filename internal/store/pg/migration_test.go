@@ -76,12 +76,14 @@ func requireVersion(t *testing.T, m *migrate.Migrate, want uint, dirty bool) {
 }
 
 // TestMigrationsAndStores applies every forward migration through the
-// versioned migration tool, exercises the key lifecycle, audit, and V1.2
-// management stores on the real schema, verifies the 0004 first-token column
-// round-trips (and rolls back), rolls 0003 back through the tool, verifies
-// the new columns and tables are gone, and re-applies to confirm version
-// tracking. It requires a real PostgreSQL instance and is skipped when
-// TEST_DATABASE_URL is not set.
+// versioned migration tool (fresh up to the latest version, second up as a
+// no-op), exercises the key lifecycle, audit, and V1.2 management stores on
+// the real schema, then rolls every boundary back down to the empty database
+// (0009 through 0001) verifying each down script removes exactly its own
+// artifacts, and re-applies the whole chain to confirm version tracking. It
+// requires a real PostgreSQL instance and is skipped when TEST_DATABASE_URL
+// is not set. The V1.4-specific upgrade path and schema constraints live in
+// TestVersion5UpgradePath and TestV14SchemaConstraints.
 func TestMigrationsAndStores(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -91,22 +93,40 @@ func TestMigrationsAndStores(t *testing.T) {
 	lockTestDatabase(t, dsn)
 
 	// The migration tool owns schema changes: clean slate including its
-	// bookkeeping table, then drive it like cmd/migrate does.
+	// bookkeeping table, then drive it like cmd/migrate does. The list covers
+	// every table any migration (0001-0009) can create, dependents first.
 	mdb, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("migrate connect: %v", err)
 	}
 	defer mdb.Close()
 	_, _ = mdb.ExecContext(ctx, "DROP TABLE IF EXISTS schema_migrations")
-	_, _ = mdb.ExecContext(ctx, "DROP TABLE IF EXISTS llm_requests, access_policies, model_routes, model_catalog, api_keys, subjects, tenants, providers, admin_audit CASCADE")
+	_, _ = mdb.ExecContext(ctx, `DROP TABLE IF EXISTS data_exports, archive_runs, retention_policies,
+		admin_credentials, budget_policies, usage_ledger, pricing_catalog,
+		idempotency_keys, async_job_results, async_jobs,
+		llm_requests, access_policies, model_routes, model_catalog, api_keys, subjects, tenants, providers, admin_audit CASCADE`)
 
 	m := newTestMigrator(t, mdb)
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	requireVersion(t, m, 5, false)
+	requireVersion(t, m, 9, false)
 	if err := m.Up(); !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("second up must be a no-op, got %v", err)
+	}
+
+	// Every V1.4 table from 0006-0009 exists after the full up.
+	var v14Tables int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_name IN ('async_jobs', 'async_job_results', 'idempotency_keys',
+		                     'pricing_catalog', 'usage_ledger', 'budget_policies',
+		                     'admin_credentials', 'retention_policies', 'archive_runs',
+		                     'data_exports')`).Scan(&v14Tables); err != nil {
+		t.Fatalf("v1.4 table check: %v", err)
+	}
+	if v14Tables != 10 {
+		t.Fatalf("V1.4 table count = %d, want 10", v14Tables)
 	}
 
 	// Store coverage on the migrated schema, through the production pool.
@@ -511,6 +531,66 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatal("management op must default its admin subject")
 	}
 
+	// Roll back each V1.4 migration one boundary at a time and confirm every
+	// down script removes exactly its own artifacts.
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0009: %v", err)
+	}
+	requireVersion(t, m, 8, false)
+	var lifecycleTables int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_name IN ('retention_policies','archive_runs','data_exports')`).Scan(&lifecycleTables); err != nil {
+		t.Fatalf("0009 down check: %v", err)
+	}
+	if lifecycleTables != 0 {
+		t.Fatal("0009 down migration left lifecycle metadata tables behind")
+	}
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0008: %v", err)
+	}
+	requireVersion(t, m, 7, false)
+	var adminTables int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_name IN ('admin_credentials')`).Scan(&adminTables); err != nil {
+		t.Fatalf("0008 down check: %v", err)
+	}
+	if adminTables != 0 {
+		t.Fatal("0008 down migration left admin_credentials behind")
+	}
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0007: %v", err)
+	}
+	requireVersion(t, m, 6, false)
+	var costTables int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_name IN ('pricing_catalog','usage_ledger','budget_policies')`).Scan(&costTables); err != nil {
+		t.Fatalf("0007 down check: %v", err)
+	}
+	if costTables != 0 {
+		t.Fatal("0007 down migration left cost governance tables behind")
+	}
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0006: %v", err)
+	}
+	requireVersion(t, m, 5, false)
+	var asyncArtifacts int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT (SELECT count(*) FROM information_schema.tables
+		        WHERE table_name IN ('async_jobs','async_job_results','idempotency_keys'))
+		     + (SELECT count(*) FROM information_schema.table_constraints
+		        WHERE constraint_name='uq_subjects_id_tenant')`).Scan(&asyncArtifacts); err != nil {
+		t.Fatalf("0006 down check: %v", err)
+	}
+	if asyncArtifacts != 0 {
+		t.Fatalf("0006 down migration left async artifacts behind: %d", asyncArtifacts)
+	}
+
 	// Roll back 0005 through the tool and confirm the model-control-plane
 	// artifacts are gone.
 	if err := m.Steps(-1); err != nil {
@@ -553,7 +633,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	var artifacts int
 	if err := mdb.QueryRowContext(ctx, `
 		SELECT (SELECT count(*) FROM information_schema.columns
-		        WHERE table_name='llm_requests' AND column_name IN ('trace_id','cost_micros','route_attempts','protocol'))
+		        WHERE table_name='llm_requests' AND column_name IN ('trace_id','cost_micros','route_attempts'))
 		     + (SELECT count(*) FROM information_schema.tables
 		        WHERE table_name IN ('admin_audit'))`).Scan(&artifacts); err != nil {
 		t.Fatalf("artifact check: %v", err)
@@ -564,11 +644,356 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("down migration left unexpected artifacts: %d", artifacts)
 	}
 
-	// Re-apply forward to prove version tracking recovers cleanly.
+	// Roll back 0002: the V1.1 production tables and lifecycle columns are
+	// gone and only the 0001 baseline remains.
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0002: %v", err)
+	}
+	requireVersion(t, m, 1, false)
+	var v11Artifacts int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT (SELECT count(*) FROM information_schema.tables
+		        WHERE table_name IN ('providers','model_routes'))
+		     + (SELECT count(*) FROM information_schema.columns
+		        WHERE table_name='llm_requests' AND column_name IN ('trace_id','cost_micros','route_attempts'))
+		     + (SELECT count(*) FROM information_schema.columns
+		        WHERE table_name='api_keys' AND column_name IN ('tenant_id','rotated_from','revoked_at'))`).Scan(&v11Artifacts); err != nil {
+		t.Fatalf("0002 down check: %v", err)
+	}
+	if v11Artifacts != 0 {
+		t.Fatalf("0002 down migration left V1.1 artifacts behind: %d", v11Artifacts)
+	}
+
+	// Roll back 0001: the database is completely empty.
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0001: %v", err)
+	}
+	if _, _, err := m.Version(); !errors.Is(err, migrate.ErrNilVersion) {
+		t.Fatalf("after full rollback Version() = %v, want ErrNilVersion", err)
+	}
+	var baselineTables int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_name IN ('tenants','subjects','api_keys','model_catalog','access_policies','llm_requests')`).Scan(&baselineTables); err != nil {
+		t.Fatalf("0001 down check: %v", err)
+	}
+	if baselineTables != 0 {
+		t.Fatalf("0001 down migration left %d baseline tables behind", baselineTables)
+	}
+
+	// Re-apply forward to prove version tracking recovers cleanly through the
+	// whole chain (0001-0009).
 	if err := m.Up(); err != nil {
 		t.Fatalf("re-up: %v", err)
 	}
+	requireVersion(t, m, 9, false)
+}
+
+// TestVersion5UpgradePath proves the V1.4 rollout contract: an existing
+// version-5 (V1.3) deployment upgrades in place — the version-5 schema is
+// startable and readable by the V1.3 gateway store paths before any V1.4
+// migration runs, and applying 0006-0009 on top keeps every V1.3 artifact
+// intact. It requires a real PostgreSQL instance.
+func TestVersion5UpgradePath(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping PostgreSQL migration test")
+	}
+	ctx := context.Background()
+	lockTestDatabase(t, dsn)
+
+	mdb, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("migrate connect: %v", err)
+	}
+	defer mdb.Close()
+	_, _ = mdb.ExecContext(ctx, "DROP TABLE IF EXISTS schema_migrations")
+	_, _ = mdb.ExecContext(ctx, `DROP TABLE IF EXISTS data_exports, archive_runs, retention_policies,
+		admin_credentials, budget_policies, usage_ledger, pricing_catalog,
+		idempotency_keys, async_job_results, async_jobs,
+		llm_requests, access_policies, model_routes, model_catalog, api_keys, subjects, tenants, providers, admin_audit CASCADE`)
+
+	m := newTestMigrator(t, mdb)
+
+	// Migrate to exactly version 5 — the shipped V1.3 schema — and prove the
+	// gateway store paths work against it with zero V1.4 knowledge.
+	if err := m.Migrate(5); err != nil {
+		t.Fatalf("migrate to version 5: %v", err)
+	}
 	requireVersion(t, m, 5, false)
+	pgw, err := Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool connect at version 5: %v", err)
+	}
+	catalog, err := pgw.LoadCatalog(ctx)
+	if err != nil || len(catalog) != 1 || catalog[0].PublicName != "gateway-echo" {
+		t.Fatalf("version-5 catalog = %+v err=%v", catalog, err)
+	}
+	if _, err := pgw.LoadLimits(ctx); err != nil {
+		t.Fatalf("version-5 limits load: %v", err)
+	}
+	pgw.Close()
+
+	// Apply the V1.4 chain on top: pure upgrade, V1.3 artifacts intact.
+	if err := m.Up(); err != nil {
+		t.Fatalf("upgrade 5 -> head: %v", err)
+	}
+	requireVersion(t, m, 9, false)
+	var v13Artifacts int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT (SELECT count(*) FROM information_schema.columns
+		        WHERE table_name='llm_requests' AND column_name IN ('first_token_millis','protocol','trace_id'))
+		     + (SELECT count(*) FROM information_schema.columns
+		        WHERE table_name='access_policies' AND column_name IN ('default_model','default_embedding_model'))`).Scan(&v13Artifacts); err != nil {
+		t.Fatalf("v1.3 artifact check: %v", err)
+	}
+	if v13Artifacts != 5 {
+		t.Fatalf("upgrade must keep V1.3 columns intact, found %d/5", v13Artifacts)
+	}
+	// And the gateway store paths still work after the upgrade.
+	pgw, err = Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool connect at head: %v", err)
+	}
+	defer pgw.Close()
+	catalog, err = pgw.LoadCatalog(ctx)
+	if err != nil || len(catalog) != 1 || catalog[0].PublicName != "gateway-echo" {
+		t.Fatalf("post-upgrade catalog = %+v err=%v", catalog, err)
+	}
+}
+
+// TestV14SchemaConstraints proves the V1.4 invariants are enforced at the
+// database boundary: closed state sets, duplicate idempotency and final
+// settlement keys, cross-owner foreign keys, negative amounts, malformed
+// scopes, and degenerate lifecycle timestamps all fail to insert. It requires
+// a real PostgreSQL instance.
+func TestV14SchemaConstraints(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping PostgreSQL migration test")
+	}
+	ctx := context.Background()
+	lockTestDatabase(t, dsn)
+
+	mdb, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("migrate connect: %v", err)
+	}
+	defer mdb.Close()
+	_, _ = mdb.ExecContext(ctx, "DROP TABLE IF EXISTS schema_migrations")
+	_, _ = mdb.ExecContext(ctx, `DROP TABLE IF EXISTS data_exports, archive_runs, retention_policies,
+		admin_credentials, budget_policies, usage_ledger, pricing_catalog,
+		idempotency_keys, async_job_results, async_jobs,
+		llm_requests, access_policies, model_routes, model_catalog, api_keys, subjects, tenants, providers, admin_audit CASCADE`)
+
+	m := newTestMigrator(t, mdb)
+	if err := m.Up(); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	requireVersion(t, m, 9, false)
+
+	// Fixture rows: a second tenant so cross-owner attempts have a target.
+	for _, stmt := range []string{
+		`INSERT INTO tenants (id, name) VALUES ('tenant_other', 'Other Tenant')`,
+		`INSERT INTO subjects (id, tenant_id) VALUES ('subject_other', 'tenant_other')`,
+		`INSERT INTO model_catalog (public_name, provider, upstream_model, capabilities)
+			VALUES ('model-constraint', 'fake-primary', 'upstream-constraint', '{}')`,
+		`INSERT INTO async_jobs (job_id, subject_id, tenant_id, protocol, public_model, request_digest, status)
+			VALUES ('job_ok', 'subject_default', 'tenant_default', 'responses', 'gateway-echo', 'digest-ok', 'queued')`,
+	} {
+		if _, err := mdb.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("fixture: %v: %v", stmt, err)
+		}
+	}
+
+	// rejected runs stmt and asserts it fails with a PostgreSQL constraint
+	// violation (check, unique, or foreign key) rather than inserting.
+	rejected := func(t *testing.T, name, stmt string, args ...any) {
+		t.Helper()
+		if _, err := mdb.ExecContext(ctx, stmt, args...); err == nil {
+			t.Fatalf("%s: insert must be rejected at the database boundary", name)
+		}
+	}
+
+	// --- 0006 async core -----------------------------------------------------
+	rejected(t, "invalid job status", `INSERT INTO async_jobs
+		(job_id, subject_id, tenant_id, protocol, public_model, request_digest, status)
+		VALUES ('job_bad_status', 'subject_default', 'tenant_default', 'responses', 'gateway-echo', 'd1', 'waiting')`)
+	rejected(t, "invalid job protocol", `INSERT INTO async_jobs
+		(job_id, subject_id, tenant_id, protocol, public_model, request_digest, status)
+		VALUES ('job_bad_proto', 'subject_default', 'tenant_default', 'completions', 'gateway-echo', 'd2', 'queued')`)
+	rejected(t, "job subject from another tenant (cross-owner FK)", `INSERT INTO async_jobs
+		(job_id, subject_id, tenant_id, protocol, public_model, request_digest, status)
+		VALUES ('job_cross', 'subject_other', 'tenant_default', 'responses', 'gateway-echo', 'd3', 'queued')`)
+	rejected(t, "unknown job subject", `INSERT INTO async_jobs
+		(job_id, subject_id, tenant_id, protocol, public_model, request_digest, status)
+		VALUES ('job_nosubj', 'subject_missing', 'tenant_default', 'responses', 'gateway-echo', 'd4', 'queued')`)
+	rejected(t, "negative attempt count", `INSERT INTO async_jobs
+		(job_id, subject_id, tenant_id, protocol, public_model, request_digest, status, attempt_count)
+		VALUES ('job_neg', 'subject_default', 'tenant_default', 'responses', 'gateway-echo', 'd5', 'queued', -1)`)
+
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO idempotency_keys
+		(id, subject_id, key_hash, request_digest, job_id, expires_at)
+		VALUES ('idem_1', 'subject_default', 'hash-a', 'digest-ok', 'job_ok', now() + interval '1 day')`); err != nil {
+		t.Fatalf("idempotency fixture: %v", err)
+	}
+	rejected(t, "duplicate idempotency (subject, key hash)", `INSERT INTO idempotency_keys
+		(id, subject_id, key_hash, request_digest, job_id, expires_at)
+		VALUES ('idem_dup', 'subject_default', 'hash-a', 'digest-other', 'job_ok', now() + interval '1 day')`)
+
+	// --- 0007 cost governance --------------------------------------------------
+	rejected(t, "negative input price", `INSERT INTO pricing_catalog
+		(provider, public_model, price_version, currency, input_micros_per_token, output_micros_per_token, effective_from)
+		VALUES ('fake-primary', 'gateway-echo', 1, 'USD', -1, 0, now())`)
+	rejected(t, "negative output price", `INSERT INTO pricing_catalog
+		(provider, public_model, price_version, currency, input_micros_per_token, output_micros_per_token, effective_from)
+		VALUES ('fake-primary', 'gateway-echo', 1, 'USD', 0, -5, now())`)
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO pricing_catalog
+		(provider, public_model, price_version, currency, input_micros_per_token, output_micros_per_token, effective_from)
+		VALUES ('fake-primary', 'gateway-echo', 1, 'USD', 3, 12, now())`); err != nil {
+		t.Fatalf("price fixture: %v", err)
+	}
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO pricing_catalog
+		(provider, public_model, price_version, currency, input_micros_per_token, output_micros_per_token, effective_from)
+		VALUES ('fake-primary', 'gateway-echo', 2, 'USD', 2, 10, now())`); err != nil {
+		t.Fatalf("second price fixture: %v", err)
+	}
+	rejected(t, "duplicate price version", `INSERT INTO pricing_catalog
+		(provider, public_model, price_version, currency, input_micros_per_token, output_micros_per_token, effective_from)
+		VALUES ('fake-primary', 'gateway-echo', 2, 'USD', 1, 9, now())`)
+	rejected(t, "malformed currency", `INSERT INTO pricing_catalog
+		(provider, public_model, price_version, currency, input_micros_per_token, output_micros_per_token, effective_from)
+		VALUES ('fake-primary', 'gateway-echo', 3, 'dollars', 1, 9, now())`)
+
+	rejected(t, "negative cost", `INSERT INTO usage_ledger
+		(request_id, subject_id, tenant_id, protocol, public_model, price_version, currency, cost_micros, settle_status, settled_at)
+		VALUES ('req_negcost', 'subject_default', 'tenant_default', 'chat', 'gateway-echo', 1, 'USD', -9, 'settled', now())`)
+	rejected(t, "invalid settle status", `INSERT INTO usage_ledger
+		(request_id, subject_id, tenant_id, protocol, public_model, settle_status)
+		VALUES ('req_badstatus', 'subject_default', 'tenant_default', 'chat', 'gateway-echo', 'pending')`)
+	rejected(t, "cost settled without a price version", `INSERT INTO usage_ledger
+		(request_id, subject_id, tenant_id, protocol, public_model, cost_micros, settle_status, settled_at)
+		VALUES ('req_noversion', 'subject_default', 'tenant_default', 'chat', 'gateway-echo', 5, 'settled', now())`)
+	rejected(t, "settled without settled_at", `INSERT INTO usage_ledger
+		(request_id, subject_id, tenant_id, protocol, public_model, price_version, currency, cost_micros, settle_status)
+		VALUES ('req_nostamp', 'subject_default', 'tenant_default', 'chat', 'gateway-echo', 1, 'USD', 5, 'settled')`)
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO usage_ledger
+		(request_id, subject_id, tenant_id, protocol, public_model, price_version, currency, prompt_tokens, cost_micros, settle_status, settled_at)
+		VALUES ('req_settle', 'subject_default', 'tenant_default', 'chat', 'gateway-echo', 1, 'USD', 10, 30, 'settled', now())`); err != nil {
+		t.Fatalf("settled ledger fixture: %v", err)
+	}
+	// The same request identity must never produce a second final record.
+	rejected(t, "duplicate final settlement for one request", `INSERT INTO usage_ledger
+		(request_id, subject_id, tenant_id, protocol, public_model, price_version, currency, prompt_tokens, cost_micros, settle_status, settled_at)
+		VALUES ('req_settle', 'subject_default', 'tenant_default', 'chat', 'gateway-echo', 1, 'USD', 10, 30, 'settled', now())`)
+	// A released row for the same identity is fine (reserve -> release ->
+	// reserve -> settle is a legal lifecycle).
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO usage_ledger
+		(request_id, subject_id, tenant_id, protocol, public_model, settle_status)
+		VALUES ('req_settle', 'subject_default', 'tenant_default', 'chat', 'gateway-echo', 'released')`); err != nil {
+		t.Fatalf("released row for a settled identity must be allowed: %v", err)
+	}
+	// Unknown cost (NULL cost_micros) with known tokens never violates; it is
+	// the explicit unknown representation.
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO usage_ledger
+		(request_id, subject_id, tenant_id, protocol, public_model, prompt_tokens, settle_status, settled_at)
+		VALUES ('req_unknown_cost', 'subject_default', 'tenant_default', 'chat', 'gateway-echo', 7, 'settled', now())`); err != nil {
+		t.Fatalf("costless settled row (unknown pricing) must be allowed: %v", err)
+	}
+
+	rejected(t, "negative budget amount", `INSERT INTO budget_policies
+		(scope, subject_id, tenant_id, period, amount_micros, currency)
+		VALUES ('subject', 'subject_default', 'tenant_default', 'daily', -100, 'USD')`)
+	rejected(t, "zero budget amount", `INSERT INTO budget_policies
+		(scope, subject_id, tenant_id, period, amount_micros, currency)
+		VALUES ('subject', 'subject_default', 'tenant_default', 'daily', 0, 'USD')`)
+	rejected(t, "invalid budget period", `INSERT INTO budget_policies
+		(scope, subject_id, tenant_id, period, amount_micros, currency)
+		VALUES ('subject', 'subject_default', 'tenant_default', 'weekly', 100, 'USD')`)
+	rejected(t, "subject budget without a subject", `INSERT INTO budget_policies
+		(scope, subject_id, tenant_id, period, amount_micros, currency)
+		VALUES ('subject', NULL, 'tenant_default', 'daily', 100, 'USD')`)
+	rejected(t, "tenant budget carrying a subject", `INSERT INTO budget_policies
+		(scope, subject_id, tenant_id, period, amount_micros, currency)
+		VALUES ('tenant', 'subject_default', 'tenant_default', 'daily', 100, 'USD')`)
+	rejected(t, "budget subject from another tenant (cross-owner FK)", `INSERT INTO budget_policies
+		(scope, subject_id, tenant_id, period, amount_micros, currency)
+		VALUES ('subject', 'subject_other', 'tenant_default', 'daily', 100, 'USD')`)
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO budget_policies
+		(scope, subject_id, tenant_id, period, amount_micros, currency)
+		VALUES ('subject', 'subject_default', 'tenant_default', 'daily', 1000, 'USD')`); err != nil {
+		t.Fatalf("budget fixture: %v", err)
+	}
+	rejected(t, "duplicate budget target", `INSERT INTO budget_policies
+		(scope, subject_id, tenant_id, period, amount_micros, currency)
+		VALUES ('subject', 'subject_default', 'tenant_default', 'daily', 2000, 'USD')`)
+
+	// --- 0008 admin identity ------------------------------------------------
+	rejected(t, "malformed scope", `INSERT INTO admin_credentials
+		(id, admin_subject, credential_hash, credential_prefix, scopes, status)
+		VALUES ('ac_1', 'admin-a', '\x00'::bytea, 'kbap_', ARRAY['root'], 'active')`)
+	rejected(t, "invented privileged scope", `INSERT INTO admin_credentials
+		(id, admin_subject, credential_hash, credential_prefix, scopes, status)
+		VALUES ('ac_2', 'admin-a', '\x01'::bytea, 'kbap_', ARRAY['superuser'], 'active')`)
+	rejected(t, "empty scope set", `INSERT INTO admin_credentials
+		(id, admin_subject, credential_hash, credential_prefix, scopes, status)
+		VALUES ('ac_3', 'admin-a', '\x02'::bytea, 'kbap_', ARRAY[]::text[], 'active')`)
+	rejected(t, "mixed valid and malformed scopes", `INSERT INTO admin_credentials
+		(id, admin_subject, credential_hash, credential_prefix, scopes, status)
+		VALUES ('ac_4', 'admin-a', '\x03'::bytea, 'kbap_', ARRAY['viewer', 'wizard'], 'active')`)
+	rejected(t, "invalid credential status", `INSERT INTO admin_credentials
+		(id, admin_subject, credential_hash, credential_prefix, scopes, status)
+		VALUES ('ac_5', 'admin-a', '\x04'::bytea, 'kbap_', ARRAY['viewer'], 'disabled')`)
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO admin_credentials
+		(id, admin_subject, credential_hash, credential_prefix, scopes, status, tenant_id)
+		VALUES ('ac_ok', 'tenant-admin', '\x05'::bytea, 'kbap_', ARRAY['viewer', 'billing'], 'active', 'tenant_default')`); err != nil {
+		t.Fatalf("admin credential fixture: %v", err)
+	}
+	rejected(t, "duplicate credential hash", `INSERT INTO admin_credentials
+		(id, admin_subject, credential_hash, credential_prefix, scopes, status)
+		VALUES ('ac_dup', 'admin-b', '\x05'::bytea, 'kbap_', ARRAY['viewer'], 'active')`)
+
+	// --- 0009 lifecycle metadata --------------------------------------------
+	rejected(t, "retention on an unmanaged table", `INSERT INTO retention_policies (table_name, ttl_seconds)
+		VALUES ('tenants', 3600)`)
+	rejected(t, "zero retention TTL", `INSERT INTO retention_policies (table_name, ttl_seconds)
+		VALUES ('llm_requests', 0)`)
+	rejected(t, "negative retention TTL", `INSERT INTO retention_policies (table_name, ttl_seconds)
+		VALUES ('llm_requests', -1)`)
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO retention_policies (table_name, ttl_seconds)
+		VALUES ('llm_requests', 86400)`); err != nil {
+		t.Fatalf("retention fixture: %v", err)
+	}
+	rejected(t, "invalid archive status", `INSERT INTO archive_runs (table_name, status)
+		VALUES ('llm_requests', 'cancelled')`)
+	rejected(t, "negative archived row count", `INSERT INTO archive_runs (table_name, status, rows_archived)
+		VALUES ('llm_requests', 'completed', -1)`)
+	rejected(t, "terminal archive run without finished_at", `INSERT INTO archive_runs (table_name, status)
+		VALUES ('llm_requests', 'completed')`)
+	rejected(t, "invalid export status", `INSERT INTO data_exports (id, requested_by, tenant_id, status)
+		VALUES ('dx_1', 'ops', 'tenant_default', 'running')`)
+	rejected(t, "completed export without completed_at", `INSERT INTO data_exports (id, requested_by, tenant_id, status)
+		VALUES ('dx_2', 'ops', 'tenant_default', 'completed')`)
+
+	// Cleanup: leave the shared database at head, as the other tests expect.
+	for _, stmt := range []string{
+		`DELETE FROM data_exports`,
+		`DELETE FROM archive_runs`,
+		`DELETE FROM retention_policies`,
+		`DELETE FROM admin_credentials`,
+		`DELETE FROM budget_policies`,
+		`DELETE FROM usage_ledger`,
+		`DELETE FROM pricing_catalog`,
+		`DELETE FROM idempotency_keys`,
+		`DELETE FROM async_jobs`,
+		`DELETE FROM model_catalog WHERE public_name = 'model-constraint'`,
+		`DELETE FROM subjects WHERE id = 'subject_other'`,
+		`DELETE FROM tenants WHERE id = 'tenant_other'`,
+	} {
+		if _, err := mdb.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("cleanup: %v: %v", stmt, err)
+		}
+	}
 }
 
 // int64Ptr is a test helper for optional audit fields.
