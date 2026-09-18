@@ -27,6 +27,25 @@ gated on `TEST_DATABASE_URL`. New migrations must also keep
 `TestMigrationFilesParse` passing: complete up/down pairs, golang-migrate
 naming.
 
+### Convention: Migration batches walk every down boundary and freeze wire first
+
+**What**: When a task lands a batch of migrations (e.g. the V1.4 0006-0009
+foundation), the env-gated lifecycle test must (a) walk **every** down
+boundary (9→8→…→0) with per-boundary artifact checks, not just one step,
+then re-up; (b) include an upgrade-path test from the previous release
+version (e.g. fresh up to exactly version 5, V1.3 store reads work, upgrade,
+reads still work); and (c) prove schema invariants (closed state sets,
+uniqueness, owner-scoped FKs, money checks) with DB-level rejection tests,
+not application logic. Wire behavior is frozen with golden fixtures
+**before** feature children start.
+
+**Why**: Constraint regressions and partial-down corruption are invisible to
+single-step tests; the golden freeze catches accidental wire drift across a
+long roadmap.
+
+**Boundary**: Never edit applied migrations; edits to a not-yet-merged batch
+after a PostgreSQL rehearsal require a fresh full down-boundary run.
+
 ### Convention: Multi-row subject policies fold deterministically
 
 **What**: A subject may have one `access_policies` row per granted model.
