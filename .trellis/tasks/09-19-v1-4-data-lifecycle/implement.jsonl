@@ -1,0 +1,3 @@
+{"file":"docs/v1.4-operations-and-async-roadmap.md","reason":"TTL, partition, archive, query, and export requirements."}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Migration ownership, transactions, and PostgreSQL constraints."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace data contracts from database through export boundary."}
