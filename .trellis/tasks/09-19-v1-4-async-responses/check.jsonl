@@ -1,0 +1,3 @@
+{"file":"docs/v1.4-operations-and-async-roadmap.md","reason":"Validate states, ownership, idempotency, expiry, and recovery."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Auth ordering, bounded resources, race tests, and provider contracts."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Ensure stored/logged async metadata excludes sensitive content."}
