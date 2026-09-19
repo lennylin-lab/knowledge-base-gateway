@@ -1,0 +1,3 @@
+{"file":"docs/v1.4-operations-and-async-roadmap.md","reason":"Admin roles, credential lifecycle, tenant isolation, and audit contract."}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Credential hashing, transactional persistence, and schema conventions."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Atomic management mutation/audit and authentication conventions."}
