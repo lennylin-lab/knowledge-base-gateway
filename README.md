@@ -221,7 +221,7 @@ in errors.
 | `GATEWAY_DATABASE_URL` | – | PostgreSQL DSN; enables persistent keys/catalog/routes/policies/audit |
 | `GATEWAY_LIMITS_MODE` | `local` | `local` (dev-only, single instance) or `redis`; selects the backing store for rate/concurrency limits and token quotas |
 | `GATEWAY_REDIS_ADDR` | `127.0.0.1:6379` | Redis address for distributed limits |
-| `GATEWAY_ADMIN_TOKEN` | – | Bearer token for the admin API (admin API disabled when unset) |
+| `GATEWAY_ADMIN_TOKEN` | – | Legacy bootstrap bearer token for the admin API (platform-admin). In database mode the admin API also runs without it once scoped admin credentials exist; see `docs/admin-rbac.md` |
 | `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
 | `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | – | Anthropic credentials (env only); per-provider override `ANTHROPIC_API_KEY__<PROVIDER_NAME>` |
@@ -229,8 +229,15 @@ in errors.
 
 ### Admin API
 
-Token-gated (`Authorization: Bearer $GATEWAY_ADMIN_TOKEN`):
+Authenticated per the V1.4 admin identity model (see
+`docs/admin-rbac.md`): scoped admin credentials (`kba_...`, minted through
+`/admin/admins`, checked against a per-route scope) plus the legacy
+`GATEWAY_ADMIN_TOKEN` as the platform-admin bootstrap identity during the
+migration — both paths stay live until scoped credentials are
+production-verified (`Authorization: Bearer ...`):
 
+- `POST /admin/admins` `{"admin_subject":"ops","scopes":["operator"],"tenant_id":"...","expires_in_hours":24}` — mints a scoped admin credential; plaintext returned exactly once
+- `GET /admin/admins`, `POST /admin/admins/{id}/rotate`, `POST /admin/admins/{id}/revoke`
 - `POST /admin/keys` `{"subject":"svc","tenant_id":"...","expires_in_hours":24}` — returns the plaintext key exactly once
 - `GET /admin/keys?subject=svc` — metadata only (prefix, status, timestamps)
 - `POST /admin/keys/{id}/rotate` — new plaintext, old key revoked
