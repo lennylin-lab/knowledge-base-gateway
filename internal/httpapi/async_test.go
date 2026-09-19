@@ -267,6 +267,13 @@ func (s ctxFaithfulStore) QueueDepth(ctx context.Context) (int, error) {
 	return s.inner.QueueDepth(ctx)
 }
 
+func (s ctxFaithfulStore) QueueOldestAge(ctx context.Context) (time.Duration, error) {
+	if err := s.check(ctx); err != nil {
+		return 0, err
+	}
+	return s.inner.QueueOldestAge(ctx)
+}
+
 func (s ctxFaithfulStore) Ready(ctx context.Context) error {
 	if err := s.check(ctx); err != nil {
 		return err

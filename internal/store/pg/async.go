@@ -19,17 +19,20 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/async"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/tracing"
 )
 
 const jobColumns = `job_id, subject_id, tenant_id, protocol, public_model,
 	request_digest, status, attempt_count, lease_owner, lease_expires_at,
-	final_request_id, result_expires_at, created_at, updated_at`
+	final_request_id, result_expires_at, created_at, updated_at,
+	trace_id, parent_span_id, trace_sampled`
 
 // jobColumnsQualified is jobColumns with the async_jobs alias applied, for
 // the idempotency JOIN.
 const jobColumnsQualified = `j.job_id, j.subject_id, j.tenant_id, j.protocol, j.public_model,
 	j.request_digest, j.status, j.attempt_count, j.lease_owner, j.lease_expires_at,
-	j.final_request_id, j.result_expires_at, j.created_at, j.updated_at`
+	j.final_request_id, j.result_expires_at, j.created_at, j.updated_at,
+	j.trace_id, j.parent_span_id, j.trace_sampled`
 
 // AsyncStore implements async.Store on top of the connection pool. It is a
 // distinct wrapper type because DB itself already carries the auth-lifecycle
@@ -45,7 +48,8 @@ func scanJob(scan func(dest ...any) error) (async.Job, error) {
 	var leaseExpires, resultExpires *time.Time
 	if err := scan(&j.ID, &j.SubjectID, &j.TenantID, &j.Protocol, &j.PublicModel,
 		&j.RequestDigest, &j.Status, &j.AttemptCount, &leaseOwner, &leaseExpires,
-		&finalRequestID, &resultExpires, &j.CreatedAt, &j.UpdatedAt); err != nil {
+		&finalRequestID, &resultExpires, &j.CreatedAt, &j.UpdatedAt,
+		&j.TraceID, &j.ParentSpanID, &j.TraceSampled); err != nil {
 		return async.Job{}, err
 	}
 	if leaseOwner != nil {
@@ -129,13 +133,23 @@ func (s AsyncStore) createOnce(ctx context.Context, in async.CreateInput) (out a
 		Protocol: in.Protocol, PublicModel: in.PublicModel,
 		RequestDigest: in.RequestDigest, Status: async.StatusQueued,
 		CreatedAt: in.Now, UpdatedAt: in.Now,
+		// Persist only normalized trace identity: anything that is not a
+		// well-formed lowercase-hex W3C pair collapses to empty before it can
+		// reach the row (internal/tracing owns the shape contract).
+		TraceID: in.TraceID, ParentSpanID: in.SpanID, TraceSampled: in.TraceSampled,
+	}
+	if tc, ok := tracing.Normalize(j.TraceID, j.ParentSpanID); ok {
+		j.TraceID, j.ParentSpanID = tc.TraceID, tc.SpanID
+	} else {
+		j.TraceID, j.ParentSpanID, j.TraceSampled = "", "", false
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO async_jobs (job_id, subject_id, tenant_id, protocol, public_model,
-			request_digest, status, created_at, updated_at, visible_at)
-		VALUES ($1,$2,$3,$4,$5,$6,'queued',$7,$7,$7)`,
+			request_digest, status, created_at, updated_at, visible_at,
+			trace_id, parent_span_id, trace_sampled)
+		VALUES ($1,$2,$3,$4,$5,$6,'queued',$7,$7,$7,$8,$9,$10)`,
 		j.ID, j.SubjectID, j.TenantID, j.Protocol, j.PublicModel,
-		j.RequestDigest, in.Now); err != nil {
+		j.RequestDigest, in.Now, j.TraceID, j.ParentSpanID, j.TraceSampled); err != nil {
 		return async.CreateOutcome{}, false, unavailable(err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -651,6 +665,19 @@ func (s AsyncStore) QueueDepth(ctx context.Context) (int, error) {
 		return 0, unavailable(err)
 	}
 	return n, nil
+}
+
+// QueueOldestAge implements async.Store: the age of the oldest queued job in
+// seconds (0 when the queue is empty), measured against the database clock so
+// the gauge stays correct across process clock skew.
+func (s AsyncStore) QueueOldestAge(ctx context.Context) (time.Duration, error) {
+	var secs float64
+	if err := s.DB.Pool.QueryRow(ctx, `
+		SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)
+		FROM async_jobs WHERE status = 'queued'`).Scan(&secs); err != nil {
+		return 0, unavailable(err)
+	}
+	return time.Duration(secs * float64(time.Second)), nil
 }
 
 // SweepExpiredIdempotencyKeys implements async.Store: removes idempotency

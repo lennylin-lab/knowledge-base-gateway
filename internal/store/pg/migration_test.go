@@ -79,7 +79,7 @@ func requireVersion(t *testing.T, m *migrate.Migrate, want uint, dirty bool) {
 // versioned migration tool (fresh up to the latest version, second up as a
 // no-op), exercises the key lifecycle, audit, and V1.2 management stores on
 // the real schema, then rolls every boundary back down to the empty database
-// (0011 through 0001) verifying each down script removes exactly its own
+// (0012 through 0001) verifying each down script removes exactly its own
 // artifacts, and re-applies the whole chain to confirm version tracking. It
 // requires a real PostgreSQL instance and is skipped when TEST_DATABASE_URL
 // is not set. The V1.4-specific upgrade path and schema constraints live in
@@ -110,7 +110,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	requireVersion(t, m, 11, false)
+	requireVersion(t, m, 12, false)
 	if err := m.Up(); !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("second up must be a no-op, got %v", err)
 	}
@@ -534,6 +534,21 @@ func TestMigrationsAndStores(t *testing.T) {
 	// Roll back each V1.4 migration one boundary at a time and confirm every
 	// down script removes exactly its own artifacts.
 	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0012: %v", err)
+	}
+	requireVersion(t, m, 11, false)
+	var traceArtifacts int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_name = 'async_jobs'
+		  AND column_name IN ('trace_id', 'parent_span_id')`).Scan(&traceArtifacts); err != nil {
+		t.Fatalf("0012 down check: %v", err)
+	}
+	if traceArtifacts != 0 {
+		t.Fatal("0012 down migration left the job trace-context columns behind")
+	}
+
+	if err := m.Steps(-1); err != nil {
 		t.Fatalf("roll back 0011: %v", err)
 	}
 	requireVersion(t, m, 10, false)
@@ -712,11 +727,11 @@ func TestMigrationsAndStores(t *testing.T) {
 	}
 
 	// Re-apply forward to prove version tracking recovers cleanly through the
-	// whole chain (0001-0011).
+	// whole chain (0001-0012).
 	if err := m.Up(); err != nil {
 		t.Fatalf("re-up: %v", err)
 	}
-	requireVersion(t, m, 11, false)
+	requireVersion(t, m, 12, false)
 }
 
 // TestVersion5UpgradePath proves the V1.4 rollout contract: an existing
@@ -768,7 +783,7 @@ func TestVersion5UpgradePath(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("upgrade 5 -> head: %v", err)
 	}
-	requireVersion(t, m, 11, false)
+	requireVersion(t, m, 12, false)
 	var v13Artifacts int
 	if err := mdb.QueryRowContext(ctx, `
 		SELECT (SELECT count(*) FROM information_schema.columns
@@ -820,7 +835,7 @@ func TestV14SchemaConstraints(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	requireVersion(t, m, 11, false)
+	requireVersion(t, m, 12, false)
 
 	// Fixture rows: a second tenant so cross-owner attempts have a target.
 	for _, stmt := range []string{

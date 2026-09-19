@@ -70,6 +70,15 @@ type Job struct {
 	ResultExpiresAt time.Time // zero until a terminal result exists
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+	// TraceID/ParentSpanID are the normalized W3C identity of the enqueue
+	// span (lowercase hex, validated before persistence; empty when the job
+	// was created without an active trace). TraceSampled carries the caller's
+	// sampling decision. Metadata only: the worker joins its execution spans
+	// to the caller's trace through them. Baggage and any request content
+	// are never persisted here.
+	TraceID      string
+	ParentSpanID string
+	TraceSampled bool
 }
 
 // Usage carries optional token counts for a stored result. A nil count stays
@@ -95,6 +104,8 @@ type Result struct {
 // CreateInput carries everything creation persists atomically: the job row,
 // its request snapshot, and the optional idempotency mapping. KeyHash is the
 // subject-scoped hash of the caller's Idempotency-Key ("" when none was sent).
+// TraceID/SpanID carry the pre-normalized W3C trace identity of the enqueue
+// span ("" when absent); stores must persist only normalized values.
 type CreateInput struct {
 	JobID         string
 	SubjectID     string
@@ -104,6 +115,9 @@ type CreateInput struct {
 	RequestDigest string
 	Request       json.RawMessage
 	KeyHash       string
+	TraceID       string
+	SpanID        string
+	TraceSampled  bool
 	ResultTTL     time.Duration
 	KeyTTL        time.Duration
 	Now           time.Time
@@ -181,6 +195,10 @@ type Store interface {
 	SweepExpiredIdempotencyKeys(ctx context.Context, now time.Time) (int, error)
 	// QueueDepth reports the number of queued jobs (operational metric).
 	QueueDepth(ctx context.Context) (int, error)
+	// QueueOldestAge reports the age of the oldest queued job (0 when the
+	// queue is empty) for the scrape-time queue-age gauge and queue-health
+	// readiness check.
+	QueueOldestAge(ctx context.Context) (time.Duration, error)
 	// Ready reports store health for /readyz.
 	Ready(ctx context.Context) error
 }

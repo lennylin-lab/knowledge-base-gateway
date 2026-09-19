@@ -588,3 +588,98 @@ func TestAsyncStoreUnavailable(t *testing.T) {
 		t.Fatalf("claim outage err = %v, want ErrUnavailable", err)
 	}
 }
+
+// TestAsyncTraceContextRoundTrip proves the observability contract on the
+// real schema: the normalized W3C trace context (trace ID, parent span ID,
+// sampled bit) survives the create/claim round trip so the worker joins the
+// caller's trace, and a malformed pair persists as empty (normalization
+// happens at the store boundary).
+func TestAsyncTraceContextRoundTrip(t *testing.T) {
+	s, db := newAsyncTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	in := asyncCreateInput("job-trace-ok", now)
+	in.TraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	in.SpanID = "00f067aa0ba902b7"
+	in.TraceSampled = true
+	out, err := s.Create(ctx, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	job, err := s.Get(ctx, out.Job.ID, now)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if job.TraceID != in.TraceID || job.ParentSpanID != in.SpanID || !job.TraceSampled {
+		t.Fatalf("trace context not persisted: %+v", job)
+	}
+
+	// Claim returns the same identity: the worker's linkage input.
+	claimed, ok, err := s.Claim(ctx, async.ClaimInput{Owner: "w-trace", Lease: time.Minute, Now: now})
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if claimed.Job.TraceID != in.TraceID || claimed.Job.ParentSpanID != in.SpanID || !claimed.Job.TraceSampled {
+		t.Fatalf("claimed job lost its trace context: %+v", claimed.Job)
+	}
+
+	// A malformed pair is normalized to empty at the store boundary.
+	bad := asyncCreateInput("job-trace-bad", now)
+	bad.TraceID = "4BF92F3577B34DA6A3CE929D0E0E4736" // uppercase: rejected
+	bad.SpanID = "'; DROP TABLE async_jobs; --"      // not hex: rejected
+	if _, err := db.Exec(`DELETE FROM async_jobs WHERE job_id = 'job-trace-bad'`); err != nil {
+		t.Fatalf("pre-clean: %v", err)
+	}
+	out, err = s.Create(ctx, bad)
+	if err != nil {
+		t.Fatalf("create bad: %v", err)
+	}
+	job, err = s.Get(ctx, out.Job.ID, now)
+	if err != nil {
+		t.Fatalf("get bad: %v", err)
+	}
+	if job.TraceID != "" || job.ParentSpanID != "" || job.TraceSampled {
+		t.Fatalf("malformed trace context must persist as empty: %+v", job)
+	}
+}
+
+// TestAsyncQueueOldestAge proves the scrape-time queue-age signal on the
+// real schema: 0 on an empty queue, positive for a queued job, and
+// unchanged by a terminal job's presence.
+func TestAsyncQueueOldestAge(t *testing.T) {
+	s, db := newAsyncTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if age, err := s.QueueOldestAge(ctx); err != nil || age != 0 {
+		t.Fatalf("empty queue age = %v err=%v, want 0", age, err)
+	}
+
+	out, err := s.Create(ctx, asyncCreateInput("job-age", now.Add(-5*time.Minute)))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE async_jobs SET created_at = $1 WHERE job_id = $2`,
+		now.Add(-5*time.Minute), out.Job.ID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	age, err := s.QueueOldestAge(ctx)
+	if err != nil {
+		t.Fatalf("queue age: %v", err)
+	}
+	if age < 4*time.Minute || age > 6*time.Minute {
+		t.Fatalf("queue age = %v, want about 5m", age)
+	}
+
+	// Depth and age come from the same queued set: claim it and both drop.
+	if _, ok, err := s.Claim(ctx, async.ClaimInput{Owner: "w-age", Lease: time.Minute, Now: now}); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if depth, err := s.QueueDepth(ctx); err != nil || depth != 0 {
+		t.Fatalf("depth after claim = %d err=%v, want 0", depth, err)
+	}
+	if age, err := s.QueueOldestAge(ctx); err != nil || age != 0 {
+		t.Fatalf("queue age after claim = %v err=%v, want 0", age, err)
+	}
+}

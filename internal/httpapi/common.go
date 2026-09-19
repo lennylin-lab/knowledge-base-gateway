@@ -14,12 +14,16 @@ package httpapi
 // are recorded by the caller through the audit sink.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
@@ -31,6 +35,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/tracing"
 )
 
 // Protocol labels used by the admission pipeline and audit records. Existing
@@ -40,6 +45,60 @@ const (
 	protocolResponses  = "responses"
 	protocolEmbeddings = "embeddings"
 )
+
+// statusWriter records the response status so the request span carries the
+// final code when it ends.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush forwards to the wrapped writer when it supports flushing, so the
+// SSE streaming paths keep their http.Flusher behavior through the wrapper.
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// startHTTPSpan opens the server root span for one protocol request. The
+// incoming W3C traceparent (when the caller supplied one) makes the span a
+// child of the caller's trace; only trace identity is extracted — baggage is
+// never read. Attributes are metadata only: request ID and protocol here,
+// final status on finish.
+func startHTTPSpan(w http.ResponseWriter, r *http.Request, protocol string) (*statusWriter, *http.Request, trace.Span) {
+	ctx := tracing.Extract(r.Context(), r.Header)
+	ctx, span := tracing.StartServer(ctx, "http."+protocol,
+		attribute.String(tracing.AttrRequestID, requestIDOf(r)),
+		attribute.String(tracing.AttrProtocol, protocol),
+	)
+	sw := &statusWriter{ResponseWriter: w}
+	return sw, r.WithContext(ctx), span
+}
+
+// finishHTTPSpan stamps the recorded status and closes the span.
+func finishHTTPSpan(sw *statusWriter, span trace.Span) {
+	status := sw.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	span.SetAttributes(attribute.Int(tracing.AttrStatus, status))
+	span.End()
+}
 
 // resolvePublicModel performs the default-model backfill for requests that
 // omit `model`: chat/responses fall back to the subject's default_model and
@@ -111,13 +170,15 @@ func authenticate(r *http.Request, d admissionDeps) (auth.Principal, error) {
 
 // admitted is the outcome of a successful admission: the ordered route plan,
 // the token-quota reservation, the money-budget reservation, the limiter
-// release func, and the metrics registry for settlement observability.
+// release func, the metrics registry for settlement observability, and the
+// admission context so post-response settlement spans join the request trace.
 type admitted struct {
 	plan    gateway.Plan
 	qres    quota.Reservation
 	ares    accounting.Reservation
 	release func()
 	metrics *metrics.Registry
+	ctx     context.Context
 }
 
 // settle finalizes both reservations to the reported usage exactly once
@@ -130,13 +191,19 @@ func (a *admitted) settle(providerName string, u *model.Usage) {
 	if a.ares == nil {
 		return
 	}
+	_, span := tracing.Start(a.ctx, "ledger.settle",
+		attribute.String(tracing.AttrProvider, providerName))
+	defer span.End()
 	if err := a.ares.Settle(providerName, accounting.UsageFrom(u)); err != nil {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "failed"))
 		if a.metrics != nil {
 			a.metrics.IncSettlementFailure()
 		}
 		slog.Error("accounting: usage settlement failed; ledger row remains reserved",
 			"error", err)
+		return
 	}
+	span.SetAttributes(attribute.String(tracing.AttrOutcome, "settled"))
 }
 
 // refund releases both reservations (no billable outcome); repeated calls
@@ -147,13 +214,18 @@ func (a *admitted) refund() {
 	if a.ares == nil {
 		return
 	}
+	_, span := tracing.Start(a.ctx, "ledger.release")
+	defer span.End()
 	if err := a.ares.Release(); err != nil {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "failed"))
 		if a.metrics != nil {
 			a.metrics.IncSettlementFailure()
 		}
 		slog.Error("accounting: reservation release failed; ledger row remains reserved",
 			"error", err)
+		return
 	}
+	span.SetAttributes(attribute.String(tracing.AttrOutcome, "released"))
 }
 
 // attempts reports the maximum number of provider attempts the plan allows
@@ -172,7 +244,21 @@ func (a *admitted) attempts() int {
 // principal. Denials write the stable error envelope themselves and return a
 // non-nil auditErr; the caller still owns audit recording (it owns the
 // request/trace IDs, the principal, and the audit fields).
-func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, publicModel string, mreq *model.Request, principal auth.Principal) (*admitted, error) {
+func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, publicModel string, mreq *model.Request, principal auth.Principal) (out *admitted, outErr error) {
+	// Admission span: the ordered pipeline is one trace segment; downstream
+	// limiter/quota/accounting calls join it through the request context.
+	// Attributes stay metadata-only (protocol, model, denial class).
+	actx, span := tracing.Start(r.Context(), "http.admission",
+		attribute.String(tracing.AttrProtocol, protocol),
+		attribute.String(tracing.AttrModel, publicModel),
+	)
+	r = r.WithContext(actx)
+	defer func() {
+		if outErr != nil {
+			span.SetAttributes(attribute.String(tracing.AttrErrorClass, classifyErr(outErr)))
+		}
+		span.End()
+	}()
 	subject := principal.SubjectID
 
 	// 1. Model existence + subject policy (non-leaky combined errors).
@@ -347,7 +433,7 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 		}
 		ares = res
 	}
-	return &admitted{plan: plan, qres: qres, ares: ares, release: release}, nil
+	return &admitted{plan: plan, qres: qres, ares: ares, release: release, ctx: actx}, nil
 }
 
 // classifyErr names an error for the audit error_class column without

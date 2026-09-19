@@ -67,6 +67,9 @@ func validateChatOnlyFields(raw map[string]json.RawMessage) error {
 
 func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	sw, r, span := startHTTPSpan(w, r, protocolEmbeddings)
+	w = sw // every later write flows through the recording writer so the span carries the real final status
+	defer finishHTTPSpan(sw, span)
 	requestID := requestIDOf(r)
 	w.Header().Set("X-Request-ID", requestID)
 	traceID := traceIDOf(r, requestID)

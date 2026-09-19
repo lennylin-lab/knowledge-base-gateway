@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
 
@@ -387,6 +388,10 @@ type Gate struct {
 	Budgets     BudgetGate // required whenever Enforcement is on and a budget applies
 	Enforcement bool
 	Now         func() time.Time
+	// Metrics counts settlements whose cost stayed unknown (unknown usage or
+	// no applicable price) — the unknown-cost-rate signal. Optional; nil
+	// disables the counter.
+	Metrics *metrics.Registry
 
 	// finalizeTimeout bounds the detached-context settlement operations:
 	// settlement must survive a client disconnect but must not hang forever.
@@ -588,6 +593,12 @@ func (r *reservation) Settle(provider string, u Usage) error {
 		PriceVersion: version, Currency: currency, SettledAt: r.g.now(),
 	}); err != nil {
 		return unavailable(err)
+	}
+	if cost == nil && r.g.Metrics != nil {
+		// The settled row keeps cost NULL: either the upstream reported no
+		// usage or no price applied. Unknown stays unknown — never zero —
+		// and is counted so the unknown-cost rate is observable.
+		r.g.Metrics.IncCostUnknown()
 	}
 	// The settlement landed (or was already settled by a racer — the same
 	// exactly-once outcome). Adjust the counters exactly once.

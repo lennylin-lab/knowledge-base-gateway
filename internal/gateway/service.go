@@ -9,12 +9,16 @@ import (
 	"errors"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/cenkalti/backoff/v5"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/router"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/tracing"
 )
 
 // ErrUnknownModel is returned when the public model is not in the catalog or
@@ -189,6 +193,17 @@ func attemptTimeout(ctx context.Context, d time.Duration) (context.Context, cont
 	return context.WithTimeout(ctx, d)
 }
 
+// providerSpanObserve stamps the content-free attempt outcome on a provider
+// span: the classified error class only — never the raw error text, which
+// could embed upstream URLs or response fragments.
+func providerSpanObserve(span trace.Span, err error) {
+	if err == nil {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "ok"))
+		return
+	}
+	span.SetAttributes(attribute.String(tracing.AttrErrorClass, provider.ClassOf(err).String()))
+}
+
 // Complete performs a non-streaming completion. Attempts proceed through the
 // candidate order; each attempt admits its route's breaker permit
 // immediately before the provider call and records the outcome immediately
@@ -224,8 +239,15 @@ func (s *Service) Complete(ctx context.Context, plan Plan, req model.Request) (m
 			}
 			attempts++
 			actx, acancel := attemptTimeout(ctx, cand.Timeout)
+			actx, span := tracing.Start(actx, "provider.attempt",
+				tracing.String(tracing.AttrModel, plan.PublicModel),
+				tracing.String(tracing.AttrProvider, cand.ProviderName),
+				attribute.Int(tracing.AttrAttempt, attempts),
+			)
 			resp, err := cand.Provider.Complete(actx, creq)
 			acancel()
+			providerSpanObserve(span, err)
+			span.End()
 			s.Routes.Record(plan.PublicModel, cand.ProviderName, err == nil)
 			if err == nil {
 				return resp, cand.ProviderName, nil
@@ -277,8 +299,15 @@ func (s *Service) Embeddings(ctx context.Context, plan Plan, req model.Embedding
 			}
 			attempts++
 			actx, acancel := attemptTimeout(ctx, cand.Timeout)
+			actx, span := tracing.Start(actx, "provider.attempt",
+				tracing.String(tracing.AttrModel, plan.PublicModel),
+				tracing.String(tracing.AttrProvider, cand.ProviderName),
+				attribute.Int(tracing.AttrAttempt, attempts),
+			)
 			resp, err := cand.Provider.Embeddings(actx, creq)
 			acancel()
+			providerSpanObserve(span, err)
+			span.End()
 			s.Routes.Record(plan.PublicModel, cand.ProviderName, err == nil)
 			if err == nil {
 				return resp, cand.ProviderName, nil
@@ -334,8 +363,16 @@ func (s *Service) Stream(ctx context.Context, plan Plan, req model.Request, emit
 		}
 		attempts++
 		actx, acancel := attemptTimeout(ctx, cand.Timeout)
+		actx, span := tracing.Start(actx, "provider.attempt",
+			tracing.String(tracing.AttrModel, plan.PublicModel),
+			tracing.String(tracing.AttrProvider, cand.ProviderName),
+			attribute.Int(tracing.AttrAttempt, attempts),
+			attribute.Bool("gw.stream", true),
+		)
 		err := cand.Provider.Stream(actx, creq, wrapped)
 		acancel()
+		providerSpanObserve(span, err)
+		span.End()
 		s.Routes.Record(plan.PublicModel, cand.ProviderName, err == nil)
 		if err == nil {
 			return cand.ProviderName, nil

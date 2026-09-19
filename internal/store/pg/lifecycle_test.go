@@ -254,8 +254,8 @@ func TestLifecycleSweepArchiveThenDelete(t *testing.T) {
 	if !manifest.Complete || manifest.RowCount != 1 || manifest.Table != lifecycle.TableRequests {
 		t.Fatalf("manifest = %+v", manifest)
 	}
-	if manifest.SchemaVersion != 11 {
-		t.Fatalf("manifest schema version = %d, want 11", manifest.SchemaVersion)
+	if manifest.SchemaVersion != 12 {
+		t.Fatalf("manifest schema version = %d, want 12", manifest.SchemaVersion)
 	}
 	data, err := os.ReadFile(dataFile)
 	if err != nil {

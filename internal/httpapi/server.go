@@ -11,10 +11,11 @@ import (
 // disables /v1/responses and a nil Embeddings handler disables
 // /v1/embeddings (the documented rollback switches) without touching Chat
 // Completions. The optional async handlers disable the V1.4 job query/cancel
-// endpoints when unset.
+// endpoints when unset. Ready is the aggregated /readyz handler; when nil,
+// readiness reports ready (the development default with no dependencies).
 type Deps struct {
 	Logger          *slog.Logger
-	ReadyFn         func() bool
+	Ready           http.Handler
 	Metrics         http.Handler
 	Responses       http.Handler // POST /v1/responses; nil disables the endpoint
 	ResponsesGet    http.Handler // GET /v1/responses/{id}; nil disables it
@@ -27,21 +28,20 @@ type Deps struct {
 func NewMux(chat http.Handler, deps Deps) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		// Liveness is process-only by contract: no dependency probes here.
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if deps.ReadyFn != nil && !deps.ReadyFn() {
+	if deps.Ready != nil {
+		mux.Handle("/readyz", deps.Ready)
+	} else {
+		mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "unavailable"})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
-	})
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+		})
+	}
 	mux.Handle("/metrics", deps.Metrics)
 	mux.Handle("/v1/chat/completions", methodGuard(chat, http.MethodPost))
 	if deps.Responses != nil {

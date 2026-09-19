@@ -36,14 +36,16 @@ import (
 // ledgerStub is the in-memory accounting.Store double used by the worker
 // tests: it records the ledger lifecycle and serves one configured price.
 type ledgerStub struct {
-	mu           sync.Mutex
-	price        accounting.Price
-	hasPrice     bool
-	budgetLimits accounting.BudgetLimits
-	reserved     map[string]bool // identity key -> reserved
-	settled      []accounting.SettleQuery
-	released     []string
-	failSettle   atomic.Bool
+	mu                 sync.Mutex
+	price              accounting.Price
+	hasPrice           bool
+	budgetLimits       accounting.BudgetLimits
+	reserved           map[string]bool // identity key -> reserved
+	settled            []accounting.SettleQuery
+	released           []string
+	failSettle         atomic.Bool
+	failSettleOnce     atomic.Int32 // > 0: fail this many settlements, then pass
+	settlementAttempts atomic.Int32
 }
 
 func newLedgerStub(price accounting.Price) *ledgerStub {
@@ -77,6 +79,10 @@ func (s *ledgerStub) SettleLedger(_ context.Context, q accounting.SettleQuery) (
 	if s.failSettle.Load() {
 		return accounting.SettleOutcome{}, errors.New("ledger down")
 	}
+	if n := s.failSettleOnce.Add(-1); n >= 0 {
+		return accounting.SettleOutcome{}, errors.New("transient ledger failure")
+	}
+	s.settlementAttempts.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.settled = append(s.settled, q)

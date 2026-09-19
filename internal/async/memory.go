@@ -13,6 +13,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/knowledge-base/knowledge-base-gateway/internal/tracing"
 )
 
 // MemoryStore is the mutex-guarded Store implementation.
@@ -88,6 +90,13 @@ func (m *MemoryStore) Create(_ context.Context, in CreateInput) (CreateOutcome, 
 		Protocol: in.Protocol, PublicModel: in.PublicModel,
 		RequestDigest: in.RequestDigest, Status: StatusQueued,
 		CreatedAt: in.Now, UpdatedAt: in.Now,
+		// Persist only normalized trace identity (mirrors the pg store).
+		TraceID: in.TraceID, ParentSpanID: in.SpanID, TraceSampled: in.TraceSampled,
+	}
+	if tc, ok := tracing.Normalize(j.TraceID, j.ParentSpanID); ok {
+		j.TraceID, j.ParentSpanID = tc.TraceID, tc.SpanID
+	} else {
+		j.TraceID, j.ParentSpanID, j.TraceSampled = "", "", false
 	}
 	rec := &memJob{job: j, request: in.Request} // fresh jobs are immediately claimable
 	m.jobs[in.JobID] = rec
@@ -332,6 +341,27 @@ func (m *MemoryStore) QueueDepth(_ context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// QueueOldestAge implements Store: the age of the oldest queued job, 0 when
+// the queue is empty.
+func (m *MemoryStore) QueueOldestAge(_ context.Context) (time.Duration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	var oldest time.Time
+	for _, rec := range m.jobs {
+		if rec.job.Status != StatusQueued {
+			continue
+		}
+		if oldest.IsZero() || rec.job.CreatedAt.Before(oldest) {
+			oldest = rec.job.CreatedAt
+		}
+	}
+	if oldest.IsZero() {
+		return 0, nil
+	}
+	return now.Sub(oldest), nil
 }
 
 // SweepExpiredIdempotencyKeys implements Store: removes mappings whose

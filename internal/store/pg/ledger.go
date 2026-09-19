@@ -185,6 +185,20 @@ func (s LedgerStore) ReleaseLedger(ctx context.Context, id accounting.Identity) 
 	return err
 }
 
+// ReservedBacklog counts reserved ledger rows older than the window: the
+// settlement backlog signal behind /readyz (an explicit unhealthy threshold;
+// fresh reserved rows are normal in-flight settlements, only stale ones
+// count). A store error returns so readiness fails closed — an unmeasurable
+// backlog is never reported healthy.
+func (s LedgerStore) ReservedBacklog(ctx context.Context, olderThan time.Duration) (int64, error) {
+	var n int64
+	err := s.DB.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM usage_ledger
+		WHERE settle_status = 'reserved' AND created_at < now() - $1::interval`,
+		olderThan).Scan(&n)
+	return n, err
+}
+
 // --- Pricing and budget management (admin API surface) --------------------
 
 // UpsertPrice inserts or updates one price version and its management-audit

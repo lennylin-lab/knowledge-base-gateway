@@ -17,12 +17,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/knowledge-base/knowledge-base-gateway/internal/adminauth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/async"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/tracing"
 )
 
 // Async bundles the background-job collaborators shared by the Responses
@@ -192,7 +195,17 @@ func (h *ResponsesHandler) createBackground(w http.ResponseWriter, r *http.Reque
 		keyHash = async.HashIdempotencyKey(principal.SubjectID, key)
 	}
 
-	out, err := as.Jobs.Create(r.Context(), async.CreateInput{
+	// The enqueue span is the trace's persistence boundary: its W3C identity
+	// (normalized) rides the job row so the worker joins the caller's trace.
+	// Baggage and request content never reach the row.
+	ectx, enqueueSpan := tracing.Start(r.Context(), "async.enqueue",
+		attribute.String(tracing.AttrModel, publicModel),
+		attribute.String(tracing.AttrProtocol, protocolResponses),
+	)
+	defer enqueueSpan.End()
+	tc := tracing.Current(ectx)
+
+	out, err := as.Jobs.Create(ectx, async.CreateInput{
 		JobID:         newJobID(),
 		SubjectID:     principal.SubjectID,
 		TenantID:      principal.TenantID,
@@ -201,24 +214,34 @@ func (h *ResponsesHandler) createBackground(w http.ResponseWriter, r *http.Reque
 		RequestDigest: async.DigestRequest(snap),
 		Request:       snap,
 		KeyHash:       keyHash,
+		TraceID:       tc.TraceID,
+		SpanID:        tc.SpanID,
+		TraceSampled:  tc.Sampled,
 		ResultTTL:     as.ResultTTL,
 		KeyTTL:        as.KeyTTL,
 		Now:           time.Now(),
 	})
 	switch {
 	case errors.Is(err, async.ErrConflict):
+		enqueueSpan.SetAttributes(attribute.String(tracing.AttrOutcome, "idempotency_conflict"))
 		mapError(w, requestID, errIdempotencyConflict)
 		record(http.StatusConflict, errIdempotencyConflict)
 		return
 	case errors.Is(err, async.ErrUnavailable):
+		enqueueSpan.SetAttributes(attribute.String(tracing.AttrOutcome, "queue_unavailable"))
 		mapError(w, requestID, errQueueUnavailable)
 		record(http.StatusServiceUnavailable, errQueueUnavailable)
 		return
 	case err != nil:
+		enqueueSpan.SetAttributes(attribute.String(tracing.AttrOutcome, "error"))
 		mapError(w, requestID, err)
 		record(http.StatusInternalServerError, err)
 		return
 	}
+	enqueueSpan.SetAttributes(
+		attribute.String(tracing.AttrJobID, out.Job.ID),
+		attribute.String(tracing.AttrOutcome, "queued"),
+	)
 	if as.Wake != nil {
 		as.Wake()
 	}
@@ -394,18 +417,27 @@ func (h *AsyncJobsHandler) get(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDOf(r)
 	w.Header().Set("X-Request-ID", requestID)
 	w.Header().Set("X-Trace-ID", traceIDOf(r, requestID))
+	_, span := tracing.Start(r.Context(), "async.job_query")
+	defer func() {
+		span.SetAttributes(attribute.String(tracing.AttrRequestID, requestID))
+		span.End()
+	}()
 	caller, ok := h.authenticate(w, r, true)
 	if !ok {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "unauthorized"))
 		return
 	}
 	if h.Jobs == nil {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "queue_unavailable"))
 		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "job_queue_unavailable", "the service is temporarily unable to accept requests")
 		return
 	}
 	job, ok := h.loadOwnedJob(w, r, caller)
 	if !ok {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "not_found"))
 		return
 	}
+	span.SetAttributes(attribute.String(tracing.AttrJobID, job.ID), attribute.String(tracing.AttrOutcome, string(job.Status)))
 	switch job.Status {
 	case async.StatusExpired:
 		writeError(w, requestID, http.StatusGone, "invalid_request_error", "response_expired", "the response result has expired")
@@ -437,35 +469,52 @@ func (h *AsyncJobsHandler) cancel(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDOf(r)
 	w.Header().Set("X-Request-ID", requestID)
 	w.Header().Set("X-Trace-ID", traceIDOf(r, requestID))
+	_, span := tracing.Start(r.Context(), "async.job_cancel")
+	defer func() {
+		span.SetAttributes(attribute.String(tracing.AttrRequestID, requestID))
+		span.End()
+	}()
 	caller, ok := h.authenticate(w, r, false)
 	if !ok {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "unauthorized"))
 		return
 	}
 	if caller.admin != nil {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "forbidden"))
 		writeError(w, requestID, http.StatusForbidden, "permission_error", "insufficient_scope", "admin credentials may query but not cancel background responses")
 		return
 	}
 	if h.Jobs == nil {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "queue_unavailable"))
 		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "job_queue_unavailable", "the service is temporarily unable to accept requests")
 		return
 	}
 	job, ok := h.loadOwnedJob(w, r, caller)
 	if !ok {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "not_found"))
 		return
 	}
+	span.SetAttributes(attribute.String(tracing.AttrJobID, job.ID))
 	if job.Status == async.StatusExpired {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "expired"))
 		writeError(w, requestID, http.StatusGone, "invalid_request_error", "response_expired", "the response result has expired")
 		return
 	}
 	fresh, outcome, err := h.Jobs.Cancel(r.Context(), job.ID, h.now())
 	switch {
 	case errors.Is(err, async.ErrUnavailable):
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "queue_unavailable"))
 		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "job_queue_unavailable", "the service is temporarily unable to accept requests")
 		return
 	case err != nil:
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "error"))
 		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "internal_error", "internal server error")
 		return
 	}
+	span.SetAttributes(attribute.String(tracing.AttrOutcome, map[async.CancelOutcome]string{
+		async.CancelledQueued: "cancelled", async.CancelledRunning: "cancelled",
+		async.CancelNoop: "noop",
+	}[outcome]))
 	if outcome != async.CancelNoop {
 		// The cancel won the transition: it owns the job's single cancellation
 		// handoff. Content-free metadata only.

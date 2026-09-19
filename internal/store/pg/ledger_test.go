@@ -477,3 +477,55 @@ func TestBudgetUsageCurrentPeriod(t *testing.T) {
 		t.Fatalf("tenant monthly usage: %+v", tenantMonthly)
 	}
 }
+
+// TestLedgerReservedBacklogReadinessSignal proves the settlement-backlog
+// readiness query on the real schema: fresh reserved rows never count, rows
+// older than the window do, and settled/released rows are invisible.
+func TestLedgerReservedBacklogReadinessSignal(t *testing.T) {
+	s, db := newLedgerTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if n, err := s.ReservedBacklog(ctx, 10*time.Minute); err != nil || n != 0 {
+		t.Fatalf("empty ledger backlog = %d err=%v, want 0", n, err)
+	}
+
+	// A fresh reserved row: in-flight, not backlog.
+	fresh := accounting.Identity{RequestID: "req-fresh"}
+	if err := s.ReserveLedger(ctx, accounting.LedgerReservation{
+		Identity: fresh, SubjectID: "subject_default", TenantID: "tenant_default",
+		Protocol: "responses", PublicModel: "gateway-echo", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("reserve fresh: %v", err)
+	}
+	// A stale reserved row: backdated past the window (request-id identity:
+	// job_id carries a foreign key into async_jobs, so sync rows are the
+	// simplest fixture here).
+	stale := accounting.Identity{RequestID: "req-stale-backlog"}
+	if err := s.ReserveLedger(ctx, accounting.LedgerReservation{
+		Identity: stale, SubjectID: "subject_default", TenantID: "tenant_default",
+		Protocol: "responses", PublicModel: "gateway-echo", CreatedAt: now.Add(-30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("reserve stale: %v", err)
+	}
+	mustExec(t, db, `UPDATE usage_ledger SET created_at = $1 WHERE request_id IS NOT DISTINCT FROM $2`,
+		now.Add(-30*time.Minute), "req-stale-backlog")
+
+	n, err := s.ReservedBacklog(ctx, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("backlog: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("backlog = %d, want exactly the one stale reserved row", n)
+	}
+
+	// Settling the stale row clears the backlog signal.
+	if _, err := s.SettleLedger(ctx, accounting.SettleQuery{
+		Identity: stale, SettledAt: now,
+	}); err != nil {
+		t.Fatalf("settle stale: %v", err)
+	}
+	if n, err := s.ReservedBacklog(ctx, 10*time.Minute); err != nil || n != 0 {
+		t.Fatalf("backlog after settle = %d err=%v, want 0", n, err)
+	}
+}

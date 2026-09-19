@@ -21,6 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
@@ -30,6 +32,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/policy"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/provider"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/tracing"
 )
 
 // CancelRegistry propagates client cancels to in-flight executions in this
@@ -125,6 +128,10 @@ type Pool struct {
 	stopped    chan struct{}
 	stopOnce   sync.Once
 	wake       chan struct{}
+
+	started       atomic.Bool // set by Start, gates the readiness health signal
+	inflight      atomic.Int64
+	lastSweepNano atomic.Int64 // worker heartbeat: last completed sweep pass
 }
 
 // NewPool builds a pool; Start launches it.
@@ -146,6 +153,7 @@ func NewPool(deps PoolDeps, cfg PoolConfig) *Pool {
 // Start launches the worker goroutines and the sweep loop. Call Stop once.
 func (p *Pool) Start(parent context.Context) {
 	p.ctx, p.cancel = context.WithCancel(parent)
+	p.started.Store(true)
 	for i := 0; i < p.cfg.Count; i++ {
 		p.wg.Add(1)
 		go p.loop()
@@ -156,6 +164,21 @@ func (p *Pool) Start(parent context.Context) {
 		<-p.ctx.Done()
 		p.closeAccepting()
 	}()
+	p.setWorkerHealthy(true)
+}
+
+// Healthy is the readiness worker signal: the pool is accepting jobs and its
+// sweep heartbeat is fresh within three poll intervals. A pool that has not
+// started, or one past Stop, is never healthy; the startup window before the
+// first sweep pass is granted (no evidence of failure yet).
+func (p *Pool) Healthy() bool {
+	if !p.started.Load() || !p.isAccepting() {
+		return false
+	}
+	if nano := p.lastSweepNano.Load(); nano != 0 {
+		return time.Since(time.Unix(0, nano)) <= 3*p.cfg.PollInterval
+	}
+	return true
 }
 
 // Wake nudges the queue poll so a freshly created job starts without waiting
@@ -169,10 +192,13 @@ func (p *Pool) Wake() {
 
 // Stop ends intake, waits up to drain for in-flight jobs to commit, then
 // aborts the remainder and hands their leases back to the queue. Safe to call
-// multiple times.
+// multiple times. The three stages are logged and mirrored on the worker
+// health gauge so shutdown is observable from metrics and logs alone.
 func (p *Pool) Stop(drain time.Duration) {
 	p.stopOnce.Do(func() {
+		p.log().Info("async: shutdown: stopping job intake")
 		p.closeAccepting() // 1. stop receiving new jobs
+		p.setWorkerHealthy(false)
 		if p.cancel != nil {
 			p.cancel() // workers exit their claim loops
 		}
@@ -185,11 +211,15 @@ func (p *Pool) Stop(drain time.Duration) {
 		}()
 		select {
 		case <-done:
+			p.log().Info("async: shutdown: drain complete")
 		case <-time.After(drain):
 			// 3. reclaim worker leases: abort in-flight provider work; the
 			// workers observe the abort and requeue under their own leases.
+			p.log().Warn("async: shutdown: drain window elapsed; aborting in-flight executions",
+				"inflight", p.inflight.Load(), "drain", drain.String())
 			p.cancelInFlight()
 			<-done
+			p.log().Info("async: shutdown: in-flight executions aborted; leases returned to the queue")
 		}
 		close(p.stopped)
 	})
@@ -240,9 +270,7 @@ func (p *Pool) loop() {
 			return
 		default:
 		}
-		cl, ok, err := p.deps.Store.Claim(p.ctx, ClaimInput{
-			Owner: p.cfg.WorkerID, Lease: p.cfg.Lease, Now: p.deps.Now(),
-		})
+		cl, ok, err := p.claim()
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				p.log().Error("async: claim failed", "error", err)
@@ -258,7 +286,34 @@ func (p *Pool) loop() {
 	}
 }
 
-// sweep recovers expired leases, expires due results, and reports queue depth.
+// claim performs one store claim under a queue span and records the
+// enqueue→claim latency (the queue-wait histogram) for the winner.
+func (p *Pool) claim() (Claimed, bool, error) {
+	ctx, span := tracing.Start(p.ctx, "async.claim")
+	cl, ok, err := p.deps.Store.Claim(ctx, ClaimInput{
+		Owner: p.cfg.WorkerID, Lease: p.cfg.Lease, Now: p.deps.Now(),
+	})
+	switch {
+	case err != nil:
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "error"))
+	case ok:
+		span.SetAttributes(
+			attribute.String(tracing.AttrOutcome, "claimed"),
+			attribute.String(tracing.AttrJobID, cl.Job.ID),
+		)
+		if p.deps.Metrics != nil {
+			p.deps.Metrics.ObserveQueueWait(p.deps.Now().Sub(cl.Job.CreatedAt))
+		}
+	default:
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "empty"))
+	}
+	span.End()
+	return cl, ok, err
+}
+
+// sweep recovers expired leases, expires due results, and refreshes the
+// pool's readiness heartbeat. Queue depth/age live on the scrape-time
+// collector (internal/metrics RegisterQueueCollector), not here.
 func (p *Pool) sweep() {
 	defer p.wg.Done()
 	for {
@@ -269,6 +324,7 @@ func (p *Pool) sweep() {
 			return
 		case <-time.After(p.cfg.PollInterval):
 		}
+		p.lastSweepNano.Store(p.deps.Now().UnixNano())
 		out, err := p.deps.Store.RecoverExpiredLeases(p.ctx, RecoverInput{
 			MaxAttempts:   p.cfg.MaxAttempts,
 			FailureResult: p.leaseLostResult,
@@ -276,6 +332,13 @@ func (p *Pool) sweep() {
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			p.log().Error("async: lease recovery failed", "error", err)
+		}
+		if n := len(out.Requeued) + len(out.Failed); n > 0 {
+			// Every recovered job was a lapsed worker lease (queue hand-back
+			// or terminal lease-lost failure).
+			if p.deps.Metrics != nil {
+				p.deps.Metrics.AddLeaseExpired(n)
+			}
 		}
 		for _, id := range out.Requeued {
 			p.log().Warn("async: expired lease returned job to queue", "job_id", id)
@@ -291,7 +354,10 @@ func (p *Pool) sweep() {
 			if !errors.Is(err, context.Canceled) {
 				p.log().Error("async: result expiry failed", "error", err)
 			}
-		} else if n > 0 {
+		} else {
+			if n > 0 && p.deps.Metrics != nil {
+				p.deps.Metrics.AddResultsExpired(n)
+			}
 			p.incExpired(n)
 		}
 		// KeyTTL reclamation: the idempotency mapping's expires_at is
@@ -303,9 +369,6 @@ func (p *Pool) sweep() {
 			}
 		} else if n > 0 {
 			p.log().Info("async: swept expired idempotency keys", "count", n)
-		}
-		if depth, err := p.deps.Store.QueueDepth(p.ctx); err == nil {
-			p.setQueueDepth(depth)
 		}
 	}
 }
@@ -338,8 +401,16 @@ func (p *Pool) log() *slog.Logger { return p.deps.Logger }
 // run executes one claimed job end to end: decode, re-admit, apply the same
 // limiter/quota/money-budget gates as the sync path, invoke the gateway
 // service on a detached bounded context, then commit the outcome through the
-// store CAS.
+// store CAS. The worker span joins the enqueue trace through the job's
+// persisted W3C context (never baggage), so one trace links HTTP enqueue →
+// worker → provider attempts → settlement.
 func (p *Pool) run(cl Claimed) {
+	p.inflight.Add(1)
+	defer func() {
+		p.inflight.Add(-1)
+		p.setWorkerInflight()
+	}()
+	p.setWorkerInflight()
 	start := p.deps.Now()
 	job := cl.Job
 
@@ -488,9 +559,25 @@ func (p *Pool) run(cl Claimed) {
 
 	// Detached bounded execution: the provider call survives HTTP shutdown
 	// and pool intake stop, bounded by the job timeout, cancellable through
-	// the registry when a client cancel wins its store transition.
+	// the registry when a client cancel wins its store transition. The worker
+	// span is the child of the persisted enqueue span (remote parent) when
+	// the job carries trace context, so execution joins the caller's trace.
 	execCtx, cancelExec := context.WithTimeout(context.Background(), p.cfg.JobTimeout)
 	defer cancelExec()
+	traceSource := "fresh_root"
+	if tc := (tracing.TraceContext{TraceID: job.TraceID, SpanID: job.ParentSpanID, Sampled: job.TraceSampled}); !tc.Empty() {
+		execCtx = tracing.WithRemote(execCtx, tc)
+		traceSource = "persisted"
+	}
+	execCtx, workerSpan := tracing.Start(execCtx, "async.worker.execute",
+		attribute.String(tracing.AttrJobID, job.ID),
+		attribute.String(tracing.AttrModel, job.PublicModel),
+		attribute.String(tracing.AttrProtocol, job.Protocol),
+		attribute.Int(tracing.AttrAttempt, job.AttemptCount+1),
+		attribute.String(tracing.AttrWorkerID, p.cfg.WorkerID),
+		attribute.String(tracing.AttrTraceSource, traceSource),
+	)
+	defer workerSpan.End()
 	unregister := p.deps.Cancels.Register(job.ID, cancelExec)
 	defer unregister()
 
@@ -501,9 +588,11 @@ func (p *Pool) run(cl Claimed) {
 	close(heartbeatDone)
 
 	if err != nil {
+		workerSpan.SetAttributes(attribute.String(tracing.AttrErrorClass, providerClassOf(err)))
 		p.runFailed(job, res, execCtx, err, providerName, start)
 		return
 	}
+	workerSpan.SetAttributes(attribute.String(tracing.AttrOutcome, "completed"))
 	p.runSucceeded(execCtx, job, res, mreq, resp, providerName, start)
 }
 
@@ -562,7 +651,10 @@ func (p *Pool) runSucceeded(execCtx context.Context, job Job, res reservations, 
 	}
 	reqID := p.requestID()
 	if class == "" {
-		won, cErr := p.deps.Store.CommitSuccess(execCtx, SuccessInput{
+		commitCtx, commitSpan := tracing.Start(execCtx, "async.commit",
+			attribute.String(tracing.AttrJobID, job.ID),
+			attribute.String(tracing.AttrOutcome, "completed"))
+		won, cErr := p.deps.Store.CommitSuccess(commitCtx, SuccessInput{
 			JobID: job.ID, Owner: job.LeaseOwner,
 			FinalRequestID:  reqID,
 			Response:        envelope,
@@ -572,12 +664,14 @@ func (p *Pool) runSucceeded(execCtx context.Context, job Job, res reservations, 
 			BumpAttempt:     true,
 			Now:             p.deps.Now(),
 		})
+		commitSpan.SetAttributes(attribute.Bool("gw.won", won))
+		commitSpan.End()
 		// Single terminal handoff: the CAS winner settles both reservations
 		// to the reported usage (unknown usage retains the conservative
 		// reservation) and writes the one audit record; the loser releases —
 		// except the cancel-after-output race, where the loser settles by
 		// the known usage (see handoff).
-		p.handoff(won, cErr, job, reqID, res, resp.Usage, providerName, start, "")
+		p.handoff(execCtx, won, cErr, job, reqID, res, resp.Usage, providerName, start, "")
 		return
 	}
 	// The upstream produced a billable response the gateway cannot deliver as
@@ -588,7 +682,10 @@ func (p *Pool) runSucceeded(execCtx context.Context, job Job, res reservations, 
 		p.log().Error("async: encode failure envelope", "job_id", job.ID, "error", ferr)
 		return
 	}
-	won, cErr := p.deps.Store.CommitFailure(execCtx, FailureInput{
+	commitCtx, commitSpan := tracing.Start(execCtx, "async.commit",
+		attribute.String(tracing.AttrJobID, job.ID),
+		attribute.String(tracing.AttrErrorClass, class))
+	won, cErr := p.deps.Store.CommitFailure(commitCtx, FailureInput{
 		JobID: job.ID, Owner: job.LeaseOwner,
 		FinalRequestID:  reqID,
 		ErrorClass:      class,
@@ -598,7 +695,9 @@ func (p *Pool) runSucceeded(execCtx context.Context, job Job, res reservations, 
 		BumpAttempt:     true,
 		Now:             p.deps.Now(),
 	})
-	p.handoff(won, cErr, job, reqID, res, resp.Usage, providerName, start, class)
+	commitSpan.SetAttributes(attribute.Bool("gw.won", won))
+	commitSpan.End()
+	p.handoff(execCtx, won, cErr, job, reqID, res, resp.Usage, providerName, start, class)
 }
 
 // runFailed classifies an execution error and either requeues (retry-eligible
@@ -636,7 +735,10 @@ func (p *Pool) runFailed(job Job, res reservations, execCtx context.Context, err
 	// drain window; a drain-timeout or client-cancel abort cancels the same
 	// context and the lease falls to the recovery sweep instead.
 	reqID := p.requestID()
-	won, cErr := p.deps.Store.CommitFailure(execCtx, FailureInput{
+	commitCtx, commitSpan := tracing.Start(execCtx, "async.commit",
+		attribute.String(tracing.AttrJobID, job.ID),
+		attribute.String(tracing.AttrErrorClass, class))
+	won, cErr := p.deps.Store.CommitFailure(commitCtx, FailureInput{
 		JobID: job.ID, Owner: job.LeaseOwner,
 		FinalRequestID:  reqID,
 		ErrorClass:      class,
@@ -646,7 +748,9 @@ func (p *Pool) runFailed(job Job, res reservations, execCtx context.Context, err
 		BumpAttempt:     true,
 		Now:             p.deps.Now(),
 	})
-	p.handoff(won, cErr, job, reqID, res, nil, providerName, start, class)
+	commitSpan.SetAttributes(attribute.Bool("gw.won", won))
+	commitSpan.End()
+	p.handoff(execCtx, won, cErr, job, reqID, res, nil, providerName, start, class)
 }
 
 // readmit re-resolves model authorization, capabilities, and routing for the
@@ -752,7 +856,7 @@ func (p *Pool) commitFailure(job Job, class, providerName string, start time.Tim
 		BumpAttempt:     true,
 		Now:             p.deps.Now(),
 	})
-	p.handoff(won, cerr, job, reqID, reservations{}, nil, providerName, start, class)
+	p.handoff(p.ctx, won, cerr, job, reqID, reservations{}, nil, providerName, start, class)
 }
 
 // handoff performs the single terminal audit/accounting handoff. The store
@@ -771,7 +875,7 @@ func (p *Pool) commitFailure(job Job, class, providerName string, start time.Tim
 // loser writes the settled ledger row, and any repeated finalization is a
 // no-op. Any other loss (lease recovery returns the job to the queue) still
 // releases, because the retry re-reserves and settles.
-func (p *Pool) handoff(won bool, cerr error, job Job, requestID string, res reservations, usage *model.Usage, providerName string, start time.Time, class string) {
+func (p *Pool) handoff(ctx context.Context, won bool, cerr error, job Job, requestID string, res reservations, usage *model.Usage, providerName string, start time.Time, class string) {
 	if cerr != nil {
 		// Commit failed: never fabricate a settlement. The job is recovered
 		// by lease expiry if the commit did not land.
@@ -784,17 +888,13 @@ func (p *Pool) handoff(won bool, cerr error, job Job, requestID string, res rese
 		if usage != nil && usage.Known && p.jobCancelled(job.ID) {
 			// Cancel-after-output: settle by known usage. A settlement
 			// failure stays observable and retryable via the reserved row.
-			if err := res.settle(providerName, usage); err != nil {
-				p.settleFailed(job.ID, err)
-			}
+			p.settleObserved(ctx, job, res, usage, providerName)
 			return
 		}
 		res.release()
 		return
 	}
-	if err := res.settle(providerName, usage); err != nil {
-		p.settleFailed(job.ID, err)
-	}
+	p.settleObserved(ctx, job, res, usage, providerName)
 	if class == "" {
 		p.incJob(string(StatusCompleted))
 	} else {
@@ -814,6 +914,32 @@ func (p *Pool) handoff(won bool, cerr error, job Job, requestID string, res rese
 		}
 		p.deps.Audit.Write(evt)
 	}
+}
+
+// settleObserved finalizes the reservations under a settlement span, exactly
+// once per outcome. A failure is counted and then retried once in-process:
+// both settle halves are idempotent (the quota finalizer and the ledger's
+// exactly-once settlement), so a bounded retry can only converge — and a
+// still-failing settlement keeps its reserved ledger row as the durable,
+// re-drivable evidence.
+func (p *Pool) settleObserved(ctx context.Context, job Job, res reservations, usage *model.Usage, providerName string) {
+	_, span := tracing.Start(ctx, "ledger.settle",
+		attribute.String(tracing.AttrJobID, job.ID),
+		attribute.String(tracing.AttrProvider, providerName))
+	defer span.End()
+	if err := res.settle(providerName, usage); err != nil {
+		span.SetAttributes(attribute.String(tracing.AttrOutcome, "retrying"))
+		p.settleFailed(job.ID, err)
+		if p.deps.Metrics != nil {
+			p.deps.Metrics.IncSettlementRetry()
+		}
+		if err := res.settle(providerName, usage); err != nil {
+			span.SetAttributes(attribute.String(tracing.AttrOutcome, "failed"))
+			p.settleFailed(job.ID, err)
+			return
+		}
+	}
+	span.SetAttributes(attribute.String(tracing.AttrOutcome, "settled"))
 }
 
 // settleFailed records a failed ledger settlement: counted, logged, and left
@@ -925,9 +1051,15 @@ func (p *Pool) incJob(status string) {
 	}
 }
 
-func (p *Pool) setQueueDepth(n int) {
+func (p *Pool) setWorkerHealthy(v bool) {
 	if p.deps.Metrics != nil {
-		p.deps.Metrics.SetAsyncQueueDepth(n)
+		p.deps.Metrics.SetWorkerHealthy(v)
+	}
+}
+
+func (p *Pool) setWorkerInflight() {
+	if p.deps.Metrics != nil {
+		p.deps.Metrics.SetWorkerInflight(int(p.inflight.Load()))
 	}
 }
 

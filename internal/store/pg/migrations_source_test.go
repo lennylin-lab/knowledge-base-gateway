@@ -15,7 +15,7 @@ import (
 // It is asserted as an equality so an accidentally copied or half-deleted
 // migration file fails the parse test; bump it when landing a new migration
 // pair.
-const wantMigrationVersions = 11
+const wantMigrationVersions = 12
 
 // migrationsDirURL resolves the repository migrations directory to an
 // absolute file:// URL, which is how golang-migrate's file source parses it.
