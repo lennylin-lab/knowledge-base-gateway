@@ -203,11 +203,12 @@ CAS discipline plus these pins close all three classes.
 
 **Boundary**: Upstream provider effects are at-least-once (a crash between
 the upstream call and the terminal commit re-executes the job — documented);
-local state and audit are exactly-once. Child-3 handoff: when cancel wins
-after output, the losing worker's observed usage is dropped at
-`Pool.handoff` — the cost-governance child must record usage on exactly that
-path or settle from the stored result. Idempotency `KeyTTL` enforcement is
-owned by the data-lifecycle child.
+local state and audit are exactly-once. Since cost governance landed, the
+one exception to "losers write nothing": when cancel wins after the provider
+produced output, the losing worker settles both reservations to the observed
+known usage (one settled ledger row; the cancel winner keeps the single
+audit) — recovery-loss losers still release. Idempotency `KeyTTL`
+enforcement is owned by the data-lifecycle child.
 
 ### Convention: Provider adapters share one offline contract suite
 

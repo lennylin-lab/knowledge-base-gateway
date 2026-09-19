@@ -64,6 +64,7 @@ go run ./cmd/gateway
 | `GATEWAY_RESPONSES_ENABLED` | `true` | Set `false` to disable `/v1/responses` (rollback switch) |
 | `GATEWAY_EMBEDDINGS_ENABLED` | `true` | Set `false` to disable `/v1/embeddings` (rollback switch) |
 | `GATEWAY_ASYNC_ENABLED` | `false` | Set `true` to accept `background: true` Responses jobs (V1.4; requires database mode) |
+| `GATEWAY_BUDGETS_ENABLED` | `false` | Set `true` to enforce monetary budgets (V1.4; database mode). Ledger capture is always on in database mode — enforcement can be rolled back without losing cost evidence |
 | `GATEWAY_ASYNC_WORKERS` | `2` | Background-job worker goroutines (1..64) |
 | `GATEWAY_ASYNC_POLL_INTERVAL` | `1s` | Queue poll / recovery sweep cadence |
 | `GATEWAY_ASYNC_LEASE` | `60s` | Worker claim lease, heartbeat-extended |
@@ -601,3 +602,52 @@ adapters — mock-provider fixtures directly, and OpenAI/Anthropic fixtures
 through a canned stub transport — asserting the normalized responses and
 stream events. It performs no network I/O and needs no API keys. Custom
 fixture directories: `go run ./cmd/replay -dir <path>`.
+
+## V1.4: cost governance (pricing, usage ledger, monetary budgets)
+
+Every request — synchronous or background — settles into a durable usage
+ledger (`usage_ledger`): a `reserved` row is written before any provider
+work, then finalized exactly once as `settled` (with the reported token
+classes, the selected price version, and the computed cost) or `released`
+(no billable outcome). The same request can never produce two settled
+records, and repeated finalization is a no-op.
+
+- **Pricing** — prices live in the versioned `pricing_catalog`: micros per
+  token (integer micro units, never floats) for input, output, and — when
+  the upstream reports them — reasoning and cached-input tokens, plus a
+  currency and an `effective_from` instant. Settlement uses the version in
+  force at request time and records it, so every known cost is exactly
+  recomputable from tokens + price version. A class is charged only when
+  the upstream reported it; a reported class without a price — or unknown
+  usage — keeps the cost NULL. Unknown cost is never fabricated as zero.
+  Manage the catalog with `GET/POST /admin/prices`.
+- **Budgets** — `budget_policies` caps spend per subject and per tenant,
+  daily and monthly on UTC boundaries, in one currency per applicable
+  policy. Checks run before the provider is invoked: the subject's and the
+  tenant's counters are checked and charged in one atomic operation (Redis
+  in `GATEWAY_LIMITS_MODE=redis`, in-process otherwise), so concurrent
+  instances cannot oversell either dimension. True exhaustion answers `429
+  budget_exceeded` with the UTC boundary as `Retry-After`; a Redis or
+  database outage answers `503 limiter_unavailable` — an outage is never a
+  denial. A configured budget with no effective price (or a price in
+  another currency) refuses the request before provider work as `500
+  pricing_unavailable` — a priceless request can never bypass a budget.
+  Manage policies with `GET/POST /admin/budgets`.
+- **Rollback posture** — `GATEWAY_BUDGETS_ENABLED` (default `false`) gates
+  enforcement only. Ledger capture is unconditional in database mode, so
+  enforcement can be disabled without losing cost evidence.
+- **Observability** — `/admin/usage` merges the ledger into the per-model
+  usage rows (`cost_micros` sum of known cost, `unknown_cost_requests`,
+  distinct `price_versions`) and reports current-period budget utilization
+  (`budgets`: limit, known spend, and unknown-cost settlements counted
+  separately — never as zero spend). Prometheus counters:
+  `gateway_budget_denials_total{scope}` and
+  `gateway_ledger_settlement_failures_total` (a failed settlement leaves
+  its `reserved` ledger row as retryable evidence — it is never silently
+  marked settled).
+- **Background jobs** — a cancelled job that already produced upstream
+  output settles by the usage the provider reported (the losing worker
+  records the one settlement); cancellation before any output releases the
+  reservation. A budget denial at execution time fails the job terminally
+  with `budget_exceeded` (or `pricing_unavailable`); infrastructure
+  outages requeue the job free instead.
