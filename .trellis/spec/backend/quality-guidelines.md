@@ -223,6 +223,30 @@ Fixture text must include multi-byte UTF-8 content (e.g. Chinese) — an
 ASCII-only suite let a byte-index sharding bug corrupt streamed CJK into
 U+FFFD unnoticed (issue #3).
 
+### Convention: Admin RBAC — one matrix, one tenant authority
+
+**What**: Every admin route's scope requirement lives in exactly one place
+(`adminRoutePolicy` in `internal/httpapi/admin_auth.go`); unlisted routes
+default to platform-admin + global-only. Tenant authorization always derives
+from `subjects.tenant_id` via a join — `api_keys.tenant_id` is a label, never
+the authority — and tenant-bound principals get non-leaky 403/404 on
+cross-tenant access. The legacy `GATEWAY_ADMIN_TOKEN` authenticates as an
+explicit bootstrap platform-admin identity so scoped credentials and the
+legacy path coexist until production-verified.
+
+**Why**: Two real defects hid in the seams: a tenant-bound admin could mint
+API keys labeled with a foreign tenant (booking budgets/async jobs against
+it), and audit-details degradation would have silently rewritten
+atomicity-fault payloads. Matrix-in-one-place + join-based tenancy made both
+greppable.
+
+**Boundary**: Key-creation labels follow the `/admin/admins` rule (empty →
+caller's tenant, foreign → uniform 403 before store access); scope
+implications are operator/billing ⇒ viewer, platform-admin ⇒ all; failure
+throttling is per client host and counts invalid tokens too. `/admin/usage`
+is tenant-predicated, `/admin/management-log` is platform-scope (treat as
+platform-scope in lifecycle exports).
+
 ### Convention: Quota reservation/settlement behind quota.Gate
 
 **What**: Daily/monthly token quotas (`internal/quota`) reserve a deterministic
