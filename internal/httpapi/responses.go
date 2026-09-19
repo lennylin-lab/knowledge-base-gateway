@@ -37,6 +37,10 @@ type ResponsesHandler struct {
 	MaxBody  int64
 	MaxItems int
 	MaxChars int
+	// Async enables background:true acceptance (V1.4). Nil keeps the frozen
+	// synchronous-only behavior: background requests receive the stable 503
+	// job_queue_unavailable (the documented rollback posture).
+	Async *Async
 }
 
 // responsesWireTool accepts both function-tool dialects on /v1/responses:
@@ -93,7 +97,8 @@ type responsesWireFormat struct {
 	Strict bool            `json:"strict"`
 }
 
-// responsesRequest is the documented MVP request subset.
+// responsesRequest is the documented MVP request subset. Background (V1.4)
+// is additive and optional; absent or false keeps the synchronous contract.
 type responsesRequest struct {
 	Model           string              `json:"model"`
 	Input           json.RawMessage     `json:"input"`
@@ -106,6 +111,7 @@ type responsesRequest struct {
 	ResponseFormat  *chatWireFormat     `json:"response_format"`
 	Text            *responsesWireText  `json:"text"`
 	Metadata        json.RawMessage     `json:"metadata"`
+	Background      *bool               `json:"background"`
 }
 
 // toDomain translates the Responses request into the domain request.
@@ -357,11 +363,24 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Background requests never stream: a queued job has no live connection
+	// to stream to, so the combination is a stable 400 before admission.
+	if req.Background != nil && *req.Background && req.Stream {
+		err := fmt.Errorf("%w: background requests do not support streaming", errValidation)
+		fail(principal, err)
+		return
+	}
+
 	// 3. Shared admission pipeline: model/policy -> capability precheck ->
-	// clamps -> rate limit -> quota.
+	// clamps -> rate limit -> quota. Background requests reuse it verbatim;
+	// the reservation it holds is a creation-time gate only.
 	adm, auditErr := admit(w, r, deps, protocolResponses, publicModel, &mreq, principal)
 	if auditErr != nil {
 		fail(principal, auditErr)
+		return
+	}
+	if req.Background != nil && *req.Background {
+		h.createBackground(w, r, deps, requestID, traceID, principal, adm, publicModel, mreq, start)
 		return
 	}
 	defer adm.release()

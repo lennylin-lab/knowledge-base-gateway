@@ -10,14 +10,17 @@ import (
 // optional protocol handlers degrade independently: a nil Responses handler
 // disables /v1/responses and a nil Embeddings handler disables
 // /v1/embeddings (the documented rollback switches) without touching Chat
-// Completions.
+// Completions. The optional async handlers disable the V1.4 job query/cancel
+// endpoints when unset.
 type Deps struct {
-	Logger     *slog.Logger
-	ReadyFn    func() bool
-	Metrics    http.Handler
-	Responses  http.Handler // POST /v1/responses; nil disables the endpoint
-	Embeddings http.Handler // POST /v1/embeddings; nil disables the endpoint
-	Models     http.Handler // GET /v1/models, GET /v1/models/{model}
+	Logger          *slog.Logger
+	ReadyFn         func() bool
+	Metrics         http.Handler
+	Responses       http.Handler // POST /v1/responses; nil disables the endpoint
+	ResponsesGet    http.Handler // GET /v1/responses/{id}; nil disables it
+	ResponsesCancel http.Handler // POST /v1/responses/{id}/cancel; nil disables it
+	Embeddings      http.Handler // POST /v1/embeddings; nil disables the endpoint
+	Models          http.Handler // GET /v1/models, GET /v1/models/{model}
 }
 
 // NewMux wires all routes.
@@ -43,6 +46,12 @@ func NewMux(chat http.Handler, deps Deps) *http.ServeMux {
 	mux.Handle("/v1/chat/completions", methodGuard(chat, http.MethodPost))
 	if deps.Responses != nil {
 		mux.Handle("/v1/responses", methodGuard(deps.Responses, http.MethodPost))
+	}
+	if deps.ResponsesGet != nil {
+		mux.Handle("GET /v1/responses/{id}", deps.ResponsesGet)
+	}
+	if deps.ResponsesCancel != nil {
+		mux.Handle("POST /v1/responses/{id}/cancel", deps.ResponsesCancel)
 	}
 	if deps.Embeddings != nil {
 		mux.Handle("/v1/embeddings", methodGuard(deps.Embeddings, http.MethodPost))

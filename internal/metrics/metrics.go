@@ -27,6 +27,8 @@ type Registry struct {
 	tokens         *prometheus.CounterVec
 	rateLimit      *prometheus.CounterVec
 	duration       *prometheus.HistogramVec
+	asyncJobs      *prometheus.CounterVec
+	queueDepth     prometheus.Gauge
 }
 
 // New creates a registry with the gateway collectors plus the standard Go
@@ -55,9 +57,18 @@ func New() *Registry {
 		Help:    "Chat completion request duration in seconds.",
 		Buckets: requestDurationBuckets,
 	}, []string{"model", "status"})
+	r.asyncJobs = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_async_jobs_total",
+		Help: "Background jobs by terminal status (completed, failed, cancelled, expired).",
+	}, []string{"status"})
+	r.queueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "gateway_async_queue_depth",
+		Help: "Background jobs currently queued.",
+	})
 
 	reg.MustRegister(
 		r.requests, r.upstreamErrors, r.tokens, r.rateLimit, r.duration,
+		r.asyncJobs, r.queueDepth,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -89,6 +100,16 @@ func (r *Registry) IncRequest(model, status string) {
 // gateway_request_duration_seconds for the given labels.
 func (r *Registry) ObserveDuration(model, status string, d time.Duration) {
 	r.duration.WithLabelValues(model, status).Observe(d.Seconds())
+}
+
+// IncAsyncJob increments gateway_async_jobs_total for a terminal status.
+func (r *Registry) IncAsyncJob(status string) {
+	r.asyncJobs.WithLabelValues(status).Inc()
+}
+
+// SetAsyncQueueDepth records gateway_async_queue_depth from the worker sweep.
+func (r *Registry) SetAsyncQueueDepth(n int) {
+	r.queueDepth.Set(float64(n))
 }
 
 // Handler serves the Prometheus text exposition for this registry.

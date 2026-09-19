@@ -36,9 +36,37 @@ func writeError(w http.ResponseWriter, requestID string, status int, typ, code, 
 	}})
 }
 
+// V1.4 async error sentinels. New codes are additive to the stable envelope
+// and never change the existing sync mappings.
+var (
+	errIdempotencyConflict = errors.New("idempotency key conflict")
+	errResponseNotFound    = errors.New("response not found")
+	errResponseExpired     = errors.New("response expired")
+	errQueueUnavailable    = errors.New("job queue unavailable")
+)
+
 // mapError translates internal failures into the documented envelope without
 // leaking provider status codes, secrets, or internal details.
 func mapError(w http.ResponseWriter, requestID string, err error) {
+	// V1.4 async outcomes: the roadmap-stable codes, classified before the
+	// generic fallbacks so they can never collide with an internal 500.
+	switch {
+	case errors.Is(err, errQueueUnavailable):
+		// Job-store outage: 503-class, never disguised as a job failure.
+		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "job_queue_unavailable", "the service is temporarily unable to accept requests")
+		return
+	case errors.Is(err, errIdempotencyConflict):
+		writeError(w, requestID, http.StatusConflict, "invalid_request_error", "idempotency_conflict", "this Idempotency-Key was already used with a different request")
+		return
+	case errors.Is(err, errResponseNotFound):
+		// Non-leaky: absent and not-owned are indistinguishable.
+		writeError(w, requestID, http.StatusNotFound, "invalid_request_error", "response_not_found", "the response does not exist for this principal")
+		return
+	case errors.Is(err, errResponseExpired):
+		writeError(w, requestID, http.StatusGone, "invalid_request_error", "response_expired", "the response result has expired")
+		return
+	}
+
 	// Limiter/quota infrastructure failure: 503-class with a non-leaky
 	// envelope; must not be confused with a genuine limit denial (429).
 	if errors.Is(err, limiter.ErrUnavailable) {
