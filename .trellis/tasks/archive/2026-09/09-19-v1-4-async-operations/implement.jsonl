@@ -1,0 +1,4 @@
+{"file":"docs/v1.4-operations-and-async-roadmap.md","reason":"Authoritative V1.4 scope, ordering, compatibility, and acceptance criteria."}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"Package boundaries and provider isolation conventions."}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Migration, PostgreSQL/Redis ownership, unknown usage, and policy folding rules."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Required cross-layer contract and data-flow review."}

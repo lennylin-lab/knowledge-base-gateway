@@ -1,0 +1,4 @@
+{"file":"docs/v1.4-operations-and-async-roadmap.md","reason":"Verify every roadmap requirement and acceptance criterion is covered."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Repository test, infrastructure, security, and compatibility gates."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Stable error envelopes, cancellation, retry, and outage classification."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Metadata-only logging and redaction requirements."}
