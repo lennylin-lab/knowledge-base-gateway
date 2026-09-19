@@ -42,6 +42,10 @@ type AdminDeps struct {
 	// /admin/providers reflects the running process instead of the registry
 	// alone. A false ok leaves the store-reported fields untouched.
 	ProviderRuntime func(name string) (mgmt.ProviderRuntime, bool)
+	// Accounting is the pricing/budget management surface (V1.4, database
+	// mode). Nil disables /admin/prices and /admin/budgets and omits the
+	// budget-utilization section of /admin/usage.
+	Accounting AccountingAdmin
 }
 
 // NewAdminMux builds the management API. Endpoints are disabled (404) unless
@@ -119,6 +123,9 @@ func NewAdminMux(deps AdminDeps) *http.ServeMux {
 		mux.HandleFunc("/admin/audit", mgmtGuard)
 		mux.HandleFunc("/admin/usage", mgmtGuard)
 		mux.HandleFunc("/admin/management-log", mgmtGuard)
+	}
+	if deps.Accounting != nil {
+		registerAccountingAdmin(mux, guard, deps)
 	}
 	return mux
 }
@@ -228,7 +235,13 @@ func handleManagement(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
 			writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query usage")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"usage": rows})
+		body := map[string]any{"usage": rows}
+		if budgets, have := budgetUsageSection(deps, r); have {
+			// Wired accounting: current-period budget utilization. Nil stays
+			// nil when unwired so the section is detectably absent.
+			body["budgets"] = budgets
+		}
+		writeJSON(w, http.StatusOK, body)
 
 	case r.URL.Path == "/admin/management-log" && r.Method == http.MethodGet:
 		ops, err := deps.Mgmt.Ops(ctx, queryInt(r.URL.Query().Get("limit")))

@@ -193,7 +193,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           go test -race -count=1 -v \
-            ./cmd/gateway/ ./internal/limiter/ ./internal/quota/ ./internal/store/pg/ \
+            ./cmd/gateway/ ./internal/accounting/ ./internal/limiter/ ./internal/quota/ ./internal/store/pg/ \
             2>&1 | tee artifacts/integration-test.log
           skips=$(grep -c -- '--- SKIP' artifacts/integration-test.log || true)
           if [ "$skips" -ne 0 ]; then

@@ -232,6 +232,36 @@ type openaiWireUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// Optional token-detail classes reported by newer upstreams (V1.4
+	// pricing charges them only when reported).
+	PromptTokensDetails     *openaiWirePromptTokensDetails     `json:"prompt_tokens_details"`
+	CompletionTokensDetails *openaiWireCompletionTokensDetails `json:"completion_tokens_details"`
+}
+
+type openaiWirePromptTokensDetails struct {
+	CachedTokens *int `json:"cached_tokens"`
+}
+
+type openaiWireCompletionTokensDetails struct {
+	ReasoningTokens *int `json:"reasoning_tokens"`
+}
+
+// toModelUsage converts the wire usage; the detail classes ride only when
+// the upstream reported them.
+func (w *openaiWireUsage) toModelUsage() *model.Usage {
+	u := &model.Usage{
+		PromptTokens:     w.PromptTokens,
+		CompletionTokens: w.CompletionTokens,
+		TotalTokens:      w.TotalTokens,
+		Known:            true,
+	}
+	if w.PromptTokensDetails != nil {
+		u.CachedInputTokens = w.PromptTokensDetails.CachedTokens
+	}
+	if w.CompletionTokensDetails != nil {
+		u.ReasoningTokens = w.CompletionTokensDetails.ReasoningTokens
+	}
+	return u
 }
 
 type openaiWireResponse struct {
@@ -304,12 +334,7 @@ func (o *OpenAI) Complete(ctx context.Context, req model.Request) (model.Respons
 	}
 	out := normalizeResponse(&wire)
 	if wire.Usage != nil {
-		out.Usage = &model.Usage{
-			PromptTokens:     wire.Usage.PromptTokens,
-			CompletionTokens: wire.Usage.CompletionTokens,
-			TotalTokens:      wire.Usage.TotalTokens,
-			Known:            true,
-		}
+		out.Usage = wire.Usage.toModelUsage()
 	}
 	return out, nil
 }
@@ -399,10 +424,7 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 		// stream_options.include_usage the final usage chunk carries empty
 		// choices, and skipping it would lose the reported usage.
 		if chunk.Usage != nil {
-			usage = &model.Usage{
-				PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens,
-				TotalTokens: chunk.Usage.TotalTokens, Known: true,
-			}
+			usage = chunk.Usage.toModelUsage()
 		}
 		if len(chunk.Choices) == 0 {
 			continue

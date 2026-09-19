@@ -21,14 +21,16 @@ var requestDurationBuckets = []float64{
 
 // Registry holds the labeled gateway metrics and exposes them at /metrics.
 type Registry struct {
-	reg            *prometheus.Registry
-	requests       *prometheus.CounterVec
-	upstreamErrors *prometheus.CounterVec
-	tokens         *prometheus.CounterVec
-	rateLimit      *prometheus.CounterVec
-	duration       *prometheus.HistogramVec
-	asyncJobs      *prometheus.CounterVec
-	queueDepth     prometheus.Gauge
+	reg                *prometheus.Registry
+	requests           *prometheus.CounterVec
+	upstreamErrors     *prometheus.CounterVec
+	tokens             *prometheus.CounterVec
+	rateLimit          *prometheus.CounterVec
+	duration           *prometheus.HistogramVec
+	asyncJobs          *prometheus.CounterVec
+	queueDepth         prometheus.Gauge
+	budgetDenials      *prometheus.CounterVec
+	settlementFailures prometheus.Counter
 }
 
 // New creates a registry with the gateway collectors plus the standard Go
@@ -65,10 +67,18 @@ func New() *Registry {
 		Name: "gateway_async_queue_depth",
 		Help: "Background jobs currently queued.",
 	})
+	r.budgetDenials = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_budget_denials_total",
+		Help: "Monetary budget denials by scope (subject, tenant).",
+	}, []string{"scope"})
+	r.settlementFailures = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_ledger_settlement_failures_total",
+		Help: "Usage-ledger settlements that failed and remain retryable (reserved rows kept).",
+	})
 
 	reg.MustRegister(
 		r.requests, r.upstreamErrors, r.tokens, r.rateLimit, r.duration,
-		r.asyncJobs, r.queueDepth,
+		r.asyncJobs, r.queueDepth, r.budgetDenials, r.settlementFailures,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -110,6 +120,17 @@ func (r *Registry) IncAsyncJob(status string) {
 // SetAsyncQueueDepth records gateway_async_queue_depth from the worker sweep.
 func (r *Registry) SetAsyncQueueDepth(n int) {
 	r.queueDepth.Set(float64(n))
+}
+
+// IncBudgetDenial increments gateway_budget_denials_total for the denying
+// scope (subject or tenant).
+func (r *Registry) IncBudgetDenial(scope string) {
+	r.budgetDenials.WithLabelValues(scope).Inc()
+}
+
+// IncSettlementFailure increments gateway_ledger_settlement_failures_total.
+func (r *Registry) IncSettlementFailure() {
+	r.settlementFailures.Inc()
 }
 
 // Handler serves the Prometheus text exposition for this registry.

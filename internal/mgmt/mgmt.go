@@ -187,7 +187,14 @@ type UsageRow struct {
 	// measured", never fabricated zero.
 	FirstTokenP50Millis *int64 `json:"first_token_p50_ms"`
 	FirstTokenP95Millis *int64 `json:"first_token_p95_ms"`
-	CostMicros          *int64 `json:"cost_micros"` // sum of known estimated cost; null when none known
+	CostMicros          *int64 `json:"cost_micros"` // sum of known settled cost; null when none known
+
+	// V1.4 ledger-derived cost fields: UnknownCostRequests counts settled
+	// ledger rows in the window whose cost stayed unknown (never counted as
+	// zero), and PriceVersions names the distinct price versions that
+	// produced the known cost, so every reported cost is explainable.
+	UnknownCostRequests int64 `json:"unknown_cost_requests"`
+	PriceVersions       []int `json:"price_versions,omitempty"`
 }
 
 // AdminOp is one management-operation audit record.
@@ -198,6 +205,77 @@ type AdminOp struct {
 	Target       string          `json:"target"`
 	AdminSubject string          `json:"admin_subject"`
 	Detail       json.RawMessage `json:"detail,omitempty"`
+}
+
+// PriceView is one pricing_catalog row: micros per token per class, in one
+// currency, effective from the given instant. Money is integer micros only.
+type PriceView struct {
+	Provider                  string    `json:"provider"`
+	PublicModel               string    `json:"public_model"`
+	PriceVersion              int       `json:"price_version"`
+	Currency                  string    `json:"currency"`
+	InputMicrosPerToken       int64     `json:"input_micros_per_token"`
+	OutputMicrosPerToken      int64     `json:"output_micros_per_token"`
+	ReasoningMicrosPerToken   *int64    `json:"reasoning_micros_per_token"`
+	CachedInputMicrosPerToken *int64    `json:"cached_input_micros_per_token"`
+	EffectiveFrom             time.Time `json:"effective_from"`
+	CreatedAt                 time.Time `json:"created_at"`
+}
+
+// PriceInput upserts one price version (keyed by provider, public model,
+// version).
+type PriceInput struct {
+	Provider                  string
+	PublicModel               string
+	PriceVersion              int
+	Currency                  string
+	InputMicrosPerToken       int64
+	OutputMicrosPerToken      int64
+	ReasoningMicrosPerToken   *int64
+	CachedInputMicrosPerToken *int64
+	EffectiveFrom             time.Time // zero means now
+}
+
+// BudgetView is one budget_policies row: a monetary cap per scope/period in
+// one currency.
+type BudgetView struct {
+	ID           int64     `json:"id"`
+	Scope        string    `json:"scope"`
+	SubjectID    string    `json:"subject_id,omitempty"`
+	TenantID     string    `json:"tenant_id"`
+	Period       string    `json:"period"`
+	Currency     string    `json:"currency"`
+	AmountMicros int64     `json:"amount_micros"`
+	Enabled      bool      `json:"enabled"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// BudgetInput upserts one budget (keyed by scope, target, period, currency).
+// Enabled nil defaults to true.
+type BudgetInput struct {
+	Scope        string
+	SubjectID    string
+	TenantID     string
+	Period       string
+	Currency     string
+	AmountMicros int64
+	Enabled      *bool
+}
+
+// BudgetUsageView is one budget's current-period utilization, computed from
+// settled ledger rows: the sum of known cost and the number of settlements
+// whose cost stayed unknown. Unknown-cost settlements are surfaced
+// separately — they are never counted as zero spend.
+type BudgetUsageView struct {
+	Scope                  string `json:"scope"`
+	SubjectID              string `json:"subject_id,omitempty"`
+	TenantID               string `json:"tenant_id"`
+	Period                 string `json:"period"`
+	Currency               string `json:"currency"`
+	LimitMicros            int64  `json:"limit_micros"`
+	UsedMicros             int64  `json:"used_micros"`
+	UnknownCostSettlements int64  `json:"unknown_cost_settlements"`
 }
 
 // NormalizeOp fills management-audit defaults so every store implementation

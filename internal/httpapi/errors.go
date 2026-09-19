@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
@@ -67,10 +68,34 @@ func mapError(w http.ResponseWriter, requestID string, err error) {
 		return
 	}
 
-	// Limiter/quota infrastructure failure: 503-class with a non-leaky
-	// envelope; must not be confused with a genuine limit denial (429).
+	// Limiter/quota/accounting infrastructure failure: 503-class with a
+	// non-leaky envelope; must not be confused with a genuine limit denial
+	// (429).
 	if errors.Is(err, limiter.ErrUnavailable) {
 		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "limiter_unavailable", "the service is temporarily unable to accept requests")
+		return
+	}
+	// V1.4 cost-governance outcomes, classified before every 429 branch so
+	// an outage can never surface as a budget denial.
+	if errors.Is(err, accounting.ErrPricingUnavailable) {
+		// A configured monetary budget applies but no effective price exists
+		// for the model (or its currency): the gateway cannot evaluate the
+		// budget, so the request fails before provider work. Operators fix
+		// this by publishing a price; retrying cannot.
+		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "pricing_unavailable", "no effective price is configured for this model while a monetary budget applies")
+		return
+	}
+	if errors.Is(err, accounting.ErrBudgetConfig) {
+		// Budget policy rows disagree on currency: a loud configuration
+		// error, never a client fault and never a bypass.
+		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "budget_configuration_error", "the configured monetary budgets are invalid")
+		return
+	}
+	var aErr *accounting.Error
+	if errors.As(err, &aErr) && aErr.Code == accounting.CodeBudgetExceeded {
+		// Budget exhaustion: 429 with the stable code; Retry-After (the UTC
+		// boundary) is set by the admission path that produced the denial.
+		writeError(w, requestID, http.StatusTooManyRequests, "rate_limit_error", aErr.Code, "monetary budget exceeded for this principal")
 		return
 	}
 	var qErr *quota.Error

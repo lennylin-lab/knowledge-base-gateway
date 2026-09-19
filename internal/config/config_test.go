@@ -374,3 +374,36 @@ func TestAsyncEnabledFlagAndValidation(t *testing.T) {
 		}
 	}
 }
+
+// TestBudgetsEnabledFlag mirrors the rollout-switch convention: opt-in,
+// exact-on "true", default off — enforcement only, never ledger capture.
+func TestBudgetsEnabledFlag(t *testing.T) {
+	base := map[string]string{
+		"GATEWAY_API_KEYS": "key-1:tenant-a:sk-abc",
+		"GATEWAY_MODELS":   "gpt-a:fake:gpt-a",
+	}
+	setEnv(t, base)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BudgetsEnabled {
+		t.Error("budget enforcement must default to disabled (gradual rollout)")
+	}
+	setEnv(t, map[string]string{
+		"GATEWAY_API_KEYS":        base["GATEWAY_API_KEYS"],
+		"GATEWAY_MODELS":          base["GATEWAY_MODELS"],
+		"GATEWAY_BUDGETS_ENABLED": "true",
+	})
+	if cfg, err = FromEnv(); err != nil || !cfg.BudgetsEnabled {
+		t.Errorf("GATEWAY_BUDGETS_ENABLED=true: enabled=%v err=%v", cfg.BudgetsEnabled, err)
+	}
+	setEnv(t, map[string]string{
+		"GATEWAY_API_KEYS":        base["GATEWAY_API_KEYS"],
+		"GATEWAY_MODELS":          base["GATEWAY_MODELS"],
+		"GATEWAY_BUDGETS_ENABLED": "TRUE",
+	})
+	if cfg, err = FromEnv(); err != nil || cfg.BudgetsEnabled {
+		t.Errorf("only the exact string \"true\" enables: enabled=%v err=%v", cfg.BudgetsEnabled, err)
+	}
+}

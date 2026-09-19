@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
@@ -148,16 +149,17 @@ type Authenticator interface {
 
 // ChatHandler serves POST /v1/chat/completions.
 type ChatHandler struct {
-	Auth     Authenticator
-	Service  *gateway.Service
-	Policy   *policy.Policy
-	Limiter  limiter.Gate
-	Quota    quota.Gate
-	Audit    audit.Sink
-	Metrics  *metrics.Registry
-	MaxBody  int64
-	MaxMsgs  int
-	MaxChars int
+	Auth       Authenticator
+	Service    *gateway.Service
+	Policy     *policy.Policy
+	Limiter    limiter.Gate
+	Quota      quota.Gate
+	Accounting *accounting.Gate
+	Audit      audit.Sink
+	Metrics    *metrics.Registry
+	MaxBody    int64
+	MaxMsgs    int
+	MaxChars   int
 }
 
 func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -253,15 +255,15 @@ func (h *ChatHandler) record(deps admissionDeps, requestID, traceID string, prin
 func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
 	resp, providerName, err := h.Service.Complete(r.Context(), adm.plan, preq)
 	if err != nil {
-		// No billable response: refund the reservation idempotently.
-		adm.qres.Release()
+		// No billable response: refund the reservations idempotently.
+		adm.refund()
 		mapError(w, requestID, err)
 		h.record(deps, requestID, traceID, principal, modelName, providerName, 0, err, adm.attempts(), nil, false, start, nil)
 		return
 	}
 	// Settle exactly once to the reported total; unknown usage keeps the
 	// conservative reservation and is never fabricated as zero.
-	adm.qres.Settle(usageTotal(resp.Usage))
+	adm.settle(providerName, resp.Usage)
 
 	// Final output validation: failures are recorded in audit (never marked
 	// successful silently) but the transport still delivers the payload.
@@ -279,8 +281,8 @@ func (h *ChatHandler) complete(w http.ResponseWriter, r *http.Request, deps admi
 func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
 	flusher, canFlush := w.(http.Flusher)
 	if !canFlush {
-		// No provider call will happen; refund the reservation.
-		adm.qres.Release()
+		// No provider call will happen; refund the reservations.
+		adm.refund()
 		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "streaming_unsupported", "streaming is not supported by this connection")
 		return
 	}
@@ -298,8 +300,8 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admiss
 		usage = final.Usage
 		// Settle exactly once to the reported stream total (idempotent
 		// finalize); unknown usage keeps the conservative reservation —
-		// Settle(nil) is a deliberate no-op.
-		adm.qres.Settle(usageTotal(usage))
+		// Settle with unknown usage is a deliberate no-op.
+		adm.settle(providerName, usage)
 		// Final output validation: invalid streamed tool arguments or
 		// structured output are recorded in audit, never silently marked
 		// successful. The V1 transport has no post-output failure event, so
@@ -315,7 +317,7 @@ func (h *ChatHandler) stream(w http.ResponseWriter, r *http.Request, deps admiss
 		// Failed before any output: nothing billable, refund idempotently.
 		// Failures after output started keep the conservative reservation
 		// because the consumed usage is unknown and never fabricated.
-		adm.qres.Release()
+		adm.refund()
 	}
 	recordErr := err
 	if recordErr == nil {

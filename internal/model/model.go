@@ -121,12 +121,17 @@ func (r Request) LastUserText() string {
 }
 
 // Usage reports token counts. Known is false when the upstream supplied no
-// usage; the values must then not be treated as zero.
+// usage; the values must then not be treated as zero. ReasoningTokens and
+// CachedInputTokens are the optional token-detail classes the upstream may
+// report alongside the base counts (V1.4 pricing charges them only when
+// reported); nil means the class was not reported.
 type Usage struct {
-	PromptTokens     int  `json:"prompt_tokens"`
-	CompletionTokens int  `json:"completion_tokens"`
-	TotalTokens      int  `json:"total_tokens"`
-	Known            bool `json:"-"`
+	PromptTokens      int  `json:"prompt_tokens"`
+	CompletionTokens  int  `json:"completion_tokens"`
+	TotalTokens       int  `json:"total_tokens"`
+	ReasoningTokens   *int `json:"-"`
+	CachedInputTokens *int `json:"-"`
+	Known             bool `json:"-"`
 }
 
 // OutputKind discriminates domain output items.

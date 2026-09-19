@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
@@ -28,23 +29,25 @@ import (
 
 // EmbeddingsHandler serves POST /v1/embeddings.
 type EmbeddingsHandler struct {
-	Auth     Authenticator
-	Service  *gateway.Service
-	Policy   *policy.Policy
-	Limiter  limiter.Gate
-	Quota    quota.Gate
-	Audit    audit.Sink
-	Metrics  *metrics.Registry
-	MaxBody  int64
-	MaxItems int
-	MaxChars int
+	Auth       Authenticator
+	Service    *gateway.Service
+	Policy     *policy.Policy
+	Limiter    limiter.Gate
+	Quota      quota.Gate
+	Accounting *accounting.Gate
+	Audit      audit.Sink
+	Metrics    *metrics.Registry
+	MaxBody    int64
+	MaxItems   int
+	MaxChars   int
 }
 
 // fromEmbeddings builds the shared deps from an EmbeddingsHandler's fields.
 func fromEmbeddings(h *EmbeddingsHandler) admissionDeps {
 	return admissionDeps{
 		Auth: h.Auth, Service: h.Service, Policy: h.Policy,
-		Limiter: h.Limiter, Quota: h.Quota, Audit: h.Audit, Metrics: h.Metrics,
+		Limiter: h.Limiter, Quota: h.Quota, Accounting: h.Accounting,
+		Audit: h.Audit, Metrics: h.Metrics,
 	}
 }
 
@@ -159,15 +162,15 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, providerName, err := h.Service.Embeddings(r.Context(), adm.plan, ereq)
 	if err != nil {
-		// No billable response: refund the reservation idempotently.
-		adm.qres.Release()
+		// No billable response: refund the reservations idempotently.
+		adm.refund()
 		mapError(w, requestID, err)
 		h.record(deps, requestID, traceID, principal, publicModel, providerName, 0, err, adm.attempts(), nil, start)
 		return
 	}
 	// Settle exactly once to the reported input-token total; unknown usage
 	// keeps the conservative reservation and is never fabricated as zero.
-	adm.qres.Settle(usageTotal(resp.Usage))
+	adm.settle(providerName, resp.Usage)
 
 	// Dimension gate: a response vector whose width differs from the
 	// catalog-declared embedding_dim is a gateway configuration error. It

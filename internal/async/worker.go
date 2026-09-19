@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
@@ -83,17 +84,18 @@ type ResultEncoder interface {
 
 // PoolDeps carries the worker collaborators.
 type PoolDeps struct {
-	Store   Store
-	Service *gateway.Service
-	Policy  *policy.Policy
-	Limiter limiter.Gate
-	Quota   quota.Gate
-	Audit   audit.Sink
-	Metrics *metrics.Registry
-	Logger  *slog.Logger
-	Cancels *CancelRegistry
-	Encoder ResultEncoder
-	Now     func() time.Time
+	Store      Store
+	Service    *gateway.Service
+	Policy     *policy.Policy
+	Limiter    limiter.Gate
+	Quota      quota.Gate
+	Accounting *accounting.Gate
+	Audit      audit.Sink
+	Metrics    *metrics.Registry
+	Logger     *slog.Logger
+	Cancels    *CancelRegistry
+	Encoder    ResultEncoder
+	Now        func() time.Time
 }
 
 // PoolConfig bounds the pool and every job lifecycle knob. All values are
@@ -324,8 +326,9 @@ func (p *Pool) sleepOrWake(d time.Duration) {
 func (p *Pool) log() *slog.Logger { return p.deps.Logger }
 
 // run executes one claimed job end to end: decode, re-admit, apply the same
-// limiter/quota gates as the sync path, invoke the gateway service on a
-// detached bounded context, then commit the outcome through the store CAS.
+// limiter/quota/money-budget gates as the sync path, invoke the gateway
+// service on a detached bounded context, then commit the outcome through the
+// store CAS.
 func (p *Pool) run(cl Claimed) {
 	start := p.deps.Now()
 	job := cl.Job
@@ -378,16 +381,27 @@ func (p *Pool) run(cl Claimed) {
 	}
 	defer release()
 
-	// Token quota: reserve the same deterministic estimate the sync path
-	// would, settle to the reported usage at the terminal handoff, release on
-	// outcomes that produced no billable response.
-	qres := quota.Done
-	if p.deps.Quota != nil && p.deps.Policy != nil {
-		limits, lErr := policy.NewResolver(p.deps.Policy).LimitsFor(p.ctx, job.SubjectID, job.PublicModel)
+	// Re-reservations against current state, both from the same
+	// deterministic estimate the sync path uses: token quota first, then
+	// monetary budgets, so the background path can never bypass either
+	// gate the synchronous admission enforces.
+	var limits policy.Limits
+	if p.deps.Policy != nil {
+		l, lErr := policy.NewResolver(p.deps.Policy).LimitsFor(p.ctx, job.SubjectID, job.PublicModel)
 		if lErr != nil {
+			// Resolver infrastructure failure: requeue free, never execute
+			// against unknown limits.
 			p.requeue(job, false, p.cfg.PollInterval)
 			return
 		}
+		limits = l
+	}
+
+	// Token quota: reserve the deterministic estimate, settle to the
+	// reported usage at the terminal handoff, release on outcomes that
+	// produced no billable response.
+	qres := quota.Done
+	if p.deps.Quota != nil {
 		ql := quota.Limits{DailyTokens: limits.DailyTokens, MonthlyTokens: limits.MonthlyTokens}
 		if ql.Configured() {
 			est := quota.Estimate(mreq.MaxTokens, limits.MaxOutputTokens, mreq.InputChars())
@@ -407,6 +421,61 @@ func (p *Pool) run(cl Claimed) {
 		}
 	}
 
+	// Money budgets (V1.4): reserve the same estimate against the subject's
+	// and tenant's monetary budgets. A configured budget with no applicable
+	// price fails terminally as pricing_unavailable — the budget can never
+	// be bypassed; infrastructure failures requeue free.
+	money := accounting.Reservation(nil)
+	if p.deps.Accounting != nil {
+		in := quota.InputTokens(mreq.InputChars())
+		estimate := accounting.Usage{PromptTokens: &in}
+		if job.Protocol != protocolEmbeddings {
+			out := quota.Estimate(mreq.MaxTokens, limits.MaxOutputTokens, mreq.InputChars()) - in
+			estimate.CompletionTokens = &out
+		}
+		res, aErr := p.deps.Accounting.Reserve(p.ctx, accounting.ReserveInput{
+			Identity:    accounting.Identity{JobID: job.ID},
+			SubjectID:   job.SubjectID,
+			TenantID:    job.TenantID,
+			Protocol:    job.Protocol,
+			PublicModel: job.PublicModel,
+			Provider:    plan.Primary(),
+			Estimate:    estimate,
+			Now:         p.deps.Now(),
+		})
+		if aErr != nil {
+			qres.Release()
+			var denial *accounting.Error
+			var class string
+			switch {
+			case errors.As(aErr, &denial):
+				// Exhausted budget: retrying cannot help until the period
+				// resets, so the job fails terminally.
+				class = "budget_exceeded"
+				if p.deps.Metrics != nil {
+					p.deps.Metrics.IncBudgetDenial(denial.Scope)
+				}
+			case errors.Is(aErr, accounting.ErrPricingUnavailable),
+				errors.Is(aErr, accounting.ErrBudgetConfig):
+				// The budget cannot be evaluated (no price / invalid policy):
+				// refusing loudly beats silently bypassing it.
+				class = "pricing_unavailable"
+				if errors.Is(aErr, accounting.ErrBudgetConfig) {
+					class = "budget_configuration_error"
+				}
+			default:
+				// Infrastructure outage: never the job's fault, never a
+				// terminal outcome.
+				p.requeue(job, false, p.cfg.PollInterval)
+				return
+			}
+			p.commitFailure(job, class, "", start)
+			return
+		}
+		money = res
+	}
+	res := reservations{quota: qres, money: money}
+
 	// Detached bounded execution: the provider call survives HTTP shutdown
 	// and pool intake stop, bounded by the job timeout, cancellable through
 	// the registry when a client cancel wins its store transition.
@@ -422,10 +491,46 @@ func (p *Pool) run(cl Claimed) {
 	close(heartbeatDone)
 
 	if err != nil {
-		p.runFailed(job, qres, execCtx, err, providerName, start)
+		p.runFailed(job, res, execCtx, err, providerName, start)
 		return
 	}
-	p.runSucceeded(execCtx, job, qres, mreq, resp, providerName, start)
+	p.runSucceeded(execCtx, job, res, mreq, resp, providerName, start)
+}
+
+// protocolEmbeddings mirrors the HTTP-layer protocol label for the one
+// per-protocol accounting distinction (embeddings reserve input tokens only).
+const protocolEmbeddings = "embeddings"
+
+// reservations pairs the token-quota and money-budget reservation handles so
+// every terminal path finalizes both exactly once. The zero value finalizes
+// nothing.
+type reservations struct {
+	quota quota.Reservation
+	money accounting.Reservation
+}
+
+// release refunds both reservations (no billable outcome). Idempotent.
+func (r reservations) release() {
+	if r.quota != nil {
+		r.quota.Release()
+	}
+	if r.money != nil {
+		_ = r.money.Release()
+	}
+}
+
+// settle finalizes both reservations to the reported usage exactly once.
+// Unknown usage keeps the conservative reservations; a settlement failure is
+// returned so the caller makes it observable (the ledger row stays
+// 'reserved' as the retryable record — never silently marked settled).
+func (r reservations) settle(providerName string, usage *model.Usage) error {
+	if r.quota != nil {
+		r.quota.Settle(usageTotal(usage))
+	}
+	if r.money == nil {
+		return nil
+	}
+	return r.money.Settle(providerName, accounting.UsageFrom(usage))
 }
 
 // runSucceeded commits a completed execution, converting output-validation
@@ -433,7 +538,7 @@ func (p *Pool) run(cl Claimed) {
 // runs on the detached execution context: it must land during the shutdown
 // drain window (the pool context is already stopping then), and a drain-timeout
 // abort cancels the same context, so the commit can never outlive the job.
-func (p *Pool) runSucceeded(execCtx context.Context, job Job, qres quota.Reservation, mreq model.Request, resp model.Response, providerName string, start time.Time) {
+func (p *Pool) runSucceeded(execCtx context.Context, job Job, res reservations, mreq model.Request, resp model.Response, providerName string, start time.Time) {
 	auditErr := model.ValidateOutput(mreq, resp)
 	envelope, encErr := p.deps.Encoder.EncodeResult(job.PublicModel, job.ID, resp, mreq.Metadata)
 	class := ""
@@ -457,17 +562,19 @@ func (p *Pool) runSucceeded(execCtx context.Context, job Job, qres quota.Reserva
 			BumpAttempt:     true,
 			Now:             p.deps.Now(),
 		})
-		// Single terminal handoff: the CAS winner settles the reservation to
-		// the reported usage (unknown usage retains the conservative
-		// reservation) and writes the one audit record; the loser releases.
-		p.handoff(won, cErr, job, reqID, qres, resp.Usage, providerName, start, "")
+		// Single terminal handoff: the CAS winner settles both reservations
+		// to the reported usage (unknown usage retains the conservative
+		// reservation) and writes the one audit record; the loser releases —
+		// except the cancel-after-output race, where the loser settles by
+		// the known usage (see handoff).
+		p.handoff(won, cErr, job, reqID, res, resp.Usage, providerName, start, "")
 		return
 	}
 	// The upstream produced a billable response the gateway cannot deliver as
 	// stored: commit the failure with the real usage settled.
 	failEnv, ferr := p.deps.Encoder.EncodeFailure(job.PublicModel, job.ID, class)
 	if ferr != nil {
-		qres.Release()
+		res.release()
 		p.log().Error("async: encode failure envelope", "job_id", job.ID, "error", ferr)
 		return
 	}
@@ -481,37 +588,37 @@ func (p *Pool) runSucceeded(execCtx context.Context, job Job, qres quota.Reserva
 		BumpAttempt:     true,
 		Now:             p.deps.Now(),
 	})
-	p.handoff(won, cErr, job, reqID, qres, resp.Usage, providerName, start, class)
+	p.handoff(won, cErr, job, reqID, res, resp.Usage, providerName, start, class)
 }
 
 // runFailed classifies an execution error and either requeues (retry-eligible
 // pre-output failures have no partial output by construction of Complete) or
 // commits the terminal failure.
-func (p *Pool) runFailed(job Job, qres quota.Reservation, execCtx context.Context, err error, providerName string, start time.Time) {
+func (p *Pool) runFailed(job Job, res reservations, execCtx context.Context, err error, providerName string, start time.Time) {
 	// Abort hand-back (context.Canceled only): a shutdown drain, a client
 	// cancel, or a lost lease stopped the execution before any outcome; the
 	// lease returns to the queue without spending an attempt and without
 	// backoff, so another worker (or the restarted process) takes over
 	// immediately. A client-cancel abort reaches the same shape but its store
 	// transition already decided the job; the requeue CAS below loses, the
-	// reservation is released, and no second handoff is written. A job-timeout
-	// deadline is NOT an abort: it falls through to the retry/terminal
-	// classification below and consumes an attempt, so a hung provider can
-	// never recycle a job forever.
+	// reservations are released, and no second handoff is written. A
+	// job-timeout deadline is NOT an abort: it falls through to the
+	// retry/terminal classification below and consumes an attempt, so a hung
+	// provider can never recycle a job forever.
 	if errors.Is(execCtx.Err(), context.Canceled) {
-		qres.Release()
+		res.release()
 		p.requeue(job, false, 0)
 		return
 	}
 	if provider.RetryEligible(err) && job.AttemptCount+1 < p.cfg.MaxAttempts {
-		qres.Release()
+		res.release()
 		p.requeue(job, true, p.cfg.PollInterval)
 		return
 	}
 	class := providerClassOf(err)
 	failEnv, ferr := p.deps.Encoder.EncodeFailure(job.PublicModel, job.ID, class)
 	if ferr != nil {
-		qres.Release()
+		res.release()
 		p.log().Error("async: encode failure envelope", "job_id", job.ID, "error", ferr)
 		return
 	}
@@ -529,7 +636,7 @@ func (p *Pool) runFailed(job Job, qres quota.Reservation, execCtx context.Contex
 		BumpAttempt:     true,
 		Now:             p.deps.Now(),
 	})
-	p.handoff(won, cErr, job, reqID, qres, nil, providerName, start, class)
+	p.handoff(won, cErr, job, reqID, res, nil, providerName, start, class)
 }
 
 // readmit re-resolves model authorization, capabilities, and routing for the
@@ -617,7 +724,7 @@ func (p *Pool) requeue(job Job, bump bool, backoff time.Duration) {
 const storeOpTimeout = 5 * time.Second
 
 // commitFailure commits a no-usage terminal failure (pre-execution
-// classifications: re-admission, quota denial, undecodable payload).
+// classifications: re-admission, quota/budget denial, undecodable payload).
 func (p *Pool) commitFailure(job Job, class, providerName string, start time.Time) {
 	env, err := p.deps.Encoder.EncodeFailure(job.PublicModel, job.ID, class)
 	if err != nil {
@@ -635,34 +742,48 @@ func (p *Pool) commitFailure(job Job, class, providerName string, start time.Tim
 		BumpAttempt:     true,
 		Now:             p.deps.Now(),
 	})
-	p.handoff(won, cerr, job, reqID, nil, nil, providerName, start, class)
+	p.handoff(won, cerr, job, reqID, reservations{}, nil, providerName, start, class)
 }
 
 // handoff performs the single terminal audit/accounting handoff. The store
-// CAS decides: only the winner settles (unknown usage retains the
-// conservative reservation) and writes the one terminal audit record; the
-// loser releases its reservation and writes nothing. requestID is the same
-// final request ID persisted on the job row, so the audit record correlates
-// with the stored outcome even though the claim-time job copy predates it.
-func (p *Pool) handoff(won bool, cerr error, job Job, requestID string, qres quota.Reservation, usage *model.Usage, providerName string, start time.Time, class string) {
+// CAS decides: only the winner settles both reservations to the reported
+// usage (unknown usage retains the conservative reservation) and writes the
+// one terminal audit record; the loser releases its reservations and writes
+// no audit record.
+//
+// One deliberate exception — the child-3 settlement handoff: when a client
+// cancel wins the transition AFTER the provider produced reported usage, the
+// cancelled job will never re-execute, so the losing worker records the one
+// settlement from the usage it observed instead of dropping it (the roadmap's
+// "jobs with existing output settle by known usage"). The cancel winner (the
+// HTTP cancel handler) writes the cancellation audit record but knows no
+// usage; the exactly-once ledger settlement makes the two racers safe: this
+// loser writes the settled ledger row, and any repeated finalization is a
+// no-op. Any other loss (lease recovery returns the job to the queue) still
+// releases, because the retry re-reserves and settles.
+func (p *Pool) handoff(won bool, cerr error, job Job, requestID string, res reservations, usage *model.Usage, providerName string, start time.Time, class string) {
 	if cerr != nil {
 		// Commit failed: never fabricate a settlement. The job is recovered
 		// by lease expiry if the commit did not land.
-		if qres != nil {
-			qres.Release()
-		}
+		res.release()
 		p.log().Error("async: terminal commit failed", "job_id", job.ID, "error", cerr)
 		return
 	}
 	if !won {
 		// A racing decision (cancel, recovery) owns the terminal handoff.
-		if qres != nil {
-			qres.Release()
+		if usage != nil && usage.Known && p.jobCancelled(job.ID) {
+			// Cancel-after-output: settle by known usage. A settlement
+			// failure stays observable and retryable via the reserved row.
+			if err := res.settle(providerName, usage); err != nil {
+				p.settleFailed(job.ID, err)
+			}
+			return
 		}
+		res.release()
 		return
 	}
-	if qres != nil {
-		qres.Settle(usageTotal(usage))
+	if err := res.settle(providerName, usage); err != nil {
+		p.settleFailed(job.ID, err)
 	}
 	if class == "" {
 		p.incJob(string(StatusCompleted))
@@ -683,6 +804,31 @@ func (p *Pool) handoff(won bool, cerr error, job Job, requestID string, qres quo
 		}
 		p.deps.Audit.Write(evt)
 	}
+}
+
+// settleFailed records a failed ledger settlement: counted, logged, and left
+// retryable — the 'reserved' ledger row remains as the durable evidence and
+// can be re-driven; it is never silently marked settled.
+func (p *Pool) settleFailed(jobID string, err error) {
+	if p.deps.Metrics != nil {
+		p.deps.Metrics.IncSettlementFailure()
+	}
+	p.log().Error("accounting: usage settlement failed; ledger row remains reserved",
+		"job_id", jobID, "error", err)
+}
+
+// jobCancelled reads the store's decision for a lost terminal race: true
+// only when the job transitioned to cancelled (cancel won). Any read error
+// answers false so the caller takes the safe default (release); the
+// settlement would have failed on a broken store anyway.
+func (p *Pool) jobCancelled(jobID string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), storeOpTimeout)
+	defer cancel()
+	j, err := p.deps.Store.Get(ctx, jobID, p.deps.Now())
+	if err != nil {
+		return false
+	}
+	return j.Status == StatusCancelled
 }
 
 // auditLeaseLost writes the terminal audit record for a job the sweep

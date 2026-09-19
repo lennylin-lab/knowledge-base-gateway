@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
@@ -27,16 +28,17 @@ import (
 
 // ResponsesHandler serves POST /v1/responses.
 type ResponsesHandler struct {
-	Auth     Authenticator
-	Service  *gateway.Service
-	Policy   *policy.Policy
-	Limiter  limiter.Gate
-	Quota    quota.Gate
-	Audit    audit.Sink
-	Metrics  *metrics.Registry
-	MaxBody  int64
-	MaxItems int
-	MaxChars int
+	Auth       Authenticator
+	Service    *gateway.Service
+	Policy     *policy.Policy
+	Limiter    limiter.Gate
+	Quota      quota.Gate
+	Accounting *accounting.Gate
+	Audit      audit.Sink
+	Metrics    *metrics.Registry
+	MaxBody    int64
+	MaxItems   int
+	MaxChars   int
 	// Async enables background:true acceptance (V1.4). Nil keeps the frozen
 	// synchronous-only behavior: background requests receive the stable 503
 	// job_queue_unavailable (the documented rollback posture).
@@ -415,12 +417,12 @@ func (h *ResponsesHandler) record(deps admissionDeps, requestID, traceID string,
 func (h *ResponsesHandler) complete(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
 	resp, providerName, err := h.Service.Complete(r.Context(), adm.plan, preq)
 	if err != nil {
-		adm.qres.Release()
+		adm.refund()
 		mapError(w, requestID, err)
 		h.record(deps, requestID, traceID, principal, modelName, providerName, 0, err, adm.attempts(), nil, false, start, nil)
 		return
 	}
-	adm.qres.Settle(usageTotal(resp.Usage))
+	adm.settle(providerName, resp.Usage)
 
 	// Output validation failures are recorded in audit, never silently
 	// treated as success.
@@ -435,7 +437,7 @@ func (h *ResponsesHandler) complete(w http.ResponseWriter, r *http.Request, deps
 func (h *ResponsesHandler) stream(w http.ResponseWriter, r *http.Request, deps admissionDeps, requestID, traceID string, principal auth.Principal, adm *admitted, modelName string, preq model.Request, start time.Time) {
 	flusher, canFlush := w.(http.Flusher)
 	if !canFlush {
-		adm.qres.Release()
+		adm.refund()
 		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "streaming_unsupported", "streaming is not supported by this connection")
 		return
 	}
@@ -455,17 +457,17 @@ func (h *ResponsesHandler) stream(w http.ResponseWriter, r *http.Request, deps a
 		usage = streamed.Usage
 		// Settle exactly once to the reported stream total (idempotent
 		// finalize); unknown usage keeps the conservative reservation.
-		adm.qres.Settle(usageTotal(usage))
+		adm.settle(providerName, usage)
 	} else {
 		// Unified failure event: emitted as the first event when nothing was
 		// sent yet, or as a terminal event when the stream truncated.
 		_ = enc.WriteFailed(errorType(err))
 		if !outputBeforeFailure {
 			// Nothing reached the client before the failure: refund the
-			// reservation idempotently. Truncations after output keep the
+			// reservations idempotently. Truncations after output keep the
 			// conservative reservation; the consumed usage is unknown and
 			// never fabricated.
-			adm.qres.Release()
+			adm.refund()
 		}
 	}
 	// Audit the recorded output-validation failure rather than the Stream

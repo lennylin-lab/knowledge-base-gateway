@@ -16,10 +16,12 @@ package httpapi
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
@@ -58,20 +60,22 @@ func resolvePublicModel(d admissionDeps, protocol, subject, requested string) (s
 
 // admissionDeps carries the collaborators shared by every model handler.
 type admissionDeps struct {
-	Auth    Authenticator
-	Service *gateway.Service
-	Policy  *policy.Policy
-	Limiter limiter.Gate
-	Quota   quota.Gate
-	Audit   audit.Sink
-	Metrics *metrics.Registry
+	Auth       Authenticator
+	Service    *gateway.Service
+	Policy     *policy.Policy
+	Limiter    limiter.Gate
+	Quota      quota.Gate
+	Accounting *accounting.Gate
+	Audit      audit.Sink
+	Metrics    *metrics.Registry
 }
 
 // fromChat builds the shared deps from a ChatHandler's fields.
 func fromChat(h *ChatHandler) admissionDeps {
 	return admissionDeps{
 		Auth: h.Auth, Service: h.Service, Policy: h.Policy,
-		Limiter: h.Limiter, Quota: h.Quota, Audit: h.Audit, Metrics: h.Metrics,
+		Limiter: h.Limiter, Quota: h.Quota, Accounting: h.Accounting,
+		Audit: h.Audit, Metrics: h.Metrics,
 	}
 }
 
@@ -79,7 +83,8 @@ func fromChat(h *ChatHandler) admissionDeps {
 func fromResponses(h *ResponsesHandler) admissionDeps {
 	return admissionDeps{
 		Auth: h.Auth, Service: h.Service, Policy: h.Policy,
-		Limiter: h.Limiter, Quota: h.Quota, Audit: h.Audit, Metrics: h.Metrics,
+		Limiter: h.Limiter, Quota: h.Quota, Accounting: h.Accounting,
+		Audit: h.Audit, Metrics: h.Metrics,
 	}
 }
 
@@ -105,11 +110,50 @@ func authenticate(r *http.Request, d admissionDeps) (auth.Principal, error) {
 }
 
 // admitted is the outcome of a successful admission: the ordered route plan,
-// the quota reservation, and the limiter release func.
+// the token-quota reservation, the money-budget reservation, the limiter
+// release func, and the metrics registry for settlement observability.
 type admitted struct {
 	plan    gateway.Plan
 	qres    quota.Reservation
+	ares    accounting.Reservation
 	release func()
+	metrics *metrics.Registry
+}
+
+// settle finalizes both reservations to the reported usage exactly once
+// (idempotent finalization; unknown usage keeps the conservative token
+// reservation and the money counters unchanged). A settlement failure is
+// never silent: it is counted and logged, and the ledger row stays
+// 'reserved' as the retryable record.
+func (a *admitted) settle(providerName string, u *model.Usage) {
+	a.qres.Settle(usageTotal(u))
+	if a.ares == nil {
+		return
+	}
+	if err := a.ares.Settle(providerName, accounting.UsageFrom(u)); err != nil {
+		if a.metrics != nil {
+			a.metrics.IncSettlementFailure()
+		}
+		slog.Error("accounting: usage settlement failed; ledger row remains reserved",
+			"error", err)
+	}
+}
+
+// refund releases both reservations (no billable outcome); repeated calls
+// are no-ops. A failed ledger release is counted and logged: the row stays
+// 'reserved' as evidence instead of being silently marked released.
+func (a *admitted) refund() {
+	a.qres.Release()
+	if a.ares == nil {
+		return
+	}
+	if err := a.ares.Release(); err != nil {
+		if a.metrics != nil {
+			a.metrics.IncSettlementFailure()
+		}
+		slog.Error("accounting: reservation release failed; ledger row remains reserved",
+			"error", err)
+	}
 }
 
 // attempts reports the maximum number of provider attempts the plan allows
@@ -241,7 +285,69 @@ func admit(w http.ResponseWriter, r *http.Request, d admissionDeps, protocol, pu
 			qres = res
 		}
 	}
-	return &admitted{plan: plan, qres: qres, release: release}, nil
+
+	// 7. Monetary budgets (V1.4): subject and tenant day/month money
+	// budgets checked and reserved before any provider invocation, against
+	// the same deterministic token estimate the token quota charged. A
+	// configured budget with no applicable price fails here as
+	// pricing_unavailable — a priceless request never bypasses the budget.
+	// Ledger capture runs regardless of enforcement (the rollback posture);
+	// without an accounting gate the request keeps its pre-V1.4 behavior.
+	ares := accounting.Done
+	if d.Accounting != nil {
+		// The estimate mirrors the token quota's precedence exactly:
+		// declared max_tokens, then the policy output ceiling, then the
+		// default reserve. Embeddings reserve input tokens only.
+		outputCeiling := 0
+		if d.Policy != nil {
+			limits, lErr := policy.NewResolver(d.Policy).LimitsFor(r.Context(), subject, publicModel)
+			if lErr != nil {
+				// Fail closed after refunding the earlier reservations; never
+				// reserve money against an unknown ceiling.
+				qres.Release()
+				release()
+				return &admitted{}, lErr
+			}
+			outputCeiling = limits.MaxOutputTokens
+		}
+		in := quota.InputTokens(mreq.InputChars())
+		estimate := accounting.Usage{PromptTokens: &in}
+		if protocol != protocolEmbeddings {
+			out := int64(quota.DefaultOutputReserve)
+			if mreq.MaxTokens != nil && *mreq.MaxTokens > 0 {
+				out = int64(*mreq.MaxTokens)
+			} else if outputCeiling > 0 {
+				out = int64(outputCeiling)
+			}
+			estimate.CompletionTokens = &out
+		}
+		res, aErr := d.Accounting.Reserve(r.Context(), accounting.ReserveInput{
+			Identity:    accounting.Identity{RequestID: mreq.RequestID},
+			SubjectID:   principal.SubjectID,
+			TenantID:    principal.TenantID,
+			Protocol:    protocol,
+			PublicModel: publicModel,
+			Provider:    plan.Primary(),
+			Estimate:    estimate,
+			Now:         time.Now(),
+		})
+		if aErr != nil {
+			// Refund everything reserved so a denial leaves no residue.
+			qres.Release()
+			release()
+			if denial := (*accounting.Error)(nil); errors.As(aErr, &denial) {
+				if d.Metrics != nil {
+					d.Metrics.IncBudgetDenial(denial.Scope)
+				}
+				if denial.RetryAfter > 0 {
+					w.Header().Set("Retry-After", fmt.Sprintf("%d", int(denial.RetryAfter.Seconds())+1))
+				}
+			}
+			return &admitted{}, aErr
+		}
+		ares = res
+	}
+	return &admitted{plan: plan, qres: qres, ares: ares, release: release}, nil
 }
 
 // classifyErr names an error for the audit error_class column without

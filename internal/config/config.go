@@ -89,6 +89,12 @@ type Config struct {
 	AsyncDrainTimeout   time.Duration
 	AsyncMaxKeyBytes    int
 
+	// V1.4 cost governance. BudgetsEnabled gates monetary budget
+	// ENFORCEMENT only (the documented rollback point: disabling it never
+	// disables usage-ledger capture, so operators keep cost evidence while
+	// enforcement is off; ledger capture is automatic in database mode).
+	BudgetsEnabled bool
+
 	// DefaultModels carries the local-development default-model assignments
 	// (GATEWAY_DEFAULT_MODELS). In database mode the access_policies columns
 	// are authoritative and this list is ignored.
@@ -285,6 +291,11 @@ func FromEnv() (Config, error) {
 		}
 		c.AsyncMaxResultBytes = n
 	}
+
+	// V1.4 monetary budget enforcement: opt-in (gradual rollout). Ledger
+	// capture in database mode is unconditional, so enforcement can be
+	// rolled back without losing cost evidence.
+	c.BudgetsEnabled = os.Getenv("GATEWAY_BUDGETS_ENABLED") == "true"
 
 	// GATEWAY_DEFAULT_MODELS="subject:chat-model[:embedding-model],..."
 	// Development-mode default-model assignments; in database mode the

@@ -231,6 +231,25 @@ func (a *Anthropic) do(ctx context.Context, req model.Request, stream bool) (*ht
 type anthropicUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// CacheReadInputTokens is the optional cache-read class reported for
+	// prompt caching (V1.4 pricing charges it only when reported). It is a
+	// sub-class of input_tokens and part of the reported input total.
+	CacheReadInputTokens *int `json:"cache_read_input_tokens"`
+}
+
+// toModelUsage converts the wire usage; the cached class rides only when the
+// upstream reported it.
+func (w *anthropicUsage) toModelUsage() *model.Usage {
+	u := &model.Usage{
+		PromptTokens:     w.InputTokens,
+		CompletionTokens: w.OutputTokens,
+		TotalTokens:      w.InputTokens + w.OutputTokens,
+		Known:            true,
+	}
+	if w.CacheReadInputTokens != nil {
+		u.CachedInputTokens = w.CacheReadInputTokens
+	}
+	return u
 }
 
 type anthropicResponse struct {
@@ -297,12 +316,7 @@ func (a *Anthropic) Complete(ctx context.Context, req model.Request) (model.Resp
 		out.Status = model.StatusIncomplete
 	}
 	if wire.Usage != nil {
-		out.Usage = &model.Usage{
-			PromptTokens:     wire.Usage.InputTokens,
-			CompletionTokens: wire.Usage.OutputTokens,
-			TotalTokens:      wire.Usage.InputTokens + wire.Usage.OutputTokens,
-			Known:            true,
-		}
+		out.Usage = wire.Usage.toModelUsage()
 	}
 	return out, nil
 }
@@ -346,6 +360,7 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 		stop       string
 		inTokens   int
 		outTokens  int
+		cachedIn   *int // cache-read class, only when the upstream reported it
 		usageSeen  bool // whether the upstream reported any usage object
 	)
 	emitErr := func(e model.Event) error {
@@ -405,7 +420,8 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 					// Pointer presence: a stream without usage objects must
 					// stay unknown rather than normalize to zero tokens.
 					Usage *struct {
-						InputTokens int `json:"input_tokens"`
+						InputTokens          int  `json:"input_tokens"`
+						CacheReadInputTokens *int `json:"cache_read_input_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
 				Usage *struct {
@@ -423,6 +439,7 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 				head = model.Response{ID: evt.Message.ID, Model: evt.Message.Model}
 				if evt.Message.Usage != nil {
 					inTokens = evt.Message.Usage.InputTokens
+					cachedIn = evt.Message.Usage.CacheReadInputTokens
 					usageSeen = true
 				}
 				created := head
@@ -511,6 +528,7 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 					head.Usage = &model.Usage{
 						PromptTokens: inTokens, CompletionTokens: outTokens,
 						TotalTokens: inTokens + outTokens, Known: true,
+						CachedInputTokens: cachedIn,
 					}
 				}
 				return emitErr(model.Event{Kind: model.EventCompleted, Response: &head})

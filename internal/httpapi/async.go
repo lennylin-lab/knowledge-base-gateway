@@ -160,7 +160,7 @@ func (h *ResponsesHandler) createBackground(w http.ResponseWriter, r *http.Reque
 	as := h.Async
 	// Creation does not hold sync resources: the admission reservation was a
 	// gate, the worker re-reserves at execution time.
-	adm.qres.Release()
+	adm.refund()
 	adm.release()
 
 	record := func(status int, err error) {

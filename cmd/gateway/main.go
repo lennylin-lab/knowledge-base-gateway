@@ -17,6 +17,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/async"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
@@ -71,6 +72,8 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		authenticator  httpapi.Authenticator
 		lifecycleStore auth.MutationStore
 		auditSink      audit.Sink
+		accountingGate *accounting.Gate
+		ledgerStore    *pgstore.LedgerStore
 	)
 	if cfg.DatabaseURL != "" {
 		var err error
@@ -86,6 +89,10 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		authenticator = &pgstore.Authenticator{DB: dbw, Now: time.Now}
 		lifecycleStore = dbw
 		auditSink = pgAudit{db: dbw}
+		// V1.4 cost governance: the ledger is authoritative in database mode
+		// and budget enforcement follows GATEWAY_BUDGETS_ENABLED (the
+		// rollback point — enforcement off never disables ledger capture).
+		ledgerStore = &pgstore.LedgerStore{DB: dbw}
 	}
 
 	// Provider registry. Secrets come only from the environment; base URLs
@@ -230,8 +237,9 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	// multi-instance atomic daily/monthly budgets.
 	var rateLimiter limiter.Gate
 	var quotaGate quota.Gate
+	var rdb *redis.Client
 	if cfg.RedisEnabled {
-		rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+		rdb = redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 		rl := limiter.NewRedis(rdb, "gw", cfg.RatePerMinute, cfg.MaxConcurrent)
 		if dbw != nil {
 			if limits, err := dbw.LoadLimits(ctx); err == nil {
@@ -249,6 +257,24 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	} else {
 		rateLimiter = limiter.New(cfg.RatePerMinute, cfg.MaxConcurrent)
 		quotaGate = quota.NewMemory()
+	}
+
+	// V1.4 cost governance gate: prices, budget policies, and the settlement
+	// ledger live in PostgreSQL; the money counters share the limiter's mode
+	// (Redis for multi-instance atomic subject+tenant enforcement, in-memory
+	// for development). Budget enforcement follows GATEWAY_BUDGETS_ENABLED;
+	// ledger capture is unconditional in database mode (the rollback point).
+	if ledgerStore != nil {
+		var budgets accounting.BudgetGate
+		if rdb != nil {
+			budgets = accounting.NewRedisBudget(rdb, "gw")
+		} else {
+			budgets = accounting.NewMemoryBudget()
+		}
+		accountingGate = &accounting.Gate{
+			Store: ledgerStore, Budgets: budgets,
+			Enforcement: cfg.BudgetsEnabled, Now: time.Now,
+		}
 	}
 
 	reg := metrics.New()
@@ -345,7 +371,7 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 
 	chat := &httpapi.ChatHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
-		Audit: auditSink, Metrics: reg,
+		Accounting: accountingGate, Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxMsgs: cfg.MaxMessages, MaxChars: cfg.MaxMessageChars,
 	}
 
@@ -361,7 +387,8 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		jobs := &pgstore.AsyncStore{DB: dbw}
 		asyncPool := async.NewPool(async.PoolDeps{
 			Store: jobs, Service: asyncSvc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
-			Audit: auditSink, Metrics: reg, Logger: logger, Cancels: cancels,
+			Accounting: accountingGate,
+			Audit:      auditSink, Metrics: reg, Logger: logger, Cancels: cancels,
 			Encoder: httpapi.NewAsyncEncoder(), Now: time.Now,
 		}, async.PoolConfig{
 			WorkerID: workerID(), Count: cfg.AsyncWorkers, PollInterval: cfg.AsyncPollInterval,
@@ -389,13 +416,13 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 
 	responses := &httpapi.ResponsesHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
-		Audit: auditSink, Metrics: reg,
+		Accounting: accountingGate, Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxItems: cfg.MaxMessages * 2, MaxChars: cfg.MaxMessageChars,
 		Async: asyncBundle,
 	}
 	embeddings := &httpapi.EmbeddingsHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
-		Audit: auditSink, Metrics: reg,
+		Accounting: accountingGate, Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxItems: cfg.MaxMessages * 2, MaxChars: cfg.MaxMessageChars,
 	}
 	models := &httpapi.ModelsHandler{Auth: keyAuth, Service: svc, Policy: pol}
@@ -462,6 +489,7 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 				Manager: keyManager, Logger: logger, Token: cfg.AdminToken, Mgmt: mgmtSvc,
 				ApplyModelChange: applyModelChange, ProviderRuntime: providerRuntime,
 				ApplyPolicyChange: applyPolicyChange,
+				Accounting:        ledgerStore, // nil in development mode
 			}),
 		}
 	}
