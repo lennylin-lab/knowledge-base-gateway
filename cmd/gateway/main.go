@@ -36,6 +36,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/quota"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/router"
 	pgstore "github.com/knowledge-base/knowledge-base-gateway/internal/store/pg"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/telemetry"
 )
 
 func main() {
@@ -51,6 +52,28 @@ func main() {
 		logger.Error("configuration invalid", "error", err)
 		os.Exit(1)
 	}
+
+	// OTLP trace export (independent kill switch, default off): with the
+	// switch off the no-op provider stays installed and nothing else in the
+	// process changes. A shutdown flush is bounded by the exit deadline.
+	shutdownTracing, err := telemetry.Setup(context.Background(), telemetry.Options{
+		Enabled:  cfg.OTLPEnabled,
+		Endpoint: cfg.OTLPEndpoint,
+		Insecure: cfg.OTLPInsecure,
+		Ratio:    cfg.OTLPRatio,
+		Timeout:  cfg.OTLPTimeout,
+	}, logger)
+	if err != nil {
+		logger.Error("telemetry setup failed", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			logger.Warn("telemetry shutdown: unflushed spans dropped", "error", err)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -283,6 +306,10 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if auditSink == nil {
 		auditSink = audit.NewMemorySink(logger)
 	}
+	// The unknown-cost settlement counter rides the accounting gate.
+	if accountingGate != nil {
+		accountingGate.Metrics = reg
+	}
 
 	// V1.4 data lifecycle: retention sweeps, archives, and exports behind the
 	// admin API. GATEWAY_LIFECYCLE_ENABLED=false is the documented rollback
@@ -415,10 +442,24 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	// rollback posture: stop accepting, drain workers, retain rows/results).
 	var asyncBundle *httpapi.Async
 	var asyncJobsHandler http.Handler
+	var asyncPool *async.Pool
 	if cfg.AsyncEnabled && dbw != nil {
-		cancels := async.NewCancelRegistry()
 		jobs := &pgstore.AsyncStore{DB: dbw}
-		asyncPool := async.NewPool(async.PoolDeps{
+		// Queue depth/oldest age come from the scrape-time collector (one
+		// sample per /metrics request), never per-job series.
+		reg.RegisterQueueCollector(func(ctx context.Context) (int, time.Duration, error) {
+			depth, err := jobs.QueueDepth(ctx)
+			if err != nil {
+				return 0, 0, err
+			}
+			age, err := jobs.QueueOldestAge(ctx)
+			if err != nil {
+				return 0, 0, err
+			}
+			return depth, age, nil
+		})
+		cancels := async.NewCancelRegistry()
+		asyncPool = async.NewPool(async.PoolDeps{
 			Store: jobs, Service: asyncSvc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
 			Accounting: accountingGate,
 			Audit:      auditSink, Metrics: reg, Logger: logger, Cancels: cancels,
@@ -461,23 +502,56 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	models := &httpapi.ModelsHandler{Auth: keyAuth, Service: svc, Policy: pol}
 
-	ready := func() bool {
-		if dbw != nil {
-			if err := dbw.Ready(ctx); err != nil {
-				logger.Warn("readiness: database unavailable", "error", err)
-				return false
-			}
+	// /readyz: named dependency checks with short independent deadlines. Each
+	// check exists only while its feature is enabled (rollback: disabling a
+	// feature removes its check), required failures withdraw readiness, and
+	// the body names what degraded. Liveness (/healthz) stays process-only.
+	readiness := httpapi.NewReadiness(logger)
+	if dbw != nil {
+		readiness.Register("database", true, dbw.Ready)
+	}
+	if cfg.RedisEnabled {
+		// A configured multi-instance limiter must be reachable.
+		readiness.Register("redis", true, func(ctx context.Context) error {
+			return redisReady(ctx, cfg.RedisAddr)
+		})
+	}
+	readiness.Register("catalog", true, func(context.Context) error {
+		if catalog == nil || len(catalog.All()) == 0 {
+			return errors.New("model catalog is empty")
 		}
-		if cfg.RedisEnabled {
-			// A configured multi-instance limiter must be reachable.
-			c, cancel := context.WithTimeout(ctx, 2*time.Second)
-			defer cancel()
-			if err := redisReady(c, cfg.RedisAddr); err != nil {
-				logger.Warn("readiness: redis unavailable", "error", err)
-				return false
+		return nil
+	})
+	if asyncBundle != nil {
+		// Queue health: a real claim/query against the job table (the same
+		// table the claimer scans), then the live worker heartbeat.
+		readiness.Register("queue", true, func(ctx context.Context) error {
+			if _, err := asyncBundle.Jobs.QueueDepth(ctx); err != nil {
+				return err
 			}
-		}
-		return catalog != nil && len(catalog.All()) > 0
+			return nil
+		})
+		readiness.Register("worker", true, func(context.Context) error {
+			if asyncPool != nil && asyncPool.Healthy() {
+				return nil
+			}
+			return errors.New("worker pool not accepting jobs or sweep heartbeat stale")
+		})
+	}
+	if ledgerStore != nil {
+		// Settlement health: reserved ledger rows older than the window above
+		// the explicit threshold flip readiness (backlog, not a momentary
+		// in-flight row). An unmeasurable backlog fails closed.
+		readiness.Register("settlement", true, func(ctx context.Context) error {
+			n, err := ledgerStore.ReservedBacklog(ctx, settlementBacklogWindow)
+			if err != nil {
+				return err
+			}
+			if n > cfg.SettlementBacklogMax {
+				return fmt.Errorf("reserved ledger backlog %d exceeds threshold %d", n, cfg.SettlementBacklogMax)
+			}
+			return nil
+		})
 	}
 
 	var responsesHandler http.Handler = responses
@@ -490,7 +564,7 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	mux := httpapi.NewMux(chat, httpapi.Deps{
 		Logger:          logger,
-		ReadyFn:         ready,
+		Ready:           readiness,
 		Metrics:         reg.Handler(),
 		Responses:       responsesHandler,
 		ResponsesGet:    asyncJobsHandler,
@@ -735,6 +809,11 @@ func workerID() string {
 
 // pgAudit adapts the store writer to the audit.Sink signature.
 type pgAudit struct{ db *pgstore.DB }
+
+// settlementBacklogWindow: only reserved ledger rows older than this count
+// toward the readiness settlement backlog — fresh reserved rows are normal
+// in-flight settlements (the detached finalize path can take seconds).
+const settlementBacklogWindow = 10 * time.Minute
 
 func (a pgAudit) Write(e audit.Event) {
 	_ = a.db.WriteAudit(context.Background(), e)

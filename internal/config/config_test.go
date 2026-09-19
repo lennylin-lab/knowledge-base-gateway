@@ -58,6 +58,24 @@ func TestFromEnvValid(t *testing.T) {
 	if !cfg.EmbeddingsEnabled {
 		t.Error("EmbeddingsEnabled must default to true; GATEWAY_EMBEDDINGS_ENABLED=false is the rollback switch")
 	}
+	// V1.4 observability: OTLP export defaults off (the independent kill
+	// switch) but every knob that must not be zero when enabled has a real
+	// default; the settlement backlog threshold must never deny-by-default.
+	if cfg.OTLPEnabled {
+		t.Error("OTLPEnabled must default to false; GATEWAY_OTLP_ENABLED=true is the opt-in")
+	}
+	if cfg.OTLPEndpoint == "" {
+		t.Error("OTLPEndpoint must have a non-empty default")
+	}
+	if cfg.OTLPRatio <= 0 || cfg.OTLPRatio > 1 {
+		t.Errorf("OTLPRatio = %v, want in (0,1]", cfg.OTLPRatio)
+	}
+	if cfg.OTLPTimeout <= 0 {
+		t.Errorf("OTLPTimeout = %v, want positive", cfg.OTLPTimeout)
+	}
+	if cfg.SettlementBacklogMax <= 0 {
+		t.Errorf("SettlementBacklogMax = %d, want positive", cfg.SettlementBacklogMax)
+	}
 }
 
 func TestEmbeddingsEnabledFlag(t *testing.T) {

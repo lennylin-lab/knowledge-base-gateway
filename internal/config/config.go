@@ -105,6 +105,19 @@ type Config struct {
 	LifecycleEnabled    bool
 	LifecycleArchiveDir string
 
+	// V1.4 observability. OTLPEnabled is the independent trace-export kill
+	// switch (default off): instrumentation is always present through the
+	// OpenTelemetry API no-op, but the SDK/exporter is installed only when
+	// enabled, and Prometheus metrics plus serving stay live either way. The
+	// remaining knobs bound the OTLP/HTTP exporter and the readiness
+	// settlement-backlog threshold.
+	OTLPEnabled          bool
+	OTLPEndpoint         string        // host:port for OTLP/HTTP (protobuf)
+	OTLPInsecure         bool          // plain-HTTP export (dev/loopback collectors)
+	OTLPRatio            float64       // root-span sampling ratio 0..1
+	OTLPTimeout          time.Duration // per-export timeout
+	SettlementBacklogMax int64         // reserved-ledger backlog that flips /readyz unhealthy
+
 	// DefaultModels carries the local-development default-model assignments
 	// (GATEWAY_DEFAULT_MODELS). In database mode the access_policies columns
 	// are authoritative and this list is ignored.
@@ -311,6 +324,39 @@ func FromEnv() (Config, error) {
 	// rollback switch; inert until retention_policies rows are configured.
 	c.LifecycleEnabled = os.Getenv("GATEWAY_LIFECYCLE_ENABLED") != "false"
 	c.LifecycleArchiveDir = env("GATEWAY_LIFECYCLE_ARCHIVE_DIR", "archives")
+
+	// V1.4 observability: OTLP trace export. The kill switch is independent
+	// of serving, Prometheus, async workers, and every other feature —
+	// disabling it (the default) only removes the exporter.
+	c.OTLPEnabled = os.Getenv("GATEWAY_OTLP_ENABLED") == "true"
+	c.OTLPEndpoint = env("GATEWAY_OTLP_ENDPOINT", "localhost:4318")
+	c.OTLPInsecure = os.Getenv("GATEWAY_OTLP_INSECURE") == "true"
+	c.OTLPRatio = 1.0
+	if v := os.Getenv("GATEWAY_OTLP_SAMPLING_RATIO"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || f > 1 {
+			return c, fmt.Errorf("GATEWAY_OTLP_SAMPLING_RATIO: want float 0..1, got %q", v)
+		}
+		c.OTLPRatio = f
+	}
+	c.OTLPTimeout = 10 * time.Second
+	if v := os.Getenv("GATEWAY_OTLP_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return c, fmt.Errorf("GATEWAY_OTLP_TIMEOUT: want positive duration, got %q", v)
+		}
+		c.OTLPTimeout = d
+	}
+	// Readiness settlement-backlog threshold: reserved ledger rows older than
+	// this many minutes flip /readyz (the explicit unhealthy threshold).
+	c.SettlementBacklogMax = 100
+	if v := os.Getenv("GATEWAY_SETTLEMENT_BACKLOG_MAX"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("GATEWAY_SETTLEMENT_BACKLOG_MAX: want positive integer, got %q", v)
+		}
+		c.SettlementBacklogMax = n
+	}
 
 	// GATEWAY_DEFAULT_MODELS="subject:chat-model[:embedding-model],..."
 	// Development-mode default-model assignments; in database mode the

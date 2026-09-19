@@ -5,6 +5,7 @@
 package metrics
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -28,13 +29,25 @@ type Registry struct {
 	rateLimit          *prometheus.CounterVec
 	duration           *prometheus.HistogramVec
 	asyncJobs          *prometheus.CounterVec
-	queueDepth         prometheus.Gauge
 	budgetDenials      *prometheus.CounterVec
 	settlementFailures prometheus.Counter
+	settlementRetries  prometheus.Counter
+	costUnknown        prometheus.Counter
 	lifecycleArchived  *prometheus.CounterVec
 	lifecycleDeleted   *prometheus.CounterVec
 	lifecycleExports   prometheus.Counter
+	queueWait          prometheus.Histogram
+	leaseExpired       prometheus.Counter
+	resultsExpired     prometheus.Counter
+	workerHealthy      prometheus.Gauge
+	workerInflight     prometheus.Gauge
 }
+
+// QueueSampler produces one scrape-time queue sample (depth and oldest queued
+// job age). Implemented by callers over the async store so the metrics
+// package stays leaf-clean. A scrape that samples errors emits no queue
+// series at all — never a fabricated zero.
+type QueueSampler func(ctx context.Context) (depth int, oldestAge time.Duration, err error)
 
 // New creates a registry with the gateway collectors plus the standard Go
 // runtime and process collectors.
@@ -66,10 +79,9 @@ func New() *Registry {
 		Name: "gateway_async_jobs_total",
 		Help: "Background jobs by terminal status (completed, failed, cancelled, expired).",
 	}, []string{"status"})
-	r.queueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "gateway_async_queue_depth",
-		Help: "Background jobs currently queued.",
-	})
+	// Queue depth/age are scrape-time collector samples (registered only when
+	// a QueueSampler is wired), so the DB is polled once per scrape and no
+	// per-job label ever exists.
 	r.budgetDenials = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "gateway_budget_denials_total",
 		Help: "Monetary budget denials by scope (subject, tenant).",
@@ -77,6 +89,14 @@ func New() *Registry {
 	r.settlementFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "gateway_ledger_settlement_failures_total",
 		Help: "Usage-ledger settlements that failed and remain retryable (reserved rows kept).",
+	})
+	r.settlementRetries = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_ledger_settlement_retries_total",
+		Help: "Settlement attempts re-driven after a previous failure (bounded in-process retry).",
+	})
+	r.costUnknown = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_ledger_cost_unknown_total",
+		Help: "Settlements whose cost stayed unknown (unknown usage or no applicable price), never fabricated as zero.",
 	})
 	r.lifecycleArchived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "gateway_lifecycle_rows_archived_total",
@@ -90,15 +110,52 @@ func New() *Registry {
 		Name: "gateway_lifecycle_exports_total",
 		Help: "Completed data exports.",
 	})
+	r.queueWait = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gateway_async_queue_wait_seconds",
+		Help:    "Time a claimed job spent queued before its first claim.",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 600},
+	})
+	r.leaseExpired = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_async_lease_expired_total",
+		Help: "Worker leases that lapsed and were recovered by the sweep (requeued or terminal-failed).",
+	})
+	r.resultsExpired = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_async_results_expired_total",
+		Help: "Terminal job results dropped after their retention TTL passed.",
+	})
+	r.workerHealthy = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "gateway_async_worker_healthy",
+		Help: "1 when the worker pool is accepting jobs and its sweep is live, 0 during/after shutdown.",
+	})
+	r.workerInflight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "gateway_async_worker_inflight",
+		Help: "Background jobs currently executing in this process.",
+	})
 
 	reg.MustRegister(
 		r.requests, r.upstreamErrors, r.tokens, r.rateLimit, r.duration,
-		r.asyncJobs, r.queueDepth, r.budgetDenials, r.settlementFailures,
-		r.lifecycleArchived, r.lifecycleDeleted, r.lifecycleExports,
+		r.asyncJobs, r.budgetDenials, r.settlementFailures, r.settlementRetries,
+		r.costUnknown, r.lifecycleArchived, r.lifecycleDeleted, r.lifecycleExports,
+		r.queueWait, r.leaseExpired, r.resultsExpired, r.workerHealthy, r.workerInflight,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
+	r.workerHealthy.Set(0) // flips to 1 only after Start reports a live pool
 	return r
+}
+
+// queueSampleTimeout bounds one scrape-time queue sample so a slow database
+// can never wedge /metrics.
+const queueSampleTimeout = 2 * time.Second
+
+// RegisterQueueCollector installs the custom collectors for
+// gateway_async_queue_depth and gateway_async_queue_oldest_seconds. Both are
+// sampled once per scrape through the injected function (DB queue depth and
+// oldest queued age), so they exist only where a queue exists and carry no
+// per-job labels. A failed sample emits no series for that scrape — a gap on
+// the dashboard, never a fabricated zero. Call at most once per registry.
+func (r *Registry) RegisterQueueCollector(sample QueueSampler) {
+	r.reg.MustRegister(queueCollector{sample: sample})
 }
 
 // IncUpstreamError increments gateway_upstream_errors_total.
@@ -133,9 +190,65 @@ func (r *Registry) IncAsyncJob(status string) {
 	r.asyncJobs.WithLabelValues(status).Inc()
 }
 
-// SetAsyncQueueDepth records gateway_async_queue_depth from the worker sweep.
-func (r *Registry) SetAsyncQueueDepth(n int) {
-	r.queueDepth.Set(float64(n))
+// ObserveQueueWait records the enqueue→first-claim latency of a claimed job.
+func (r *Registry) ObserveQueueWait(d time.Duration) {
+	r.queueWait.Observe(d.Seconds())
+}
+
+// AddLeaseExpired adds n to gateway_async_lease_expired_total (leases the
+// recovery sweep reclaimed).
+func (r *Registry) AddLeaseExpired(n int) {
+	r.leaseExpired.Add(float64(n))
+}
+
+// AddResultsExpired adds n to gateway_async_results_expired_total.
+func (r *Registry) AddResultsExpired(n int) {
+	r.resultsExpired.Add(float64(n))
+}
+
+// SetWorkerHealthy records gateway_async_worker_healthy (1 live, 0 stopping).
+func (r *Registry) SetWorkerHealthy(v bool) {
+	if v {
+		r.workerHealthy.Set(1)
+		return
+	}
+	r.workerHealthy.Set(0)
+}
+
+// SetWorkerInflight records gateway_async_worker_inflight.
+func (r *Registry) SetWorkerInflight(n int) {
+	r.workerInflight.Set(float64(n))
+}
+
+// queueCollector samples the queue once per scrape and emits the depth and
+// oldest-age gauges from that single sample. On sample error nothing is
+// emitted, so a database outage shows a gap rather than a stale or fake
+// value. No label dimensions exist: aggregate depth/age only, never per-job.
+type queueCollector struct {
+	sample QueueSampler
+}
+
+var (
+	queueDepthDesc = prometheus.NewDesc("gateway_async_queue_depth",
+		"Background jobs currently queued (sampled at scrape time).", nil, nil)
+	queueOldestDesc = prometheus.NewDesc("gateway_async_queue_oldest_seconds",
+		"Age of the oldest queued job in seconds (0 when the queue is empty; sampled at scrape time).", nil, nil)
+)
+
+func (c queueCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- queueDepthDesc
+	ch <- queueOldestDesc
+}
+
+func (c queueCollector) Collect(ch chan<- prometheus.Metric) {
+	ctx, cancel := context.WithTimeout(context.Background(), queueSampleTimeout)
+	defer cancel()
+	depth, oldest, err := c.sample(ctx)
+	if err != nil {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(queueDepthDesc, prometheus.GaugeValue, float64(depth))
+	ch <- prometheus.MustNewConstMetric(queueOldestDesc, prometheus.GaugeValue, oldest.Seconds())
 }
 
 // IncBudgetDenial increments gateway_budget_denials_total for the denying
@@ -147,6 +260,18 @@ func (r *Registry) IncBudgetDenial(scope string) {
 // IncSettlementFailure increments gateway_ledger_settlement_failures_total.
 func (r *Registry) IncSettlementFailure() {
 	r.settlementFailures.Inc()
+}
+
+// IncSettlementRetry increments gateway_ledger_settlement_retries_total for
+// one re-driven settlement attempt.
+func (r *Registry) IncSettlementRetry() {
+	r.settlementRetries.Inc()
+}
+
+// IncCostUnknown increments gateway_ledger_cost_unknown_total: a settlement
+// whose cost stayed unknown (never fabricated as zero).
+func (r *Registry) IncCostUnknown() {
+	r.costUnknown.Inc()
 }
 
 // IncLifecycleArchived adds n to gateway_lifecycle_rows_archived_total for
