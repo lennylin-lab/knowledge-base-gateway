@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "检查错误分类与重试语义是否符合 spec（含本任务更新的流式措辞）"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "检查 gofmt/go test 齐备与 retry/deadline、SSE 终止测试覆盖"}

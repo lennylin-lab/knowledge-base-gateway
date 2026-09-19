@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "重试纪律与错误分类规约：pre-output 重试、never retry after SSE starts、timeout 类映射，本任务要改流式重试措辞"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "测试要求：retry/deadline behavior、SSE termination 必测；RequestTimeout 必须真正生效的防回归案例"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新增 internal/provider/stall.go 等文件的目录归属约定"}
