@@ -1,0 +1,3 @@
+{"file":"docs/v1.4-operations-and-async-roadmap.md","reason":"Required metrics, OTLP trace coverage, readiness, and shutdown."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Structured fields, severity, correlation, and redaction."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Mature infrastructure behind local interfaces and readiness conventions."}
