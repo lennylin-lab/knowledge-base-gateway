@@ -153,6 +153,9 @@ func EffectiveLimitsFrom(l policy.Limits) EffectiveLimits {
 }
 
 // AuditFilter bounds an audit or usage query; zero values are ignored.
+// Tenant is the caller's tenant boundary: empty means platform-global (no
+// restriction), non-empty is a mandatory query predicate that limits results
+// to subjects of that tenant — never a post-query filter.
 type AuditFilter struct {
 	RequestID string
 	Subject   string
@@ -160,7 +163,13 @@ type AuditFilter struct {
 	From      time.Time
 	To        time.Time
 	Limit     int
+	Tenant    string
 }
+
+// ErrTenantBoundary is returned when a tenant-bound query is issued against a
+// management service that cannot apply tenant predicates (development mode
+// without tenant data). Handlers must deny the request rather than widen it.
+var ErrTenantBoundary = errors.New("tenant boundary not supported by this management service")
 
 // UsageRow is one aggregated usage line for dashboards. P50/P95 latency is a
 // true percentile in the PostgreSQL implementation; the development-mode
@@ -205,6 +214,20 @@ type AdminOp struct {
 	Target       string          `json:"target"`
 	AdminSubject string          `json:"admin_subject"`
 	Detail       json.RawMessage `json:"detail,omitempty"`
+	// Actor is the authenticated identity behind the mutation (V1.4): the
+	// credential used, its tenant boundary, and its effective scopes. It is
+	// merged into Detail under the "actor" key by NormalizeOp so every store
+	// records the same shape without a schema change. Never contains secret
+	// material.
+	Actor AdminActor `json:"actor,omitempty"`
+}
+
+// AdminActor identifies the authenticated admin behind a management mutation.
+type AdminActor struct {
+	CredentialID string   `json:"credential_id,omitempty"`
+	TenantID     string   `json:"tenant,omitempty"` // empty = platform-global
+	Scopes       []string `json:"scopes,omitempty"`
+	Bootstrap    bool     `json:"bootstrap,omitempty"`
 }
 
 // PriceView is one pricing_catalog row: micros per token per class, in one
@@ -279,7 +302,11 @@ type BudgetUsageView struct {
 }
 
 // NormalizeOp fills management-audit defaults so every store implementation
-// records the same shape.
+// records the same shape. The actor block (subject via AdminSubject, plus
+// credential, tenant boundary, and effective scopes) is merged into Detail
+// under the "actor" key: actor ID, tenant, and scopes travel with every audit
+// summary without weakening the redaction contract — Detail is metadata only
+// and never carries secrets or content.
 func NormalizeOp(op AdminOp) AdminOp {
 	if op.AdminSubject == "" {
 		op.AdminSubject = "admin-token"
@@ -290,10 +317,81 @@ func NormalizeOp(op AdminOp) AdminOp {
 	if op.CreatedAt.IsZero() {
 		op.CreatedAt = time.Now()
 	}
+	op.Detail = mergeActor(op.Detail, op.AdminSubject, op.Actor)
 	return op
 }
 
-// Service is the management query surface consumed by the admin API.
+// mergeActor embeds the actor block into an audit detail object. The detail
+// must be a JSON object (handlers marshal maps); anything that does not
+// unmarshal into an object is passed through untouched so the store boundary
+// — not the merge — decides: malformed JSON then fails the audit insert and
+// rolls the whole mutation back (the atomic mutation/audit rule), instead of
+// being silently rewritten, which would hide handler bugs and weaken the
+// evidence chain.
+func mergeActor(detail json.RawMessage, subject string, actor AdminActor) json.RawMessage {
+	fields := map[string]any{}
+	if len(detail) > 0 {
+		if err := json.Unmarshal(detail, &fields); err != nil {
+			return detail
+		}
+	}
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	bootstrap := false
+	scopes := []string{}
+	if actor.Bootstrap {
+		bootstrap = true
+	}
+	if len(actor.Scopes) > 0 {
+		scopes = actor.Scopes
+	}
+	fields["actor"] = map[string]any{
+		"subject":       subject,
+		"credential_id": actor.CredentialID,
+		"tenant":        actor.TenantID,
+		"scopes":        scopes,
+		"bootstrap":     bootstrap,
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return json.RawMessage(`{"actor":{"subject":"unmarshalable"}}`)
+	}
+	return out
+}
+
+// MergeDetail enriches a mutation's audit detail with redacted before/after
+// summaries (the store implementations read the previous state inside their
+// transaction). Values must be metadata only — never secrets, key material,
+// prompts, or completions. The base detail stays intact; new keys win on
+// collision. A base that does not unmarshal into an object is passed through
+// untouched: the malformed JSON then fails the audit insert and rolls the
+// mutation back rather than being silently rewritten.
+func MergeDetail(base json.RawMessage, summary map[string]any) json.RawMessage {
+	fields := map[string]any{}
+	if len(base) > 0 {
+		if err := json.Unmarshal(base, &fields); err != nil {
+			return base
+		}
+	}
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	for k, v := range summary {
+		fields[k] = v
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return base
+	}
+	return out
+}
+
+// Service is the management query surface consumed by the admin API. The
+// tenant parameter on Policies / SetDefaultModelWithAudit (and AuditFilter.
+// Tenant) is the caller's tenant boundary: empty for platform-global
+// principals, otherwise a mandatory predicate or ownership check enforced
+// inside the implementation.
 type Service interface {
 	Models(ctx context.Context) ([]ModelView, error)
 	// SetModelEnabledWithAudit persists an enable/disable decision and its
@@ -304,10 +402,11 @@ type Service interface {
 	// SetDefaultModelWithAudit persists the subject's default-model slot
 	// (kind "chat" or "embedding") and its management-operation audit record
 	// as one atomic operation, with the same all-or-nothing semantics.
-	// Unknown subjects or models return ErrNotFound.
-	SetDefaultModelWithAudit(ctx context.Context, subject, model, kind string, op AdminOp) error
+	// Unknown subjects or models — including subjects outside the caller's
+	// tenant boundary — return ErrNotFound.
+	SetDefaultModelWithAudit(ctx context.Context, subject, model, kind string, op AdminOp, tenant string) error
 	Providers(ctx context.Context) ([]ProviderView, error)
-	Policies(ctx context.Context, subject string) ([]PolicyView, error)
+	Policies(ctx context.Context, subject, tenant string) ([]PolicyView, error)
 	QueryAudit(ctx context.Context, f AuditFilter) ([]audit.Event, error)
 	Usage(ctx context.Context, f AuditFilter) ([]UsageRow, error)
 	// WriteOp appends a management-operation record for mutations that carry
@@ -320,12 +419,18 @@ type Service interface {
 // MemoryService is the development-mode management service: it reads the
 // in-memory catalog, route table, and audit sink, and keeps management ops
 // in process. Enable/disable decisions are not persisted (development only).
+// Tenant boundaries are only enforceable when TenantOfSubject is wired;
+// tenant-bound queries without the hook fail closed with ErrTenantBoundary.
 type MemoryService struct {
 	Catalog      *policy.Catalog
 	Policy       *policy.Policy
 	Routes       *router.Routes
 	Audit        *audit.MemorySink
 	ProviderList []ProviderView
+	// TenantOfSubject reports a subject's authoritative tenant. Nil means
+	// development mode has no tenant data and tenant-bound queries are
+	// denied (fail closed), matching the mandatory-predicate rule.
+	TenantOfSubject func(subject string) (string, bool)
 
 	mu  sync.Mutex
 	ops []AdminOp
@@ -364,14 +469,17 @@ func (m *MemoryService) SetModelEnabledWithAudit(_ context.Context, publicModel 
 }
 
 // SetDefaultModelWithAudit flips the in-memory policy's default-model slot
-// and appends the management-operation record under one lock, so the
-// dev-mode mutation is atomic and immediately live for admission. Unknown
-// models return ErrNotFound; unknown subjects (no grants, no wildcard, no
-// recorded limits) return ErrNotFound as their row-based store counterpart
-// does.
-func (m *MemoryService) SetDefaultModelWithAudit(_ context.Context, subject, model, kind string, op AdminOp) error {
+// and appends the management-operation record under one lock, so the dev-mode
+// mutation is atomic and immediately live for admission. Unknown models
+// return ErrNotFound; unknown subjects (no grants, no wildcard, no recorded
+// limits) — and subjects outside the caller's tenant boundary — return
+// ErrNotFound as their row-based store counterpart does.
+func (m *MemoryService) SetDefaultModelWithAudit(_ context.Context, subject, model, kind string, op AdminOp, tenant string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if tenant != "" && !m.subjectInTenant(subject, tenant) {
+		return ErrNotFound
+	}
 	switch kind {
 	case "chat", "embedding":
 	default:
@@ -404,6 +512,26 @@ func (m *MemoryService) SetDefaultModelWithAudit(_ context.Context, subject, mod
 		m.Policy.SetDefault(subject, "", model)
 	}
 	m.ops = append(m.ops, NormalizeOp(op))
+	return nil
+}
+
+// subjectInTenant checks the tenant boundary via the hook; without the hook
+// no subject can be proven inside any tenant, so the answer is false (fail
+// closed) for a bounded caller. Callers holding the lock invoke this.
+func (m *MemoryService) subjectInTenant(subject, tenant string) bool {
+	if m.TenantOfSubject == nil {
+		return false
+	}
+	t, ok := m.TenantOfSubject(subject)
+	return ok && t == tenant
+}
+
+// tenantBound reports ErrTenantBoundary when a bounded caller queries a
+// service that has no tenant data (cannot predicate → must deny).
+func (m *MemoryService) tenantBound(tenant string) error {
+	if tenant != "" && m.TenantOfSubject == nil {
+		return ErrTenantBoundary
+	}
 	return nil
 }
 
@@ -448,14 +576,27 @@ func (m *MemoryService) Providers(_ context.Context) ([]ProviderView, error) {
 // database-mode concept. The subject's default-model slots ride every row
 // (matching the row-based store's view shape), and the effective-limits
 // block carries the subject's folded ceilings — in this mode the policy
-// service already holds the folded Limits.
-func (m *MemoryService) Policies(_ context.Context, subject string) ([]PolicyView, error) {
+// service already holds the folded Limits. A non-empty tenant is a mandatory
+// predicate: only subjects bound to that tenant are included.
+func (m *MemoryService) Policies(_ context.Context, subject, tenant string) ([]PolicyView, error) {
+	if err := m.tenantBound(tenant); err != nil {
+		return nil, err
+	}
 	if m.Policy == nil {
 		return []PolicyView{}, nil
+	}
+	inTenant := func(s string) bool {
+		if tenant == "" {
+			return true
+		}
+		return m.subjectInTenant(s, tenant)
 	}
 	out := []PolicyView{}
 	for _, s := range m.Policy.Subjects() {
 		if subject != "" && s != subject {
+			continue
+		}
+		if !inTenant(s) {
 			continue
 		}
 		defaults, _ := m.Policy.LimitsFor(s)
@@ -473,8 +614,12 @@ func (m *MemoryService) Policies(_ context.Context, subject string) ([]PolicyVie
 	return out, nil
 }
 
-// QueryAudit filters the in-memory sink snapshot, newest first.
+// QueryAudit filters the in-memory sink snapshot, newest first. A non-empty
+// filter tenant is a mandatory predicate over the subject dimension.
 func (m *MemoryService) QueryAudit(_ context.Context, f AuditFilter) ([]audit.Event, error) {
+	if err := m.tenantBound(f.Tenant); err != nil {
+		return nil, err
+	}
 	limit := f.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -487,6 +632,9 @@ func (m *MemoryService) QueryAudit(_ context.Context, f AuditFilter) ([]audit.Ev
 			continue
 		}
 		if f.Subject != "" && e.SubjectID != f.Subject {
+			continue
+		}
+		if f.Tenant != "" && !m.subjectInTenant(e.SubjectID, f.Tenant) {
 			continue
 		}
 		if f.Model != "" && e.Model != f.Model {
@@ -508,11 +656,17 @@ func (m *MemoryService) QueryAudit(_ context.Context, f AuditFilter) ([]audit.Ev
 // Dev mode omits first-token percentiles (they stay null) rather than
 // approximating them; PostgreSQL reports true percentiles over measured rows.
 func (m *MemoryService) Usage(_ context.Context, f AuditFilter) ([]UsageRow, error) {
+	if err := m.tenantBound(f.Tenant); err != nil {
+		return nil, err
+	}
 	snap := m.Audit.Snapshot()
 	type key struct{ model, protocol string }
 	agg := map[key]*UsageRow{}
 	for _, e := range snap {
 		if f.Subject != "" && e.SubjectID != f.Subject {
+			continue
+		}
+		if f.Tenant != "" && !m.subjectInTenant(e.SubjectID, f.Tenant) {
 			continue
 		}
 		if f.Model != "" && e.Model != f.Model {

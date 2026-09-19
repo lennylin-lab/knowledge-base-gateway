@@ -46,7 +46,7 @@ func (s *accountingAdminStub) UpsertPrice(_ context.Context, in mgmt.PriceInput,
 	return nil
 }
 
-func (s *accountingAdminStub) ListBudgets(context.Context) ([]mgmt.BudgetView, error) {
+func (s *accountingAdminStub) ListBudgets(_ context.Context, _ string) ([]mgmt.BudgetView, error) {
 	return s.budgets, nil
 }
 
@@ -62,7 +62,7 @@ func (s *accountingAdminStub) UpsertBudget(_ context.Context, in mgmt.BudgetInpu
 	return nil
 }
 
-func (s *accountingAdminStub) BudgetUsage(context.Context, time.Time) ([]mgmt.BudgetUsageView, error) {
+func (s *accountingAdminStub) BudgetUsage(_ context.Context, _ time.Time, _ string) ([]mgmt.BudgetUsageView, error) {
 	return s.usage, nil
 }
 

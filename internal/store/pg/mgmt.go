@@ -48,9 +48,11 @@ func (d *DB) Models(ctx context.Context) ([]mgmt.ModelView, error) {
 
 // SetModelEnabledWithAudit persists a management enable/disable decision and
 // its management-operation audit record in one transaction: either both land
-// or neither does. Unknown models return mgmt.ErrNotFound with nothing
-// written, so a failed operation can never be reported as audited-and-done,
-// and a committed mutation can never be reported as failed.
+// or neither does. The previous enabled state is read inside the transaction
+// and merged into the audit summary (redacted old/new evidence). Unknown
+// models return mgmt.ErrNotFound with nothing written, so a failed operation
+// can never be reported as audited-and-done, and a committed mutation can
+// never be reported as failed.
 func (d *DB) SetModelEnabledWithAudit(ctx context.Context, publicModel string, enabled bool, op mgmt.AdminOp) error {
 	tx, err := d.Pool.Begin(ctx)
 	if err != nil {
@@ -58,6 +60,14 @@ func (d *DB) SetModelEnabledWithAudit(ctx context.Context, publicModel string, e
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful Commit
 
+	var previous bool
+	if err := tx.QueryRow(ctx,
+		`SELECT enabled FROM model_catalog WHERE public_name = $1`, publicModel).Scan(&previous); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return mgmt.ErrNotFound
+		}
+		return err
+	}
 	ct, err := tx.Exec(ctx,
 		`UPDATE model_catalog SET enabled = $2, config_version = config_version + 1 WHERE public_name = $1`,
 		publicModel, enabled)
@@ -67,6 +77,9 @@ func (d *DB) SetModelEnabledWithAudit(ctx context.Context, publicModel string, e
 	if ct.RowsAffected() == 0 {
 		return mgmt.ErrNotFound
 	}
+	op.Detail = mgmt.MergeDetail(op.Detail, map[string]any{
+		"previous_enabled": previous, "enabled": enabled,
+	})
 	if err := writeOp(ctx, tx, op); err != nil {
 		return err
 	}
@@ -169,20 +182,24 @@ func (d *DB) Providers(ctx context.Context) ([]mgmt.ProviderView, error) {
 // subject's folded effective ceilings (issue #8 mitigation: min-of-declared
 // folding must be visible to operators, not silent). The effective block is
 // computed through LoadLimits so the view and the enforcement path fold the
-// rows through the exact same code.
-func (d *DB) Policies(ctx context.Context, subject string) ([]mgmt.PolicyView, error) {
+// rows through the exact same code. A non-empty tenant is a mandatory query
+// predicate resolved through subjects.tenant_id — the authoritative
+// subject→tenant binding (the api_keys tenant column is a principal field,
+// never the boundary).
+func (d *DB) Policies(ctx context.Context, subject, tenant string) ([]mgmt.PolicyView, error) {
 	limits, err := d.LoadLimits(ctx)
 	if err != nil {
 		return nil, err
 	}
 	rows, err := d.Pool.Query(ctx, `
-		SELECT subject_id, public_model, rate_per_minute, max_concurrent,
-		       COALESCE(daily_tokens, 0), COALESCE(monthly_tokens, 0),
-		       COALESCE(default_model, ''), COALESCE(default_embedding_model, '')
-		FROM access_policies
-		WHERE ($1 = '' OR subject_id = $1)
-		ORDER BY subject_id, public_model
-		LIMIT 500`, subject)
+		SELECT p.subject_id, p.public_model, p.rate_per_minute, p.max_concurrent,
+		       COALESCE(p.daily_tokens, 0), COALESCE(p.monthly_tokens, 0),
+		       COALESCE(p.default_model, ''), COALESCE(p.default_embedding_model, '')
+		FROM access_policies p
+		WHERE ($1 = '' OR p.subject_id = $1)
+		  AND ($2 = '' OR p.subject_id IN (SELECT id FROM subjects WHERE tenant_id = $2))
+		ORDER BY p.subject_id, p.public_model
+		LIMIT 500`, subject, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -203,11 +220,15 @@ func (d *DB) Policies(ctx context.Context, subject string) ([]mgmt.PolicyView, e
 // SetDefaultModelWithAudit persists a default-model decision and its
 // management-operation audit record in one transaction: either both land or
 // neither does. The slots live on access_policies rows, so every row of the
-// subject is updated together and the subject's slots stay uniform. Unknown
-// subjects (no access_policies rows) and unknown models return
+// subject is updated together and the subject's slots stay uniform. The
+// previous slot value is read inside the transaction for the redacted
+// old/new summary. A non-empty tenant is an ownership check resolved through
+// subjects.tenant_id: a subject outside the caller's boundary answers
+// mgmt.ErrNotFound (non-leaky, indistinguishable from absence). Unknown
+// subjects (no access_policies rows) and unknown models also return
 // mgmt.ErrNotFound with nothing written. kind selects the slot: "chat" sets
 // default_model, "embedding" sets default_embedding_model.
-func (d *DB) SetDefaultModelWithAudit(ctx context.Context, subject, model, kind string, op mgmt.AdminOp) error {
+func (d *DB) SetDefaultModelWithAudit(ctx context.Context, subject, model, kind string, op mgmt.AdminOp, tenant string) error {
 	column := map[string]string{"chat": "default_model", "embedding": "default_embedding_model"}[kind]
 	if column == "" {
 		return fmt.Errorf("unknown default-model kind %q", kind)
@@ -218,6 +239,18 @@ func (d *DB) SetDefaultModelWithAudit(ctx context.Context, subject, model, kind 
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful Commit
 
+	// Tenant boundary: the subject must exist inside the caller's tenant
+	// (mandatory predicate, not a post-query filter).
+	var tenantOK bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM subjects WHERE id = $1 AND ($2 = '' OR tenant_id = $2)
+		)`, subject, tenant).Scan(&tenantOK); err != nil {
+		return err
+	}
+	if !tenantOK {
+		return mgmt.ErrNotFound
+	}
 	// The target model must exist in the catalog (the FK would also reject
 	// the write, but an explicit check maps to a 404-class answer).
 	var exists bool
@@ -227,6 +260,15 @@ func (d *DB) SetDefaultModelWithAudit(ctx context.Context, subject, model, kind 
 	}
 	if !exists {
 		return mgmt.ErrNotFound
+	}
+	var previous string
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(`+column+`, '') FROM access_policies WHERE subject_id = $1 LIMIT 1`, subject).Scan(&previous); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		// No policy rows: the UPDATE below decides the ErrNotFound outcome.
+		previous = ""
 	}
 	// Parameterized identifiers are not possible for the column name, so the
 	// two known kinds branch on a validated, closed set.
@@ -238,13 +280,17 @@ func (d *DB) SetDefaultModelWithAudit(ctx context.Context, subject, model, kind 
 	if ct.RowsAffected() == 0 {
 		return mgmt.ErrNotFound
 	}
+	op.Detail = mgmt.MergeDetail(op.Detail, map[string]any{
+		"previous_model": previous, "model": model, "kind": kind,
+	})
 	if err := writeOp(ctx, tx, op); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-// QueryAudit returns audit records matching the filter, newest first.
+// QueryAudit returns audit records matching the filter, newest first. A
+// non-empty filter tenant is a mandatory predicate through subjects.tenant_id.
 func (d *DB) QueryAudit(ctx context.Context, f mgmt.AuditFilter) ([]audit.Event, error) {
 	limit := f.Limit
 	if limit <= 0 || limit > 500 {
@@ -261,9 +307,10 @@ func (d *DB) QueryAudit(ctx context.Context, f mgmt.AuditFilter) ([]audit.Event,
 		  AND ($3 = '' OR model = $3)
 		  AND ($4::timestamptz IS NULL OR created_at >= $4)
 		  AND ($5::timestamptz IS NULL OR created_at <= $5)
+		  AND ($6 = '' OR subject_id IN (SELECT id FROM subjects WHERE tenant_id = $6))
 		ORDER BY created_at DESC
-		LIMIT $6`,
-		f.RequestID, f.Subject, f.Model, nullTime(f.From), nullTime(f.To), limit)
+		LIMIT $7`,
+		f.RequestID, f.Subject, f.Model, nullTime(f.From), nullTime(f.To), f.Tenant, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +337,9 @@ func (d *DB) QueryAudit(ctx context.Context, f mgmt.AuditFilter) ([]audit.Event,
 // ledger: CostMicros sums known settled cost (null when none is known),
 // UnknownCostRequests counts settled rows whose cost stayed unknown (never
 // counted as zero), and PriceVersions names the distinct price versions
-// behind the known cost.
+// behind the known cost. A non-empty filter tenant is a mandatory predicate:
+// llm_requests rows resolve through subjects.tenant_id, ledger rows through
+// their tenant_id column.
 func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT model, COALESCE(protocol,'chat') AS protocol,
@@ -308,10 +357,11 @@ func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, er
 		  AND ($2 = '' OR model = $2)
 		  AND ($3::timestamptz IS NULL OR created_at >= $3)
 		  AND ($4::timestamptz IS NULL OR created_at <= $4)
+		  AND ($5 = '' OR subject_id IN (SELECT id FROM subjects WHERE tenant_id = $5))
 		GROUP BY model, protocol
 		ORDER BY requests DESC
 		LIMIT 100`,
-		f.Subject, f.Model, nullTime(f.From), nullTime(f.To))
+		f.Subject, f.Model, nullTime(f.From), nullTime(f.To), f.Tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -351,8 +401,9 @@ func (d *DB) mergeLedgerCost(ctx context.Context, f mgmt.AuditFilter, rows []mgm
 		  AND ($2 = '' OR public_model = $2)
 		  AND ($3::timestamptz IS NULL OR settled_at >= $3)
 		  AND ($4::timestamptz IS NULL OR settled_at <= $4)
+		  AND ($5 = '' OR tenant_id = $5)
 		GROUP BY public_model, protocol`,
-		f.Subject, f.Model, nullTime(f.From), nullTime(f.To))
+		f.Subject, f.Model, nullTime(f.From), nullTime(f.To), f.Tenant)
 	if err != nil {
 		return nil, err
 	}

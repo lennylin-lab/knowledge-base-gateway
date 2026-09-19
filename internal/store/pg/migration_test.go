@@ -287,7 +287,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	if err != nil || len(providers) != 2 {
 		t.Fatalf("admin providers = %+v err=%v", providers, err)
 	}
-	policies, err := pgw.Policies(ctx, "subject_default")
+	policies, err := pgw.Policies(ctx, "subject_default", "")
 	if err != nil || len(policies) != 1 || policies[0].PublicModel != "gateway-echo" {
 		t.Fatalf("policies = %+v err=%v", policies, err)
 	}
@@ -310,12 +310,12 @@ func TestMigrationsAndStores(t *testing.T) {
 	// management-op row in one transaction; the loader carries the slots.
 	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo", "chat", mgmt.AdminOp{
 		Action: "default_model_chat", Target: "subject_input_cap", Detail: json.RawMessage(`{"model":"gateway-echo","kind":"chat"}`),
-	}); err != nil {
+	}, ""); err != nil {
 		t.Fatalf("set chat default: %v", err)
 	}
 	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo", "embedding", mgmt.AdminOp{
 		Action: "default_model_embedding", Target: "subject_input_cap",
-	}); err != nil {
+	}, ""); err != nil {
 		t.Fatalf("set embedding default: %v", err)
 	}
 	limits, err := pgw.LoadLimits(ctx)
@@ -331,7 +331,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	if l := limits["subject_default"]; l.DefaultModel != "" || l.DefaultEmbeddingModel != "" {
 		t.Fatalf("NULL defaults must load as empty, got %+v", l)
 	}
-	policies, err2 := pgw.Policies(ctx, "subject_input_cap")
+	policies, err2 := pgw.Policies(ctx, "subject_input_cap", "")
 	if err2 != nil || len(policies) == 0 || policies[0].DefaultModel != "gateway-echo" || policies[0].DefaultEmbeddingModel != "gateway-echo" {
 		t.Fatalf("policies view defaults = %+v err=%v", policies, err2)
 	}
@@ -345,7 +345,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	}
 	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo-2", "chat", mgmt.AdminOp{
 		Action: "default_model_chat", Target: "subject_input_cap", Detail: json.RawMessage(`not-valid-json`),
-	}); err == nil {
+	}, ""); err == nil {
 		t.Fatal("atomic default-model mutation must fail when the audit insert fails")
 	}
 	fresh, err := pgw.LoadLimits(ctx)
@@ -359,13 +359,13 @@ func TestMigrationsAndStores(t *testing.T) {
 		t.Fatalf("cleanup second model: %v", err)
 	}
 	// Unknown model and unknown subject fail without writing anything.
-	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "no-such-model", "chat", mgmt.AdminOp{Action: "default_model_chat"}); err != mgmt.ErrNotFound {
+	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "no-such-model", "chat", mgmt.AdminOp{Action: "default_model_chat"}, ""); err != mgmt.ErrNotFound {
 		t.Fatalf("unknown model must be ErrNotFound, got %v", err)
 	}
-	if err := pgw.SetDefaultModelWithAudit(ctx, "no-such-subject", "gateway-echo", "chat", mgmt.AdminOp{Action: "default_model_chat"}); err != mgmt.ErrNotFound {
+	if err := pgw.SetDefaultModelWithAudit(ctx, "no-such-subject", "gateway-echo", "chat", mgmt.AdminOp{Action: "default_model_chat"}, ""); err != mgmt.ErrNotFound {
 		t.Fatalf("unknown subject must be ErrNotFound, got %v", err)
 	}
-	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo", "weird", mgmt.AdminOp{Action: "x"}); err == nil {
+	if err := pgw.SetDefaultModelWithAudit(ctx, "subject_input_cap", "gateway-echo", "weird", mgmt.AdminOp{Action: "x"}, ""); err == nil {
 		t.Fatal("unknown kind must fail")
 	}
 
@@ -458,7 +458,7 @@ func TestMigrationsAndStores(t *testing.T) {
 	// The admin policies view must expose the folded effective ceilings per
 	// row (issue #8 mitigation), identical on every row of the subject and
 	// equal to what LoadLimits enforces.
-	multiPolicies, err := pgw.Policies(ctx, "subject_multi_row")
+	multiPolicies, err := pgw.Policies(ctx, "subject_multi_row", "")
 	if err != nil || len(multiPolicies) != 2 {
 		t.Fatalf("multi-row policies view = %+v err=%v", multiPolicies, err)
 	}

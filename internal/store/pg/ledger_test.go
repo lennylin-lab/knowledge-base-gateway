@@ -406,7 +406,7 @@ func TestUpsertPriceAndBudgetAtomicWithAudit(t *testing.T) {
 	if err := s.UpsertBudget(ctx, budget, mgmt.AdminOp{CreatedAt: now, Action: "budget_upsert", Target: "ledger-test-subject"}); err != nil {
 		t.Fatalf("re-upsert budget: %v", err)
 	}
-	budgets, err := s.ListBudgets(ctx)
+	budgets, err := s.ListBudgets(ctx, "")
 	if err != nil {
 		t.Fatalf("list budgets: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestBudgetUsageCurrentPeriod(t *testing.T) {
 	insertSettled("req-usage-known-2", i64p(80))
 	insertSettled("req-usage-unknown", nil)
 
-	usage, err := s.BudgetUsage(ctx, now)
+	usage, err := s.BudgetUsage(ctx, now, "")
 	if err != nil {
 		t.Fatalf("budget usage: %v", err)
 	}

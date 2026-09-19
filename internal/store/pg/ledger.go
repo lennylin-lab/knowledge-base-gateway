@@ -188,13 +188,31 @@ func (s LedgerStore) ReleaseLedger(ctx context.Context, id accounting.Identity) 
 // --- Pricing and budget management (admin API surface) --------------------
 
 // UpsertPrice inserts or updates one price version and its management-audit
-// record in one transaction.
+// record in one transaction. The previous row is read inside the transaction
+// for the redacted old/new audit summary (null when the version is new).
 func (s LedgerStore) UpsertPrice(ctx context.Context, in mgmt.PriceInput, op mgmt.AdminOp) error {
 	tx, err := s.DB.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var previous any
+	if err := tx.QueryRow(ctx, `
+		SELECT json_build_object(
+			'currency', currency,
+			'input_micros_per_token', input_micros_per_token,
+			'output_micros_per_token', output_micros_per_token,
+			'reasoning_micros_per_token', reasoning_micros_per_token,
+			'cached_input_micros_per_token', cached_input_micros_per_token,
+			'effective_from', effective_from)
+		FROM pricing_catalog
+		WHERE provider = $1 AND public_model = $2 AND price_version = $3`,
+		in.Provider, in.PublicModel, in.PriceVersion).Scan(&previous); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		previous = nil // new version: nothing to summarize
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO pricing_catalog (provider, public_model, price_version, currency,
 			input_micros_per_token, output_micros_per_token,
@@ -212,6 +230,7 @@ func (s LedgerStore) UpsertPrice(ctx context.Context, in mgmt.PriceInput, op mgm
 		in.ReasoningMicrosPerToken, in.CachedInputMicrosPerToken, in.EffectiveFrom); err != nil {
 		return err
 	}
+	op.Detail = mgmt.MergeDetail(op.Detail, map[string]any{"previous": previous})
 	if err := writeOp(ctx, tx, op); err != nil {
 		return err
 	}
@@ -248,6 +267,8 @@ func (s LedgerStore) ListPrices(ctx context.Context) ([]mgmt.PriceView, error) {
 // UpsertBudget inserts or updates one budget row and its management-audit
 // record in one transaction. The conflict target is the schema's expression
 // index, so an upsert cannot create the duplicate the unique index forbids.
+// The previous row is read inside the transaction for the redacted old/new
+// audit summary (null when the budget is new).
 func (s LedgerStore) UpsertBudget(ctx context.Context, in mgmt.BudgetInput, op mgmt.AdminOp) error {
 	enabled := true
 	if in.Enabled != nil {
@@ -258,6 +279,18 @@ func (s LedgerStore) UpsertBudget(ctx context.Context, in mgmt.BudgetInput, op m
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var previous any
+	if err := tx.QueryRow(ctx, `
+		SELECT json_build_object('amount_micros', amount_micros, 'enabled', enabled, 'currency', currency)
+		FROM budget_policies
+		WHERE scope = $1 AND COALESCE(subject_id,'') = COALESCE($2,'') AND tenant_id = $3
+		  AND period = $4 AND currency = $5`,
+		in.Scope, in.SubjectID, in.TenantID, in.Period, in.Currency).Scan(&previous); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		previous = nil
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO budget_policies (scope, subject_id, tenant_id, period, currency, amount_micros, enabled)
 		VALUES ($1, NULLIF($2,''), $3, $4, $5, $6, $7)
@@ -268,19 +301,23 @@ func (s LedgerStore) UpsertBudget(ctx context.Context, in mgmt.BudgetInput, op m
 		in.Scope, in.SubjectID, in.TenantID, in.Period, in.Currency, in.AmountMicros, enabled); err != nil {
 		return err
 	}
+	op.Detail = mgmt.MergeDetail(op.Detail, map[string]any{"previous": previous})
 	if err := writeOp(ctx, tx, op); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-// ListBudgets returns the budget policies ordered for display.
-func (s LedgerStore) ListBudgets(ctx context.Context) ([]mgmt.BudgetView, error) {
+// ListBudgets returns the budget policies ordered for display. A non-empty
+// tenant is a mandatory predicate: tenant-bound callers only ever see their
+// tenant's rows (subject rows of the tenant plus the tenant row itself).
+func (s LedgerStore) ListBudgets(ctx context.Context, tenant string) ([]mgmt.BudgetView, error) {
 	rows, err := s.DB.Pool.Query(ctx, `
 		SELECT id, scope, COALESCE(subject_id,''), tenant_id, period, currency,
 		       amount_micros, enabled, created_at, updated_at
 		FROM budget_policies
-		ORDER BY scope, tenant_id, COALESCE(subject_id,''), period, currency`)
+		WHERE ($1 = '' OR tenant_id = $1)
+		ORDER BY scope, tenant_id, COALESCE(subject_id,''), period, currency`, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -297,12 +334,13 @@ func (s LedgerStore) ListBudgets(ctx context.Context) ([]mgmt.BudgetView, error)
 	return out, rows.Err()
 }
 
-// BudgetUsage reports current-period utilization for every budget policy:
-// the sum of known settled cost and the count of unknown-cost settlements in
-// the policy's current UTC period. Windows are computed in Go on UTC
-// boundaries so the query never depends on the database session timezone.
-func (s LedgerStore) BudgetUsage(ctx context.Context, now time.Time) ([]mgmt.BudgetUsageView, error) {
-	policies, err := s.ListBudgets(ctx)
+// BudgetUsage reports current-period utilization for every budget policy
+// (bounded to the tenant when one is given): the sum of known settled cost
+// and the count of unknown-cost settlements in the policy's current UTC
+// period. Windows are computed in Go on UTC boundaries so the query never
+// depends on the database session timezone.
+func (s LedgerStore) BudgetUsage(ctx context.Context, now time.Time, tenant string) ([]mgmt.BudgetUsageView, error) {
+	policies, err := s.ListBudgets(ctx, tenant)
 	if err != nil {
 		return nil, err
 	}

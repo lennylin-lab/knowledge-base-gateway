@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/adminauth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/async"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
@@ -235,17 +236,32 @@ func newJobID() string {
 // AsyncJobsHandler serves GET /v1/responses/{id} and
 // POST /v1/responses/{id}/cancel. Only the owning subject may see or cancel a
 // job; any other caller — including for existing jobs — receives the same
-// response_not_found, so existence never leaks across owners.
+// response_not_found, so existence never leaks across owners. Scoped admin
+// credentials (V1.4) extend visibility: a caller presenting an admin
+// credential with the viewer scope may GET any job (tenant-bound admins only
+// jobs of their tenant), still under the non-leaky not-found envelope;
+// cancellation stays with the owning subject. The legacy bootstrap token
+// authenticates as the platform-admin identity on this surface too.
 type AsyncJobsHandler struct {
 	Auth    Authenticator
 	Jobs    async.Store
 	Cancels *async.CancelRegistry
 	Audit   audit.Sink
 	Metrics *metrics.Registry
+	// AdminAuth authenticates scoped admin credentials on GET; nil disables
+	// admin access and keeps the owner-only behavior.
+	AdminAuth *adminauth.Authenticator
 	// PollHint is the suggested query interval surfaced as Retry-After for
 	// queued/running jobs.
 	PollHint time.Duration
 	Now      func() time.Time
+}
+
+// jobCaller is the resolved GET/cancel identity: the API-key subject, plus
+// the admin principal when the caller presented an admin credential.
+type jobCaller struct {
+	subjectID string
+	admin     *adminauth.Principal // nil for API-key callers
 }
 
 // ServeHTTP dispatches by method (the mux registers both routes).
@@ -260,24 +276,78 @@ func (h *AsyncJobsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// authenticate resolves the caller or writes the 401 envelope.
-func (h *AsyncJobsHandler) authenticate(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
+// authenticate resolves the caller or writes the error envelope. Routing:
+// "kba_"-prefixed tokens are admin credentials (never valid API keys — the
+// hex alphabet cannot contain '_'); any other token is tried as an API key
+// first and, on failure and when the admin authenticator is wired, as the
+// legacy bootstrap token (constant-time comparison happens inside the admin
+// authenticator). requireViewer enforces the GET visibility scope for the
+// admin path.
+func (h *AsyncJobsHandler) authenticate(w http.ResponseWriter, r *http.Request, requireViewer bool) (jobCaller, bool) {
+	requestID := requestIDOf(r)
 	key, ok := bearer(r)
 	if !ok {
-		writeError(w, requestIDOf(r), http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid API key")
-		return auth.Principal{}, false
+		writeError(w, requestID, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid API key")
+		return jobCaller{}, false
+	}
+	if adminauth.HasCredentialPrefix(key) {
+		return h.authenticateAdmin(w, r, key, requireViewer)
 	}
 	principal, err := h.Auth.Authenticate(key, time.Now())
-	if err != nil {
-		mapError(w, requestIDOf(r), err)
-		return auth.Principal{}, false
+	if err == nil {
+		return jobCaller{subjectID: principal.SubjectID}, true
 	}
-	return principal, true
+	if h.AdminAuth != nil {
+		if caller, ok := h.authenticateAdmin(w, r, key, requireViewer); ok {
+			return caller, true
+		}
+		// The admin path wrote its own envelope (401/403/429); keep it.
+		return jobCaller{}, false
+	}
+	mapError(w, requestID, err)
+	return jobCaller{}, false
 }
 
-// loadOwnedJob fetches the job and enforces ownership with the non-leaky
-// response_not_found. Job-store outages surface as job_queue_unavailable.
-func (h *AsyncJobsHandler) loadOwnedJob(w http.ResponseWriter, r *http.Request, principal auth.Principal) (async.Job, bool) {
+// authenticateAdmin resolves the admin credential or bootstrap token and
+// enforces the caller's scope for the operation at hand.
+func (h *AsyncJobsHandler) authenticateAdmin(w http.ResponseWriter, r *http.Request, key string, requireViewer bool) (jobCaller, bool) {
+	requestID := requestIDOf(r)
+	unauthorized := func() {
+		// Uniform envelope: admin states are never enumerable on /v1 routes.
+		writeError(w, requestID, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid API key")
+	}
+	if h.AdminAuth == nil {
+		unauthorized()
+		return jobCaller{}, false
+	}
+	principal, post, err := h.AdminAuth.Authenticate(r.Context(), key, clientKey(r))
+	if post != nil {
+		go post() // bounded bookkeeping off the request path (success and failure)
+	}
+	var rlErr *adminauth.RateLimitError
+	switch {
+	case errors.As(err, &rlErr):
+		if rlErr.RetryAfter > 0 {
+			w.Header().Set("Retry-After", retryAfterText(rlErr.RetryAfter))
+		}
+		writeError(w, requestID, http.StatusTooManyRequests, "rate_limit_error", "admin_rate_limited", "too many failed admin authentications; retry later")
+		return jobCaller{}, false
+	case err != nil:
+		unauthorized()
+		return jobCaller{}, false
+	}
+	if requireViewer && !principal.Has(adminauth.ScopeViewer) {
+		writeError(w, requestID, http.StatusForbidden, "permission_error", "insufficient_scope", "this admin credential is not authorized for the requested operation")
+		return jobCaller{}, false
+	}
+	return jobCaller{subjectID: principal.AdminSubject, admin: &principal}, true
+}
+
+// loadOwnedJob fetches the job and enforces visibility with the non-leaky
+// response_not_found: owning subject, or — for scoped admin callers — any
+// job within a platform admin's reach, or the tenant boundary for
+// tenant-bound admins. Job-store outages surface as job_queue_unavailable.
+func (h *AsyncJobsHandler) loadOwnedJob(w http.ResponseWriter, r *http.Request, caller jobCaller) (async.Job, bool) {
 	requestID := requestIDOf(r)
 	job, err := h.Jobs.Get(r.Context(), getJobID(r), h.now())
 	switch {
@@ -291,7 +361,17 @@ func (h *AsyncJobsHandler) loadOwnedJob(w http.ResponseWriter, r *http.Request, 
 		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "internal_error", "internal server error")
 		return async.Job{}, false
 	}
-	if job.SubjectID != principal.SubjectID {
+	if caller.admin != nil {
+		// Scoped admin visibility: platform admins see every job;
+		// tenant-bound admins only jobs of their tenant (same non-leaky
+		// envelope as absence — the boundary never leaks job existence).
+		if !caller.admin.Global() && job.TenantID != caller.admin.TenantID {
+			writeError(w, requestID, http.StatusNotFound, "invalid_request_error", "response_not_found", "the response does not exist for this principal")
+			return async.Job{}, false
+		}
+		return job, true
+	}
+	if job.SubjectID != caller.subjectID {
 		// Same non-leaky envelope as absence: ownership never leaks.
 		writeError(w, requestID, http.StatusNotFound, "invalid_request_error", "response_not_found", "the response does not exist for this principal")
 		return async.Job{}, false
@@ -308,12 +388,13 @@ func (h *AsyncJobsHandler) now() time.Time {
 
 // get serves GET /v1/responses/{id}. Queries never trigger execution or
 // polling work: queued/running carry a Retry-After hint, expired results
-// return the stable 410.
+// return the stable 410. Scoped admin credentials with the viewer scope may
+// read jobs within their tenant reach (the contained scope-check seam).
 func (h *AsyncJobsHandler) get(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDOf(r)
 	w.Header().Set("X-Request-ID", requestID)
 	w.Header().Set("X-Trace-ID", traceIDOf(r, requestID))
-	principal, ok := h.authenticate(w, r)
+	caller, ok := h.authenticate(w, r, true)
 	if !ok {
 		return
 	}
@@ -321,7 +402,7 @@ func (h *AsyncJobsHandler) get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "job_queue_unavailable", "the service is temporarily unable to accept requests")
 		return
 	}
-	job, ok := h.loadOwnedJob(w, r, principal)
+	job, ok := h.loadOwnedJob(w, r, caller)
 	if !ok {
 		return
 	}
@@ -350,19 +431,25 @@ func (h *AsyncJobsHandler) get(w http.ResponseWriter, r *http.Request) {
 // update decides cancel-versus-completion races; the winner of that decision
 // writes the job's single cancellation handoff (audit + registry signal).
 // Repeat cancels are idempotent and return the final observable state.
+// Cancellation stays with the owning subject: admin credentials authenticate
+// but are denied (the scoped-admin grant is visibility, not control).
 func (h *AsyncJobsHandler) cancel(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDOf(r)
 	w.Header().Set("X-Request-ID", requestID)
 	w.Header().Set("X-Trace-ID", traceIDOf(r, requestID))
-	principal, ok := h.authenticate(w, r)
+	caller, ok := h.authenticate(w, r, false)
 	if !ok {
+		return
+	}
+	if caller.admin != nil {
+		writeError(w, requestID, http.StatusForbidden, "permission_error", "insufficient_scope", "admin credentials may query but not cancel background responses")
 		return
 	}
 	if h.Jobs == nil {
 		writeError(w, requestID, http.StatusServiceUnavailable, "service_unavailable", "job_queue_unavailable", "the service is temporarily unable to accept requests")
 		return
 	}
-	job, ok := h.loadOwnedJob(w, r, principal)
+	job, ok := h.loadOwnedJob(w, r, caller)
 	if !ok {
 		return
 	}

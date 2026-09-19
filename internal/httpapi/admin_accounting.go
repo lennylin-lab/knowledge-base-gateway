@@ -18,13 +18,16 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/mgmt"
 )
 
-// AccountingAdmin is the management surface for pricing and budgets.
+// AccountingAdmin is the management surface for pricing and budgets. The
+// tenant parameter is the caller's tenant boundary: empty for platform
+// identities, otherwise a mandatory predicate (budget views) enforced inside
+// the implementation.
 type AccountingAdmin interface {
 	ListPrices(ctx context.Context) ([]mgmt.PriceView, error)
 	UpsertPrice(ctx context.Context, in mgmt.PriceInput, op mgmt.AdminOp) error
-	ListBudgets(ctx context.Context) ([]mgmt.BudgetView, error)
+	ListBudgets(ctx context.Context, tenant string) ([]mgmt.BudgetView, error)
 	UpsertBudget(ctx context.Context, in mgmt.BudgetInput, op mgmt.AdminOp) error
-	BudgetUsage(ctx context.Context, now time.Time) ([]mgmt.BudgetUsageView, error)
+	BudgetUsage(ctx context.Context, now time.Time, tenant string) ([]mgmt.BudgetUsageView, error)
 }
 
 // currencyPattern mirrors the schema's CHECK constraint: ISO-4217 style
@@ -50,18 +53,23 @@ func registerAccountingAdmin(mux *http.ServeMux, guard func(http.HandlerFunc) ht
 		}
 	}))
 	mux.HandleFunc("/admin/budgets", guard(func(w http.ResponseWriter, r *http.Request) {
+		requestID := newRequestID()
+		principal, _ := principalFromContext(r.Context())
 		switch r.Method {
 		case http.MethodGet:
-			rows, err := deps.Accounting.ListBudgets(r.Context())
+			rows, err := deps.Accounting.ListBudgets(r.Context(), principal.TenantID)
+			if mapMgmtErr(w, requestID, err) {
+				return
+			}
 			if err != nil {
-				writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "query_failed", "could not query budgets")
+				writeError(w, requestID, http.StatusInternalServerError, "internal_error", "query_failed", "could not query budgets")
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"budgets": rows})
 		case http.MethodPost:
 			handleUpsertBudget(w, r, deps)
 		default:
-			writeError(w, newRequestID(), http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "use GET or POST")
+			writeError(w, requestID, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "use GET or POST")
 		}
 	}))
 }
@@ -118,8 +126,8 @@ func handleUpsertPrice(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
 		"price_version": in.PriceVersion, "currency": in.Currency,
 		"effective_from": in.EffectiveFrom,
 	})
-	op := mgmt.AdminOp{CreatedAt: time.Now(), Action: "price_upsert",
-		Target: in.Provider + "/" + in.PublicModel + "/v" + strconv.Itoa(in.PriceVersion), Detail: detail}
+	op := adminOpFrom(r, "price_upsert",
+		in.Provider+"/"+in.PublicModel+"/v"+strconv.Itoa(in.PriceVersion), detail)
 	if err := deps.Accounting.UpsertPrice(r.Context(), in, op); err != nil {
 		writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "update_failed", "could not upsert the price")
 		return
@@ -140,9 +148,11 @@ type budgetBody struct {
 }
 
 func handleUpsertBudget(w http.ResponseWriter, r *http.Request, deps AdminDeps) {
+	requestID := newRequestID()
+	principal, _ := principalFromContext(r.Context())
 	var body budgetBody
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
-		writeError(w, newRequestID(), http.StatusBadRequest, "invalid_request_error", "invalid_request", "invalid budget payload")
+		writeError(w, requestID, http.StatusBadRequest, "invalid_request_error", "invalid_request", "invalid budget payload")
 		return
 	}
 	if (body.Scope != "subject" && body.Scope != "tenant") ||
@@ -151,7 +161,14 @@ func handleUpsertBudget(w http.ResponseWriter, r *http.Request, deps AdminDeps) 
 		body.TenantID == "" ||
 		(body.Period != "daily" && body.Period != "monthly") ||
 		!currencyPattern.MatchString(body.Currency) || body.AmountMicros <= 0 {
-		writeError(w, newRequestID(), http.StatusBadRequest, "invalid_request_error", "invalid_request", "scope (subject rows carry subject_id; tenant rows must not), tenant_id, period, currency, and a positive amount_micros are required")
+		writeError(w, requestID, http.StatusBadRequest, "invalid_request_error", "invalid_request", "scope (subject rows carry subject_id; tenant rows must not), tenant_id, period, currency, and a positive amount_micros are required")
+		return
+	}
+	// Tenant boundary: a tenant-bound billing identity manages budgets of its
+	// own tenant only. The tenant is declared in the body, so the denial is a
+	// plain 403 — nothing about other tenants is probed.
+	if !principal.Global() && body.TenantID != principal.TenantID {
+		adminInsufficientScope(w, requestID)
 		return
 	}
 	in := mgmt.BudgetInput{
@@ -166,9 +183,9 @@ func handleUpsertBudget(w http.ResponseWriter, r *http.Request, deps AdminDeps) 
 	detail, _ := json.Marshal(map[string]any{
 		"scope": in.Scope, "period": in.Period, "currency": in.Currency,
 	})
-	op := mgmt.AdminOp{CreatedAt: time.Now(), Action: "budget_upsert", Target: target, Detail: detail}
+	op := adminOpFrom(r, "budget_upsert", target, detail)
 	if err := deps.Accounting.UpsertBudget(r.Context(), in, op); err != nil {
-		writeError(w, newRequestID(), http.StatusInternalServerError, "internal_error", "update_failed", "could not upsert the budget")
+		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "update_failed", "could not upsert the budget")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "upserted", "scope": in.Scope, "period": in.Period})
@@ -176,12 +193,12 @@ func handleUpsertBudget(w http.ResponseWriter, r *http.Request, deps AdminDeps) 
 
 // budgetUsageSection builds the /admin/usage "budgets" block. ok is false
 // when no accounting admin is wired, leaving the section out (additive
-// evolution).
-func budgetUsageSection(deps AdminDeps, r *http.Request) (rows []mgmt.BudgetUsageView, ok bool) {
+// evolution). The tenant boundary is a mandatory predicate.
+func budgetUsageSection(deps AdminDeps, r *http.Request, tenant string) (rows []mgmt.BudgetUsageView, ok bool) {
 	if deps.Accounting == nil {
 		return nil, false
 	}
-	rows, err := deps.Accounting.BudgetUsage(r.Context(), time.Now())
+	rows, err := deps.Accounting.BudgetUsage(r.Context(), time.Now(), tenant)
 	if err != nil {
 		return nil, true // wired but failed: caller answers query_failed
 	}

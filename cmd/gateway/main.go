@@ -18,6 +18,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/accounting"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/adminauth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/async"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
@@ -375,6 +376,17 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		MaxBody: cfg.MaxBodyBytes, MaxMsgs: cfg.MaxMessages, MaxChars: cfg.MaxMessageChars,
 	}
 
+	// V1.4 scoped admin identities: stored credentials in database mode, an
+	// in-memory store in development mode. The legacy GATEWAY_ADMIN_TOKEN
+	// rides the same authenticator as the explicit platform-admin bootstrap
+	// identity; failed authentications are rate limited independently.
+	adminAuth := &adminauth.Authenticator{
+		Store:       adminCredStore(dbw),
+		LegacyToken: cfg.AdminToken,
+		Limiter:     adminauth.NewAuthLimiter(),
+		Now:         time.Now,
+	}
+
 	// V1.4 background Responses jobs: opt-in (GATEWAY_ASYNC_ENABLED) and
 	// database-mode only — PostgreSQL owns the job state machine, so the
 	// in-memory development mode has no queue and background acceptance
@@ -408,7 +420,8 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		}
 		asyncJobsHandler = &httpapi.AsyncJobsHandler{
 			Auth: keyAuth, Jobs: jobs, Cancels: cancels, Audit: auditSink, Metrics: reg,
-			PollHint: cfg.AsyncPollInterval, Now: time.Now,
+			AdminAuth: adminAuth,
+			PollHint:  cfg.AsyncPollInterval, Now: time.Now,
 		}
 		logger.Info("async responses enabled", "workers", cfg.AsyncWorkers,
 			"lease", cfg.AsyncLease.String(), "job_timeout", cfg.AsyncJobTimeout.String())
@@ -477,7 +490,12 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 
 	var adminSrv *http.Server
 	var adminLn net.Listener
-	if cfg.AdminToken != "" {
+	// Admin API: separate listener, internal network only. It starts when
+	// either authentication path is available: the legacy bootstrap token or
+	// stored admin credentials (database mode). During the migration both
+	// paths stay live; removing GATEWAY_ADMIN_TOKEN once scoped credentials
+	// are production-verified is the documented deprecation step.
+	if cfg.AdminToken != "" || dbw != nil {
 		adminLn, err = net.Listen("tcp", cfg.AdminAddr)
 		if err != nil {
 			return fmt.Errorf("admin listen %s: %w", cfg.AdminAddr, err)
@@ -487,6 +505,8 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 			Addr: cfg.AdminAddr, ReadHeaderTimeout: 10 * time.Second,
 			Handler: httpapi.NewAdminMux(httpapi.AdminDeps{
 				Manager: keyManager, Logger: logger, Token: cfg.AdminToken, Mgmt: mgmtSvc,
+				AdminAuth:        adminAuth,
+				AdminManager:     adminauth.NewManager(adminAuth.Store),
 				ApplyModelChange: applyModelChange, ProviderRuntime: providerRuntime,
 				ApplyPolicyChange: applyPolicyChange,
 				Accounting:        ledgerStore, // nil in development mode
@@ -547,6 +567,16 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	default:
 	}
 	return nil
+}
+
+// adminCredStore selects the admin credential persistence: PostgreSQL in
+// database mode, in-memory in development mode (development issues nothing
+// unless an operator calls /admin/admins with the bootstrap token).
+func adminCredStore(dbw *pgstore.DB) adminauth.Store {
+	if dbw != nil {
+		return pgstore.AdminCredentialStore{DB: dbw}
+	}
+	return adminauth.NewMemoryStore()
 }
 
 // routeSet builds the router routes for one public model from the persisted
