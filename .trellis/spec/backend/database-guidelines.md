@@ -27,6 +27,31 @@ gated on `TEST_DATABASE_URL`. New migrations must also keep
 `TestMigrationFilesParse` passing: complete up/down pairs, golang-migrate
 naming.
 
+### Convention: Lifecycle sweeps archive, verify, then delete
+
+**What**: Retention sweeps (internal/lifecycle + cmd/maintain) follow a
+fixed discipline per batch: select eligible rows (terminal jobs only,
+settled-or-released ledger rows) → write the archive artifact → read-back
+verify (row count + SHA-256) → only then delete, bounded per run. Archives
+are content-free by construction (shared column projections — response
+bodies and prompt/completion content never selected); the manifest carries
+schema version, range, and checksum. Absent policy row or `enabled=false`
+is a legal hold that skips the table. Exports are two-phase (tenant
+validated before bytes, management-log platform-scope only) with the same
+checksum trailer.
+
+**Why**: Billing ledger rows are the durable settlement record and audit
+rows are evidence — a sweep must never destroy either, and a partial or
+corrupt archive must never trigger deletes (verify-before-publish makes
+deletes unreachable on sink failure).
+
+**Boundary**: Physical partitioning of `llm_requests` stays deferred —
+bounded PK-range archive sweeps are the rolling-upgrade-safe equivalent.
+`retention_policies.archive_before_delete` is reserved (archiving is
+unconditional). Idempotency `KeyTTL` is enforced at the replay lookup
+boundary, reclaimed on write, and swept by the worker cadence and
+`cmd/maintain`.
+
 ### Convention: Migration batches walk every down boundary and freeze wire first
 
 **What**: When a task lands a batch of migrations (e.g. the V1.4 0006-0009

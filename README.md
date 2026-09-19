@@ -65,6 +65,8 @@ go run ./cmd/gateway
 | `GATEWAY_EMBEDDINGS_ENABLED` | `true` | Set `false` to disable `/v1/embeddings` (rollback switch) |
 | `GATEWAY_ASYNC_ENABLED` | `false` | Set `true` to accept `background: true` Responses jobs (V1.4; requires database mode) |
 | `GATEWAY_BUDGETS_ENABLED` | `false` | Set `true` to enforce monetary budgets (V1.4; database mode). Ledger capture is always on in database mode — enforcement can be rolled back without losing cost evidence |
+| `GATEWAY_LIFECYCLE_ENABLED` | `true` | Data lifecycle (retention/archive/export, V1.4; database mode). Set `false` to disable the admin lifecycle endpoints and stop `cmd/maintain` — the documented rollback point. Inert until `retention_policies` rows exist; see `docs/data-lifecycle.md` |
+| `GATEWAY_LIFECYCLE_ARCHIVE_DIR` | `archives` | Filesystem archive-sink root for retention archives; production configuration must point this at a durable location (see `docs/data-lifecycle.md`) |
 | `GATEWAY_ASYNC_WORKERS` | `2` | Background-job worker goroutines (1..64) |
 | `GATEWAY_ASYNC_POLL_INTERVAL` | `1s` | Queue poll / recovery sweep cadence |
 | `GATEWAY_ASYNC_LEASE` | `60s` | Worker claim lease, heartbeat-extended |
