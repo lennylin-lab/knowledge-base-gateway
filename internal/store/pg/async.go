@@ -622,13 +622,13 @@ func (s AsyncStore) ExpireDueResults(ctx context.Context, now time.Time) (int, e
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := tx.Query(ctx, `
-		UPDATE async_jobs SET status = 'expired', updated_at = $2
+		UPDATE async_jobs SET status = 'expired', updated_at = $1
 		WHERE job_id IN (
 			SELECT job_id FROM async_jobs
-			WHERE status IN ('completed','failed') AND result_expires_at < $2
+			WHERE status IN ('completed','failed') AND result_expires_at < $1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING job_id`, now, now)
+		RETURNING job_id`, now)
 	if err != nil {
 		return 0, unavailable(err)
 	}

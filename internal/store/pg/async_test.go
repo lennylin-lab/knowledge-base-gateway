@@ -508,6 +508,86 @@ func TestAsyncStoreRecoveryAndRequeue(t *testing.T) {
 	}
 }
 
+// TestAsyncStoreResultExpirySweep pins the worker-sweep reclamation path for
+// expired results on the real schema: terminal jobs past their result TTL
+// transition to expired with their result rows dropped, jobs still inside
+// their TTL keep both, and — the regression this test pins — the sweep
+// statement itself executes (an earlier revision passed an unused $1
+// parameter, which PostgreSQL rejects with SQLSTATE 42P18 on every sweep
+// pass, so results could never be reclaimed by the sweep in production).
+func TestAsyncStoreResultExpirySweep(t *testing.T) {
+	s, _ := newAsyncTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// A completed job whose result TTL already passed, and one still inside.
+	due := asyncCreateInput("job-exp-due", now.Add(-2*time.Hour))
+	if _, err := s.Create(ctx, due); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.Claim(ctx, async.ClaimInput{Owner: "w", Lease: time.Minute, Now: due.Now}); err != nil || !ok {
+		t.Fatalf("claim due: ok=%v err=%v", ok, err)
+	}
+	won, err := s.CommitSuccess(ctx, async.SuccessInput{
+		JobID: "job-exp-due", Owner: "w", FinalRequestID: "req-exp-due",
+		Response: json.RawMessage(`{"id":"job-exp-due"}`), ResultBytes: 18,
+		ResultExpiresAt: now.Add(-time.Minute), // already past
+		BumpAttempt:     true, Now: now,
+	})
+	if err != nil || !won {
+		t.Fatalf("commit due: won=%v err=%v", won, err)
+	}
+
+	live := asyncCreateInput("job-exp-live", now.Add(-2*time.Hour))
+	if _, err := s.Create(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.Claim(ctx, async.ClaimInput{Owner: "w2", Lease: time.Minute, Now: live.Now}); err != nil || !ok {
+		t.Fatalf("claim live: ok=%v err=%v", ok, err)
+	}
+	won, err = s.CommitSuccess(ctx, async.SuccessInput{
+		JobID: "job-exp-live", Owner: "w2", FinalRequestID: "req-exp-live",
+		Response: json.RawMessage(`{"id":"job-exp-live"}`), ResultBytes: 19,
+		ResultExpiresAt: now.Add(time.Hour), // still inside
+		BumpAttempt:     true, Now: now,
+	})
+	if err != nil || !won {
+		t.Fatalf("commit live: won=%v err=%v", won, err)
+	}
+
+	// A queued job is never a result-expiry candidate even with a past TTL
+	// column value (it has no terminal status).
+	if _, err := s.Create(ctx, asyncCreateInput("job-exp-queued", now)); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.ExpireDueResults(ctx, now)
+	if err != nil {
+		t.Fatalf("expire sweep: %v", err) // must not fail (the 42P18 regression)
+	}
+	if n != 1 {
+		t.Fatalf("expired = %d, want 1", n)
+	}
+	dueJob, err := s.Get(ctx, "job-exp-due", now)
+	if err != nil || dueJob.Status != async.StatusExpired {
+		t.Fatalf("due job = %+v err=%v, want expired", dueJob, err)
+	}
+	if _, err := s.Result(ctx, "job-exp-due"); !errors.Is(err, async.ErrNotFound) {
+		t.Fatalf("due result = %v, want ErrNotFound (dropped)", err)
+	}
+	liveJob, err := s.Get(ctx, "job-exp-live", now)
+	if err != nil || liveJob.Status != async.StatusCompleted {
+		t.Fatalf("live job = %+v err=%v, want still completed", liveJob, err)
+	}
+	if _, err := s.Result(ctx, "job-exp-live"); err != nil {
+		t.Fatalf("live result must survive: %v", err)
+	}
+	// The sweep is idempotent: the second pass expires nothing.
+	if n, err := s.ExpireDueResults(ctx, now); err != nil || n != 0 {
+		t.Fatalf("second sweep = %d err=%v, want 0", n, err)
+	}
+}
+
 func TestAsyncStoreRequeueAndCancelQueued(t *testing.T) {
 	s, _ := newAsyncTestStore(t)
 	ctx := context.Background()
