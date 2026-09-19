@@ -210,6 +210,26 @@ known usage (one settled ledger row; the cancel winner keeps the single
 audit) — recovery-loss losers still release. Idempotency `KeyTTL`
 enforcement is owned by the data-lifecycle child.
 
+### Convention: Release rehearsals are validation-first and staged
+
+**What**: A rollout-validation task drives a real HTTP + PostgreSQL + worker
+end-to-end rehearsal (not mocks) structured as: flags-off = previous-release
+behavior (golden byte-for-byte, readiness reflects disabled features) →
+per-flag progression → rollback rehearsal of every documented rollback point
+(disable + drain, enforcement-off retaining ledger, legacy auth path).
+Validation is expected to find defects; fixes ship with regression tests that
+demonstrably fail on the old code (temporary reversion), and a tenant/scope
+sweep re-classifies every query added during the roadmap.
+
+**Why**: The V1.4 rehearsal surfaced two production-only defects no unit test
+could catch (a jobs sweep that could never converge against the ledger FK,
+and a sweep SQL rejected by PostgreSQL entirely) precisely because it ran the
+whole machine against real services.
+
+**Boundary**: Behavior changes are limited to validation-found defects;
+load thresholds map to existing scrape-time metrics with dashboard/alert
+mapping in docs rather than ad-hoc load scripts.
+
 ### Convention: Provider adapters share one offline contract suite
 
 **What**: `internal/provider/contract_test.go` runs the same scenario set
