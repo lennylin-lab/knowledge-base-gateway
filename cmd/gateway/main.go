@@ -17,6 +17,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/knowledge-base/knowledge-base-gateway/internal/async"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/audit"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/auth"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/config"
@@ -138,6 +139,14 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 
 	svc := gateway.New(catalog, providers, cfg.RequestTimeout, cfg.MaxRetries)
+
+	// V1.4 background jobs execute on their own Service: the synchronous
+	// total deadline (cfg.RequestTimeout, unchanged since V1.3) must never cap
+	// a queued job, so the async service's total deadline is the job timeout.
+	// The live route table is shared, so breaker state and route/model
+	// administration affect both paths identically; only the deadline differs.
+	asyncSvc := gateway.New(catalog, providers, cfg.AsyncJobTimeout, cfg.MaxRetries)
+	asyncSvc.Routes = svc.Routes
 
 	// Persisted primary/backup routes replace the single-candidate defaults.
 	if dbw != nil {
@@ -339,10 +348,50 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxMsgs: cfg.MaxMessages, MaxChars: cfg.MaxMessageChars,
 	}
+
+	// V1.4 background Responses jobs: opt-in (GATEWAY_ASYNC_ENABLED) and
+	// database-mode only — PostgreSQL owns the job state machine, so the
+	// in-memory development mode has no queue and background acceptance
+	// answers with the stable 503 job_queue_unavailable (the documented
+	// rollback posture: stop accepting, drain workers, retain rows/results).
+	var asyncBundle *httpapi.Async
+	var asyncJobsHandler http.Handler
+	if cfg.AsyncEnabled && dbw != nil {
+		cancels := async.NewCancelRegistry()
+		jobs := &pgstore.AsyncStore{DB: dbw}
+		asyncPool := async.NewPool(async.PoolDeps{
+			Store: jobs, Service: asyncSvc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
+			Audit: auditSink, Metrics: reg, Logger: logger, Cancels: cancels,
+			Encoder: httpapi.NewAsyncEncoder(), Now: time.Now,
+		}, async.PoolConfig{
+			WorkerID: workerID(), Count: cfg.AsyncWorkers, PollInterval: cfg.AsyncPollInterval,
+			Lease: cfg.AsyncLease, JobTimeout: cfg.AsyncJobTimeout,
+			MaxAttempts: cfg.AsyncMaxAttempts, ResultTTL: cfg.AsyncResultTTL,
+			MaxResultBytes: cfg.AsyncMaxResultBytes, Drain: cfg.AsyncDrainTimeout,
+		})
+		asyncPool.Start(ctx)
+		// Stop runs after the HTTP listeners shut down (defers run LIFO and
+		// this is registered before dbw.Close): HTTP intake stops first, then
+		// workers drain and hand back their leases.
+		defer asyncPool.Stop(cfg.AsyncDrainTimeout)
+		asyncBundle = &httpapi.Async{
+			Jobs: jobs, Cancels: cancels, Wake: asyncPool.Wake,
+			ResultTTL: cfg.AsyncResultTTL, KeyTTL: cfg.AsyncIdempotencyTTL,
+			MaxResultBytes: cfg.AsyncMaxResultBytes, MaxKeyBytes: cfg.AsyncMaxKeyBytes,
+		}
+		asyncJobsHandler = &httpapi.AsyncJobsHandler{
+			Auth: keyAuth, Jobs: jobs, Cancels: cancels, Audit: auditSink, Metrics: reg,
+			PollHint: cfg.AsyncPollInterval, Now: time.Now,
+		}
+		logger.Info("async responses enabled", "workers", cfg.AsyncWorkers,
+			"lease", cfg.AsyncLease.String(), "job_timeout", cfg.AsyncJobTimeout.String())
+	}
+
 	responses := &httpapi.ResponsesHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
 		Audit: auditSink, Metrics: reg,
 		MaxBody: cfg.MaxBodyBytes, MaxItems: cfg.MaxMessages * 2, MaxChars: cfg.MaxMessageChars,
+		Async: asyncBundle,
 	}
 	embeddings := &httpapi.EmbeddingsHandler{
 		Auth: keyAuth, Service: svc, Policy: pol, Limiter: rateLimiter, Quota: quotaGate,
@@ -379,12 +428,14 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		embeddingsHandler = nil // documented rollback switch
 	}
 	mux := httpapi.NewMux(chat, httpapi.Deps{
-		Logger:     logger,
-		ReadyFn:    ready,
-		Metrics:    reg.Handler(),
-		Responses:  responsesHandler,
-		Embeddings: embeddingsHandler,
-		Models:     models,
+		Logger:          logger,
+		ReadyFn:         ready,
+		Metrics:         reg.Handler(),
+		Responses:       responsesHandler,
+		ResponsesGet:    asyncJobsHandler,
+		ResponsesCancel: asyncJobsHandler,
+		Embeddings:      embeddingsHandler,
+		Models:          models,
 	})
 
 	// Bind both listeners synchronously so a port conflict is an ordinary
@@ -590,6 +641,16 @@ func redisReady(ctx context.Context, addr string) error {
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
 	defer rdb.Close()
 	return rdb.Ping(ctx).Err()
+}
+
+// workerID names this process's async worker instance: host, pid, and start
+// time make it unique across restarts, which is what lease ownership keys on.
+func workerID() string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+	return fmt.Sprintf("worker-%s-%d-%d", host, os.Getpid(), time.Now().UnixNano())
 }
 
 // pgAudit adapts the store writer to the audit.Sink signature.

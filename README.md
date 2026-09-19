@@ -63,6 +63,16 @@ go run ./cmd/gateway
 | `GATEWAY_RATE_PER_MINUTE` | `120` | Per-subject request rate (fixed window) |
 | `GATEWAY_RESPONSES_ENABLED` | `true` | Set `false` to disable `/v1/responses` (rollback switch) |
 | `GATEWAY_EMBEDDINGS_ENABLED` | `true` | Set `false` to disable `/v1/embeddings` (rollback switch) |
+| `GATEWAY_ASYNC_ENABLED` | `false` | Set `true` to accept `background: true` Responses jobs (V1.4; requires database mode) |
+| `GATEWAY_ASYNC_WORKERS` | `2` | Background-job worker goroutines (1..64) |
+| `GATEWAY_ASYNC_POLL_INTERVAL` | `1s` | Queue poll / recovery sweep cadence |
+| `GATEWAY_ASYNC_LEASE` | `60s` | Worker claim lease, heartbeat-extended |
+| `GATEWAY_ASYNC_JOB_TIMEOUT` | `10m` | Per-job upstream execution deadline (async requests only; the synchronous deadline is unchanged) |
+| `GATEWAY_ASYNC_MAX_ATTEMPTS` | `3` | Job executions before terminal failure |
+| `GATEWAY_ASYNC_RESULT_TTL` | `24h` | Terminal result retention; expired results answer 410 `response_expired` |
+| `GATEWAY_ASYNC_IDEMPOTENCY_TTL` | `24h` | `Idempotency-Key` mapping retention |
+| `GATEWAY_ASYNC_MAX_RESULT_BYTES` | `1048576` | Stored result size cap (>= 1024); larger responses fail as `result_too_large` |
+| `GATEWAY_ASYNC_DRAIN_TIMEOUT` | `10s` | Graceful-shutdown window for in-flight jobs to commit |
 | `GATEWAY_DEFAULT_MODELS` | – | Dev-only default models: `subject:chat-model[:embedding-model]` comma-separated. Production slots live in `access_policies`. |
 
 Request size limits: 1 MiB body, 64 messages, 32k characters per message
@@ -97,7 +107,14 @@ value.
 - `POST /v1/chat/completions` — OpenAI-compatible chat completions (streaming and non-streaming)
 - `POST /v1/responses` — Responses-compatible protocol (V1.2): text, tool
   calling, JSON mode / structured output, SSE events; disable with
-  `GATEWAY_RESPONSES_ENABLED=false` (independent rollback switch)
+  `GATEWAY_RESPONSES_ENABLED=false` (independent rollback switch). With
+  `background: true` (V1.4) the request persists as a durable job and
+  returns `202` with a status envelope (see "V1.4: background Responses
+  jobs" below)
+- `GET /v1/responses/{id}` — background-job status and stored result
+  (owner-scoped; V1.4, requires `GATEWAY_ASYNC_ENABLED=true`)
+- `POST /v1/responses/{id}/cancel` — idempotent cancellation of a queued or
+  running background job (V1.4)
 - `POST /v1/embeddings` — OpenAI-compatible embeddings proxy (V1.3): string
   or string-array input, `object: "list"` envelope, input-token-only usage;
   disable with `GATEWAY_EMBEDDINGS_ENABLED=false` (independent rollback
@@ -283,6 +300,8 @@ and unspecified addresses are rejected outside explicit local development).
 - `gateway_upstream_errors_total{model,provider,class}`
 - `gateway_tokens_total{model,kind}`
 - `gateway_rate_limit_total{model}`
+- `gateway_async_jobs_total{status}` (terminal background-job statuses)
+- `gateway_async_queue_depth` (currently queued background jobs)
 
 Plus the standard Go runtime and process collectors. `X-Trace-ID` is honored
 (or derived from the request ID) and echoed for log/trace/audit correlation.
@@ -490,6 +509,56 @@ configuration, additively and per-model gated like every protocol before it:
   settling exactly once to the reported input-token total; unknown usage
   keeps the conservative reservation.
 
+## V1.4: background Responses jobs
+
+Long-running Responses requests can execute durably. A request with the new
+optional field `"background": true` returns `202 Accepted` immediately with a
+status envelope (`id`, `object: "response"`, `status: "queued"`, `model`,
+`created`, `request_id`); the synchronous contract is unchanged for every
+request that omits the field. Background jobs are opt-in via
+`GATEWAY_ASYNC_ENABLED=true` and require database mode (PostgreSQL owns the
+job state machine); with the flag off, background requests answer the stable
+`503 job_queue_unavailable`, which is also the rollback posture.
+
+- **Lifecycle** — `queued`, `running`, `completed`, `failed`, `cancelled`,
+  `expired`. Workers claim jobs with `FOR UPDATE SKIP LOCKED` under a
+  heartbeat-extended lease; expired leases return jobs to the queue (bounded
+  by `GATEWAY_ASYNC_MAX_ATTEMPTS`), and recovery after a restart needs only
+  the database. Background requests pass the same authentication, admission,
+  rate limiting, and token-quota gates as synchronous ones — the queue is
+  never a bypass.
+- **Retries and backoff** — a requeue that expects another try (transient
+  re-admission failure such as a dropped route, rate-limit denial, retryable
+  upstream failure) consumes one attempt, delays the job's next claimability
+  by the poll interval (`async_jobs.visible_at`), and terminal-fails the job
+  with the stable class (`no_route_available`, `rate_limit_exceeded`, or the
+  upstream class) once `GATEWAY_ASYNC_MAX_ATTEMPTS` is reached — a failing
+  job can neither loop in a tight claim cycle nor head-of-line-block younger
+  queued work. Infrastructure outages (limiter, quota, or policy store
+  unreachable) requeue with the same backoff but never consume an attempt and
+  never terminal-fail: an outage is never disguised as a job outcome, and
+  jobs proceed when the infrastructure recovers. Shutdown aborts and lease
+  recovery re-queue immediately (no backoff, shutdown aborts cost no
+  attempt).
+- **Query** — `GET /v1/responses/{id}` is owner-scoped (any other caller,
+  including for existing jobs, gets the same `404 response_not_found`).
+  `queued`/`running` answers carry a `Retry-After` hint; `completed` and
+  `failed` return the stored public envelope (normalized gateway shape only,
+  never provider-private fields); expired results answer `410
+  response_expired` and never re-trigger execution. Queries never start work.
+- **Cancel** — `POST /v1/responses/{id}/cancel` is idempotent, returns the
+  final observable state, and propagates to the in-flight upstream call.
+  Cancel-versus-completion races are decided by one conditional database
+  update: exactly one terminal outcome and one audit record exist per job.
+- **Idempotency** — an `Idempotency-Key` header scopes to the calling
+  subject: the same key with the same request returns the original job; the
+  same key with a different request is `409 idempotency_conflict`. Only
+  hashes and request digests are stored. Background streaming is a stable
+  `400`.
+- **New error codes** — `idempotency_conflict` (409),
+  `response_not_found` (404), `response_expired` (410), `job_queue_unavailable`
+  (503). All existing synchronous error codes are unchanged.
+
 ## Design notes and known limitations
 
 - **Audit is metadata-only** (subject, model, provider, status, latency, token
@@ -510,6 +579,11 @@ configuration, additively and per-model gated like every protocol before it:
 - **Local limiter** is development-only and per-process; multi-instance
   deployments must use `GATEWAY_LIMITS_MODE=redis` (readiness gates this).
   The token-quota gate follows the same mode.
+- **Background jobs** store the normalized post-admission request and the
+  public response envelope only — never raw client bytes, credentials, or
+  provider-private fields. A crash between the upstream call and the terminal
+  commit re-executes the job (upstream effects are at-least-once); the local
+  terminal state and its accounting remain exactly-once.
 - The `Known` flag on usage is internal; token usage absent from an upstream
   response is not fabricated.
 

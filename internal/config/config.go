@@ -72,6 +72,23 @@ type Config struct {
 	ResponsesEnabled  bool
 	EmbeddingsEnabled bool
 
+	// V1.4 background Responses jobs. AsyncEnabled gates acceptance of
+	// background:true (default off: the documented gradual rollout); jobs
+	// additionally require database mode (PostgreSQL owns the state
+	// machine). The remaining knobs bound the worker pool, leases, retries,
+	// and result retention; all values are validated positive.
+	AsyncEnabled        bool
+	AsyncWorkers        int
+	AsyncPollInterval   time.Duration
+	AsyncLease          time.Duration
+	AsyncJobTimeout     time.Duration
+	AsyncMaxAttempts    int
+	AsyncResultTTL      time.Duration
+	AsyncMaxResultBytes int
+	AsyncIdempotencyTTL time.Duration
+	AsyncDrainTimeout   time.Duration
+	AsyncMaxKeyBytes    int
+
 	// DefaultModels carries the local-development default-model assignments
 	// (GATEWAY_DEFAULT_MODELS). In database mode the access_policies columns
 	// are authoritative and this list is ignored.
@@ -213,6 +230,61 @@ func FromEnv() (Config, error) {
 	// rollback switch. Per-model gates live in the catalog capability matrix
 	// (embeddings + embedding_dim).
 	c.EmbeddingsEnabled = os.Getenv("GATEWAY_EMBEDDINGS_ENABLED") != "false"
+
+	// V1.4 background Responses jobs: opt-in (gradual rollout by model and
+	// tenant), database-mode only. Every lifecycle knob has a bounded,
+	// validated default; a supplied value must be positive.
+	c.AsyncEnabled = os.Getenv("GATEWAY_ASYNC_ENABLED") == "true"
+	c.AsyncWorkers = 2
+	c.AsyncPollInterval = time.Second
+	c.AsyncLease = 60 * time.Second
+	c.AsyncJobTimeout = 10 * time.Minute
+	c.AsyncMaxAttempts = 3
+	c.AsyncResultTTL = 24 * time.Hour
+	c.AsyncMaxResultBytes = 1 << 20
+	c.AsyncIdempotencyTTL = 24 * time.Hour
+	c.AsyncDrainTimeout = 10 * time.Second
+	c.AsyncMaxKeyBytes = 256
+	if v := os.Getenv("GATEWAY_ASYNC_WORKERS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > 64 {
+			return c, fmt.Errorf("GATEWAY_ASYNC_WORKERS: want integer 1..64, got %q", v)
+		}
+		c.AsyncWorkers = n
+	}
+	for _, spec := range []struct {
+		name string
+		set  func(d time.Duration)
+	}{
+		{"GATEWAY_ASYNC_POLL_INTERVAL", func(d time.Duration) { c.AsyncPollInterval = d }},
+		{"GATEWAY_ASYNC_LEASE", func(d time.Duration) { c.AsyncLease = d }},
+		{"GATEWAY_ASYNC_JOB_TIMEOUT", func(d time.Duration) { c.AsyncJobTimeout = d }},
+		{"GATEWAY_ASYNC_RESULT_TTL", func(d time.Duration) { c.AsyncResultTTL = d }},
+		{"GATEWAY_ASYNC_IDEMPOTENCY_TTL", func(d time.Duration) { c.AsyncIdempotencyTTL = d }},
+		{"GATEWAY_ASYNC_DRAIN_TIMEOUT", func(d time.Duration) { c.AsyncDrainTimeout = d }},
+	} {
+		if v := os.Getenv(spec.name); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil || d <= 0 {
+				return c, fmt.Errorf("%s: want positive duration, got %q", spec.name, v)
+			}
+			spec.set(d)
+		}
+	}
+	if v := os.Getenv("GATEWAY_ASYNC_MAX_ATTEMPTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > 100 {
+			return c, fmt.Errorf("GATEWAY_ASYNC_MAX_ATTEMPTS: want integer 1..100, got %q", v)
+		}
+		c.AsyncMaxAttempts = n
+	}
+	if v := os.Getenv("GATEWAY_ASYNC_MAX_RESULT_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1024 {
+			return c, fmt.Errorf("GATEWAY_ASYNC_MAX_RESULT_BYTES: want integer >= 1024, got %q", v)
+		}
+		c.AsyncMaxResultBytes = n
+	}
 
 	// GATEWAY_DEFAULT_MODELS="subject:chat-model[:embedding-model],..."
 	// Development-mode default-model assignments; in database mode the

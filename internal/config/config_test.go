@@ -285,3 +285,92 @@ func TestFromEnvDatabaseModeSkipsDevLists(t *testing.T) {
 		t.Errorf("supplied lists must still parse, got keys=%d models=%d", len(cfg.Keys), len(cfg.Models))
 	}
 }
+
+// TestAsyncEnabledFlagAndValidation pins the V1.4 background-job rollout
+// contract: acceptance is opt-in (the flag defaults off), the lifecycle knobs
+// carry bounded defaults, and a malformed supplied value fails startup rather
+// than being silently ignored.
+func TestAsyncEnabledFlagAndValidation(t *testing.T) {
+	base := map[string]string{
+		"GATEWAY_API_KEYS": "key-1:tenant-a:sk-abc",
+		"GATEWAY_MODELS":   "gpt-a:fake:gpt-a",
+	}
+	// Default: off, with bounded defaults for every knob.
+	setEnv(t, base)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AsyncEnabled {
+		t.Error("async acceptance must default to disabled (gradual rollout)")
+	}
+	if cfg.AsyncWorkers != 2 || cfg.AsyncMaxAttempts != 3 || cfg.AsyncPollInterval <= 0 ||
+		cfg.AsyncLease <= 0 || cfg.AsyncJobTimeout <= 0 || cfg.AsyncResultTTL <= 0 ||
+		cfg.AsyncIdempotencyTTL <= 0 || cfg.AsyncDrainTimeout <= 0 || cfg.AsyncMaxResultBytes < 1024 {
+		t.Errorf("async defaults missing: %+v", cfg)
+	}
+	// Exact-on opt-in, mirroring the other rollout switches. Every variation
+	// merges the base vars: setEnv replaces the whole environment, and a bare
+	// flag override would otherwise fail startup on missing keys.
+	withBase := func(extra map[string]string) map[string]string {
+		merged := map[string]string{}
+		for k, v := range base {
+			merged[k] = v
+		}
+		for k, v := range extra {
+			merged[k] = v
+		}
+		return merged
+	}
+	setEnv(t, withBase(map[string]string{"GATEWAY_ASYNC_ENABLED": "true"}))
+	if cfg, err = FromEnv(); err != nil || !cfg.AsyncEnabled {
+		t.Errorf("GATEWAY_ASYNC_ENABLED=true: enabled=%v err=%v", cfg.AsyncEnabled, err)
+	}
+	setEnv(t, withBase(map[string]string{"GATEWAY_ASYNC_ENABLED": "TRUE"}))
+	if cfg, err = FromEnv(); err != nil || cfg.AsyncEnabled {
+		t.Errorf("only the exact string \"true\" enables: enabled=%v err=%v", cfg.AsyncEnabled, err)
+	}
+	// Well-formed overrides apply.
+	setEnv(t, withBase(map[string]string{
+		"GATEWAY_ASYNC_ENABLED":          "true",
+		"GATEWAY_ASYNC_WORKERS":          "4",
+		"GATEWAY_ASYNC_MAX_ATTEMPTS":     "5",
+		"GATEWAY_ASYNC_LEASE":            "30s",
+		"GATEWAY_ASYNC_RESULT_TTL":       "1h",
+		"GATEWAY_ASYNC_MAX_RESULT_BYTES": "4096",
+	}))
+	if cfg, err = FromEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AsyncWorkers != 4 || cfg.AsyncMaxAttempts != 5 || cfg.AsyncLease != 30*time.Second ||
+		cfg.AsyncResultTTL != time.Hour || cfg.AsyncMaxResultBytes != 4096 {
+		t.Errorf("async overrides not applied: %+v", cfg)
+	}
+	// Malformed values fail startup.
+	for name, kv := range map[string]map[string]string{
+		"zero workers":         {"GATEWAY_ASYNC_WORKERS": "0"},
+		"huge workers":         {"GATEWAY_ASYNC_WORKERS": "65"},
+		"malformed workers":    {"GATEWAY_ASYNC_WORKERS": "two"},
+		"zero attempts":        {"GATEWAY_ASYNC_MAX_ATTEMPTS": "0"},
+		"negative lease":       {"GATEWAY_ASYNC_LEASE": "-1s"},
+		"malformed lease":      {"GATEWAY_ASYNC_LEASE": "soon"},
+		"tiny result bytes":    {"GATEWAY_ASYNC_MAX_RESULT_BYTES": "16"},
+		"malformed poll":       {"GATEWAY_ASYNC_POLL_INTERVAL": "5"},
+		"malformed drain":      {"GATEWAY_ASYNC_DRAIN_TIMEOUT": "later"},
+		"malformed idem ttl":   {"GATEWAY_ASYNC_IDEMPOTENCY_TTL": "-24h"},
+		"malformed job t/o":    {"GATEWAY_ASYNC_JOB_TIMEOUT": "0s"},
+		"malformed result ttl": {"GATEWAY_ASYNC_RESULT_TTL": "in a bit"},
+	} {
+		merged := map[string]string{"GATEWAY_ASYNC_ENABLED": "true"}
+		for k, v := range base {
+			merged[k] = v
+		}
+		for k, v := range kv {
+			merged[k] = v
+		}
+		setEnv(t, merged)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+}
