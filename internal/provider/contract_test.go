@@ -121,6 +121,63 @@ func runContractSuite(t *testing.T, d dialect) {
 		}
 	})
 
+	t.Run(d.name+"/stream-stall-first-frame", func(t *testing.T) {
+		// Silence beyond the stall window before the first frame is a TTFT
+		// stall: timeout class, retry eligible pre-output.
+		p := withStallTimeout(d.newProvider(t, d.handler("stream_stall_first", nil)), 150*time.Millisecond)
+		err := p.Stream(context.Background(), sampleRequest(), func(model.Event) error { return nil })
+		if err == nil {
+			t.Fatal("silent first frame beyond the stall window must fail")
+		}
+		if ClassOf(err) != ClassTimeout {
+			t.Errorf("stall class = %v, want timeout (%v)", ClassOf(err), err)
+		}
+		if !RetryEligible(err) {
+			t.Error("stall must be retry eligible pre-output")
+		}
+	})
+
+	t.Run(d.name+"/stream-stall-mid-stream", func(t *testing.T) {
+		// A mid-stream stall fails with the frames already emitted preserved;
+		// no completed event may follow a stall.
+		p := withStallTimeout(d.newProvider(t, d.handler("stream_hang", nil)), 150*time.Millisecond)
+		var events []model.Event
+		err := p.Stream(context.Background(), sampleRequest(), func(e model.Event) error {
+			events = append(events, e)
+			return nil
+		})
+		if err == nil {
+			t.Fatal("mid-stream stall must fail")
+		}
+		if ClassOf(err) != ClassTimeout {
+			t.Errorf("stall class = %v, want timeout (%v)", ClassOf(err), err)
+		}
+		if len(events) == 0 {
+			t.Error("frames emitted before the stall must be preserved")
+		}
+		for _, e := range events {
+			if e.Kind == model.EventCompleted {
+				t.Error("stalled stream must never emit completed")
+			}
+		}
+	})
+
+	t.Run(d.name+"/stream-stall-healthy-slow-cadence", func(t *testing.T) {
+		// Gaps inside the window must re-arm it per frame: the cumulative
+		// stream duration exceeds the window, so a cumulative watchdog would
+		// kill this healthy stream.
+		p := withStallTimeout(d.newProvider(t, d.handler("stream_stall_slow", nil)), 400*time.Millisecond)
+		var events []model.Event
+		err := p.Stream(context.Background(), sampleRequest(), func(e model.Event) error {
+			events = append(events, e)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("slow-but-healthy stream must complete: %v", err)
+		}
+		assertTextStreamShape(t, events, d.streamText)
+	})
+
 	t.Run(d.name+"/tool-call", func(t *testing.T) {
 		var body string
 		p := d.newProvider(t, d.handler("tool_call", &body))
@@ -615,6 +672,26 @@ func openAIHandler(scenario string, lastBody *string) http.HandlerFunc {
 			_, _ = fmt.Fprint(w, "data: "+`{"id":"c","choices":[{"delta":{"content":"he"}}]}`+"\n\n")
 			f.Flush()
 			time.Sleep(time.Second)
+		case "stream_stall_first":
+			// Silence beyond any stall window before the first byte.
+			time.Sleep(time.Second)
+		case "stream_stall_slow":
+			// Frames arrive slower than a small window would tolerate
+			// cumulatively but inside it per frame: only a per-frame
+			// watchdog lets this stream finish.
+			w.Header().Set("Content-Type", "text/event-stream")
+			f := w.(http.Flusher)
+			for _, c := range []string{
+				`{"id":"c","choices":[{"delta":{"content":"he"}}]}`,
+				`{"id":"c","choices":[{"delta":{"content":"y"}}]}`,
+				`{"id":"c","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			} {
+				time.Sleep(300 * time.Millisecond)
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", c)
+				f.Flush()
+			}
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			f.Flush()
 		default:
 			w.WriteHeader(http.StatusTeapot)
 		}
@@ -631,6 +708,18 @@ func sse(w http.ResponseWriter, chunks ...string) {
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	f.Flush()
+}
+
+// withStallTimeout enables the frame-gap stall detector on an adapter built
+// by a dialect; the production wiring sets it from configuration.
+func withStallTimeout(p Provider, d time.Duration) Provider {
+	switch a := p.(type) {
+	case *OpenAI:
+		a.StallTimeout = d
+	case *Anthropic:
+		a.StallTimeout = d
+	}
+	return p
 }
 
 // --- Anthropic dialect ------------------------------------------------------
@@ -753,6 +842,30 @@ func anthropicHandler(scenario string, lastBody *string) http.HandlerFunc {
 				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"he"}}`,
 			)
 			time.Sleep(time.Second)
+		case "stream_stall_first":
+			// Silence beyond any stall window before the first byte.
+			time.Sleep(time.Second)
+		case "stream_stall_slow":
+			// Frames arrive slower than a small window would tolerate
+			// cumulatively but inside it per frame: only a per-frame
+			// watchdog lets this stream finish.
+			w.Header().Set("Content-Type", "text/event-stream")
+			f := w.(http.Flusher)
+			for _, e := range []string{
+				`{"type":"message_start","message":{"id":"msg_8","model":"up-model"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"he"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"y"}}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+				`{"type":"message_stop"}`,
+			} {
+				time.Sleep(150 * time.Millisecond)
+				var typed struct {
+					Type string `json:"type"`
+				}
+				_ = json.Unmarshal([]byte(e), &typed)
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", typed.Type, e)
+				f.Flush()
+			}
 		default:
 			w.WriteHeader(http.StatusTeapot)
 		}

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
@@ -21,6 +22,10 @@ type OpenAI struct {
 	BaseURL string
 	APIKey  string
 	Client  *http.Client
+	// StallTimeout bounds the silent gap between stream frames (first frame
+	// included) in Stream; 0 disables the check. Non-streaming calls are
+	// unaffected and rely on the request context.
+	StallTimeout time.Duration
 }
 
 // NewOpenAI builds the adapter with bounded transport timeouts.
@@ -367,7 +372,9 @@ type toolAccumulator struct {
 // order, per-tool done events, one text done, then completed. Usage is
 // surfaced only when the upstream reports it on the stream.
 func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
-	resp, err := o.do(ctx, req, true)
+	sd := newStallDetector(ctx, o.StallTimeout)
+	defer sd.stop()
+	resp, err := o.do(sd.ctx, req, true)
 	if err != nil {
 		return err
 	}
@@ -393,9 +400,10 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		if err := ctx.Err(); err != nil {
-			return &Error{Class: ClassTimeout, Msg: "request canceled or deadline exceeded"}
+		if err := sd.ctx.Err(); err != nil {
+			return sd.err()
 		}
+		sd.frame()
 		line := scanner.Bytes()
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
@@ -478,9 +486,10 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request, emit func(model.
 	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return &Error{Class: ClassNetwork, Msg: "upstream stream read failed"}
 	}
-	// Cancellation surfaces as a timeout-class failure, never as truncation.
-	if ctx.Err() != nil {
-		return &Error{Class: ClassTimeout, Msg: "request canceled or deadline exceeded"}
+	// Cancellation (client, deadline, or stall watchdog) surfaces as a
+	// timeout-class failure, never as truncation.
+	if sd.ctx.Err() != nil {
+		return sd.err()
 	}
 	// A clean EOF without the [DONE] terminator is a truncated stream, not a
 	// completion: fail instead of emitting done/completed events.

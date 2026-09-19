@@ -171,6 +171,12 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 
 	svc := gateway.New(catalog, providers, cfg.RequestTimeout, cfg.MaxRetries)
+	// V1.5 streaming timeout semantics (issue #9): the frame-gap stall
+	// window plus a dedicated total cap replace the non-streaming request
+	// deadline on the stream path, and the streaming retry budget is its
+	// own knob. Non-streaming calls keep RequestTimeout/MaxRetries.
+	svc.StreamTotalTimeout = cfg.StreamTotalTimeout
+	svc.StreamMaxRetries = cfg.StreamMaxRetries
 
 	// V1.4 background jobs execute on their own Service: the synchronous
 	// total deadline (cfg.RequestTimeout, unchanged since V1.3) must never cap
@@ -720,13 +726,17 @@ func newProviderFromRegistry(cfg config.Config, kind, name, baseURL string) (pro
 		if err != nil {
 			return nil, err
 		}
-		return provider.NewOpenAI(baseURL, key), nil
+		p := provider.NewOpenAI(baseURL, key)
+		p.StallTimeout = cfg.StreamStallTimeout
+		return p, nil
 	case "anthropic":
 		key, err := resolveCredential(kind, name, cfg.AnthropicKey)
 		if err != nil {
 			return nil, err
 		}
-		return provider.NewAnthropic(baseURL, key), nil
+		p := provider.NewAnthropic(baseURL, key)
+		p.StallTimeout = cfg.StreamStallTimeout
+		return p, nil
 	case "fake":
 		return provider.Fake{}, nil
 	default:

@@ -59,7 +59,10 @@ go run ./cmd/gateway
 | `<KIND>_API_KEY__<PROVIDER_NAME>` | – | Optional per-provider credential override; see "Per-provider credentials" below |
 | `GATEWAY_API_KEYS` | – | Dev-only: `id:subject:plaintext-key` comma-separated. Production keys live in PostgreSQL (`api_keys` table, salted hashes). |
 | `GATEWAY_MODELS` | – | Dev-only: `public-name:provider:upstream-model` comma-separated. Production catalog lives in PostgreSQL. |
-| `GATEWAY_MAX_RETRIES` | `2` | Finite retries for pre-output network/429/5xx/timeout failures |
+| `GATEWAY_MAX_RETRIES` | `2` | Finite retries for pre-output network/429/5xx/timeout failures (non-streaming requests) |
+| `GATEWAY_STREAM_STALL_TIMEOUT` | `30s` | Max silent gap between stream frames (first frame included); a stall is a timeout-class failure retried like any other pre-output failure. Set `0` to disable (rollback switch) |
+| `GATEWAY_STREAM_TOTAL_TIMEOUT` | `10m` | Coarse safety cap for one streaming request; healthy streams are never bound by the non-streaming request deadline. Set `0` to disable |
+| `GATEWAY_STREAM_MAX_RETRIES` | `10` | Finite retries on the primary route for pre-output streaming failures (stall/timeout/network/429/5xx); after output begins a stream is never retried |
 | `GATEWAY_RATE_PER_MINUTE` | `120` | Per-subject request rate (fixed window) |
 | `GATEWAY_RESPONSES_ENABLED` | `true` | Set `false` to disable `/v1/responses` (rollback switch) |
 | `GATEWAY_EMBEDDINGS_ENABLED` | `true` | Set `false` to disable `/v1/embeddings` (rollback switch) |
@@ -302,7 +305,12 @@ request that stops at the primary can never consume the backup's recovery
 probe. Retries remain finite and deadline-bounded with
 exponential backoff and jitter between attempts (cenkalti/backoff), only for
 pre-output network/429/5xx/timeout failures; streaming never switches
-providers once output has reached the client. Provider base URLs are validated
+providers once output has reached the client. Streaming requests are bounded
+by a frame-gap stall window (`GATEWAY_STREAM_STALL_TIMEOUT`) instead of the
+non-streaming request deadline: a silent upstream is noticed per frame, a
+healthy long-lived stream is only capped by the coarse streaming total
+(`GATEWAY_STREAM_TOTAL_TIMEOUT`), and pre-output stalls retry on the primary
+route up to `GATEWAY_STREAM_MAX_RETRIES`. Provider base URLs are validated
 at startup against SSRF rules (https only unless explicitly allowed; unsafe
 IP destinations such as loopback, private, link-local/metadata, multicast,
 and unspecified addresses are rejected outside explicit local development).

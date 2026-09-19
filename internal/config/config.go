@@ -47,6 +47,16 @@ type Config struct {
 	RatePerMinute   int
 	MaxConcurrent   int
 
+	// V1.5 streaming timeouts. StreamStallTimeout bounds the silent gap
+	// between stream frames (first frame included); 0 disables the check.
+	// StreamTotalTimeout is the coarse safety cap for one streaming request;
+	// 0 disables it. StreamMaxRetries bounds additional pre-output attempts
+	// on the primary route for Stream only — the non-streaming budget stays
+	// MaxRetries.
+	StreamStallTimeout time.Duration
+	StreamTotalTimeout time.Duration
+	StreamMaxRetries   int
+
 	Provider  string // "openai", "anthropic", or "fake"
 	OpenAIKey string
 	OpenAIURL string
@@ -144,7 +154,13 @@ func FromEnv() (Config, error) {
 		MaxRetries:      2,
 		RatePerMinute:   120,
 		MaxConcurrent:   8,
-		Provider:        env("GATEWAY_PROVIDER", "fake"),
+
+		// Streaming timeout defaults: stall detection on (30s), a generous
+		// stream total cap, and the issue-#9 retry budget of 10.
+		StreamStallTimeout: 30 * time.Second,
+		StreamTotalTimeout: 10 * time.Minute,
+		StreamMaxRetries:   10,
+		Provider:           env("GATEWAY_PROVIDER", "fake"),
 
 		// Provider secrets and endpoints are loaded before any validation
 		// runs, so the switch below always sees the credential of the kind
@@ -166,6 +182,32 @@ func FromEnv() (Config, error) {
 			return c, fmt.Errorf("GATEWAY_MAX_RETRIES: want integer 0..10, got %q", v)
 		}
 		c.MaxRetries = n
+	}
+
+	// Streaming timeout knobs: an explicit 0 is meaningful (it disables the
+	// stall check or the total cap), so these parse with a dedicated branch
+	// instead of the positive-only duration table.
+	for _, spec := range []struct {
+		name string
+		set  func(time.Duration)
+	}{
+		{"GATEWAY_STREAM_STALL_TIMEOUT", func(d time.Duration) { c.StreamStallTimeout = d }},
+		{"GATEWAY_STREAM_TOTAL_TIMEOUT", func(d time.Duration) { c.StreamTotalTimeout = d }},
+	} {
+		if v := os.Getenv(spec.name); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil || d < 0 {
+				return c, fmt.Errorf("%s: want non-negative duration, got %q", spec.name, v)
+			}
+			spec.set(d)
+		}
+	}
+	if v := os.Getenv("GATEWAY_STREAM_MAX_RETRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 10 {
+			return c, fmt.Errorf("GATEWAY_STREAM_MAX_RETRIES: want integer 0..10, got %q", v)
+		}
+		c.StreamMaxRetries = n
 	}
 	if v := os.Getenv("GATEWAY_RATE_PER_MINUTE"); v != "" {
 		n, err := strconv.Atoi(v)

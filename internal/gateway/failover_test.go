@@ -144,6 +144,69 @@ func TestStreamFailsOverBeforeOutput(t *testing.T) {
 	}
 }
 
+// stallErr mimics the provider adapters' frame-gap watchdog classification.
+var stallErr = &provider.Error{Class: provider.ClassTimeout, Msg: "upstream stalled: no frame within the stall window"}
+
+func TestStreamStallRetriesPrimaryUpToBudget(t *testing.T) {
+	primary := &scriptedProvider{name: "primary", errs: []error{stallErr, stallErr, stallErr}}
+	backup := &scriptedProvider{name: "backup"}
+	svc := failoverService(t, primary, backup)
+	svc.StreamMaxRetries = 3
+	if _, err := svc.Stream(context.Background(), planFor(t, svc), model.Request{}, func(model.Event) error { return nil }); err != nil {
+		t.Fatalf("want success once the stall clears, got %v", err)
+	}
+	if primary.calls != 4 {
+		t.Fatalf("primary attempts = %d, want 4 (1 + StreamMaxRetries)", primary.calls)
+	}
+	if backup.calls != 0 {
+		t.Fatal("stall retries must stay on the primary until the budget is spent")
+	}
+}
+
+func TestStreamStallExhaustsBudgetThenTerminates(t *testing.T) {
+	alwaysStall := func(p *scriptedProvider, _ func(model.Event) error) error {
+		p.calls++
+		return stallErr
+	}
+	primary := &scriptedProvider{name: "primary", stream: alwaysStall}
+	backup := &scriptedProvider{name: "backup", stream: alwaysStall}
+	svc := failoverService(t, primary, backup)
+	svc.StreamMaxRetries = 3
+	_, err := svc.Stream(context.Background(), planFor(t, svc), model.Request{}, func(model.Event) error { return nil })
+	if err == nil {
+		t.Fatal("want termination after the retry budget is spent")
+	}
+	if primary.calls != 4 {
+		t.Fatalf("primary attempts = %d, want 4 (1 + StreamMaxRetries)", primary.calls)
+	}
+	if backup.calls != 1 {
+		t.Fatalf("backup attempts = %d, want 1 (failover, no retry budget)", backup.calls)
+	}
+}
+
+func TestStreamNoStallRetryAfterOutput(t *testing.T) {
+	primary := &scriptedProvider{name: "primary", stream: func(p *scriptedProvider, emit func(model.Event) error) error {
+		p.calls++
+		if err := emit(model.Event{Kind: model.EventTextDelta, Delta: "1"}); err != nil {
+			return err
+		}
+		return stallErr
+	}}
+	backup := &scriptedProvider{name: "backup"}
+	svc := failoverService(t, primary, backup)
+	svc.StreamMaxRetries = 5
+	_, err := svc.Stream(context.Background(), planFor(t, svc), model.Request{}, func(model.Event) error { return nil })
+	if err == nil {
+		t.Fatal("want the post-output stall surfaced as-is")
+	}
+	if primary.calls != 1 {
+		t.Fatalf("primary attempts = %d, want 1: retrying after output would duplicate content", primary.calls)
+	}
+	if backup.calls != 0 {
+		t.Fatal("backup must not be attempted after output began")
+	}
+}
+
 func TestFailoverHonorsTotalDeadline(t *testing.T) {
 	block := func(ctx context.Context, _ model.Request) (model.Response, error) {
 		<-ctx.Done()

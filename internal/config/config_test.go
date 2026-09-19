@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,6 +15,7 @@ var configEnvVars = []string{
 	"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
 	"GATEWAY_API_KEYS", "GATEWAY_MODELS",
 	"GATEWAY_MAX_RETRIES", "GATEWAY_RATE_PER_MINUTE",
+	"GATEWAY_STREAM_STALL_TIMEOUT", "GATEWAY_STREAM_TOTAL_TIMEOUT", "GATEWAY_STREAM_MAX_RETRIES",
 	"GATEWAY_DATABASE_URL", "GATEWAY_LIMITS_MODE", "GATEWAY_REDIS_ADDR",
 	"GATEWAY_ADMIN_TOKEN", "GATEWAY_ADMIN_ADDR",
 	"GATEWAY_ALLOW_INSECURE_BASE_URLS", "GATEWAY_RESPONSES_ENABLED",
@@ -49,6 +51,15 @@ func TestFromEnvValid(t *testing.T) {
 	if cfg.RequestTimeout != 60*time.Second {
 		t.Errorf("default timeout = %v", cfg.RequestTimeout)
 	}
+	if cfg.StreamStallTimeout != 30*time.Second {
+		t.Errorf("default StreamStallTimeout = %v, want 30s", cfg.StreamStallTimeout)
+	}
+	if cfg.StreamTotalTimeout != 10*time.Minute {
+		t.Errorf("default StreamTotalTimeout = %v, want 10m", cfg.StreamTotalTimeout)
+	}
+	if cfg.StreamMaxRetries != 10 {
+		t.Errorf("default StreamMaxRetries = %d, want 10", cfg.StreamMaxRetries)
+	}
 	if cfg.MaxConcurrent != 8 {
 		t.Errorf("default MaxConcurrent = %d, want 8", cfg.MaxConcurrent)
 	}
@@ -75,6 +86,57 @@ func TestFromEnvValid(t *testing.T) {
 	}
 	if cfg.SettlementBacklogMax <= 0 {
 		t.Errorf("SettlementBacklogMax = %d, want positive", cfg.SettlementBacklogMax)
+	}
+}
+
+func TestFromEnvStreamTimeouts(t *testing.T) {
+	// An explicit 0 is meaningful for the two duration knobs: it disables
+	// the stall check or the stream total cap (documented rollback switch).
+	setEnv(t, map[string]string{
+		"GATEWAY_API_KEYS":             "key-1:tenant-a:sk-abc",
+		"GATEWAY_MODELS":               "gpt-a:fake:gpt-a",
+		"GATEWAY_PROVIDER":             "fake",
+		"GATEWAY_STREAM_STALL_TIMEOUT": "0s",
+		"GATEWAY_STREAM_TOTAL_TIMEOUT": "90s",
+		"GATEWAY_STREAM_MAX_RETRIES":   "4",
+	})
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StreamStallTimeout != 0 {
+		t.Errorf("StreamStallTimeout = %v, want 0 (detection disabled)", cfg.StreamStallTimeout)
+	}
+	if cfg.StreamTotalTimeout != 90*time.Second {
+		t.Errorf("StreamTotalTimeout = %v, want 90s", cfg.StreamTotalTimeout)
+	}
+	if cfg.StreamMaxRetries != 4 {
+		t.Errorf("StreamMaxRetries = %d, want 4", cfg.StreamMaxRetries)
+	}
+
+	for _, tt := range []struct {
+		name string
+		env  string
+		want string
+	}{
+		{"negative stall", "GATEWAY_STREAM_STALL_TIMEOUT=-1s", "GATEWAY_STREAM_STALL_TIMEOUT"},
+		{"garbage stall", "GATEWAY_STREAM_STALL_TIMEOUT=soon", "GATEWAY_STREAM_STALL_TIMEOUT"},
+		{"negative total", "GATEWAY_STREAM_TOTAL_TIMEOUT=-5m", "GATEWAY_STREAM_TOTAL_TIMEOUT"},
+		{"above range retries", "GATEWAY_STREAM_MAX_RETRIES=11", "GATEWAY_STREAM_MAX_RETRIES"},
+		{"negative retries", "GATEWAY_STREAM_MAX_RETRIES=-1", "GATEWAY_STREAM_MAX_RETRIES"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			name, value, _ := strings.Cut(tt.env, "=")
+			setEnv(t, map[string]string{
+				"GATEWAY_API_KEYS": "key-1:tenant-a:sk-abc",
+				"GATEWAY_MODELS":   "gpt-a:fake:gpt-a",
+				"GATEWAY_PROVIDER": "fake",
+				name:               value,
+			})
+			if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %v, want it to name %s", err, tt.want)
+			}
+		})
 	}
 }
 

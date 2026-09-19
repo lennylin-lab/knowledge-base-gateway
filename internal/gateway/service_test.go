@@ -76,6 +76,39 @@ func TestStreamEnforcesTotalDeadline(t *testing.T) {
 	}
 }
 
+func TestStreamEscapesRequestTimeout(t *testing.T) {
+	// A stream that keeps producing frames must not be bound by the
+	// non-streaming request deadline: the streaming total cap governs it.
+	svc := newTestService(200*time.Millisecond, 50*time.Millisecond)
+	svc.StreamTotalTimeout = 2 * time.Second
+	plan, rerr := svc.Resolve("s", "m")
+	if rerr != nil {
+		t.Fatalf("resolve: %v", rerr)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := svc.Stream(ctx, plan, model.Request{}, func(model.Event) error { return nil }); err != nil {
+		t.Fatalf("healthy stream bound by request deadline: %v", err)
+	}
+}
+
+func TestStreamTotalDeadlineStillBounded(t *testing.T) {
+	// The streaming total cap remains a real ceiling: a stream that never
+	// finishes is cut by StreamTotalTimeout even though the request
+	// deadline would have allowed it.
+	svc := newTestService(time.Second, time.Minute)
+	svc.StreamTotalTimeout = 50 * time.Millisecond
+	plan, rerr := svc.Resolve("s", "m")
+	if rerr != nil {
+		t.Fatalf("resolve: %v", rerr)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := svc.Stream(ctx, plan, model.Request{}, func(model.Event) error { return nil }); err == nil {
+		t.Fatal("expected stream total cap error")
+	}
+}
+
 func TestResolveUnknownModelNonLeaky(t *testing.T) {
 	svc := newTestService(time.Millisecond, time.Second)
 	if _, err := svc.Resolve("subject-a", "nope"); err != ErrUnknownModel {

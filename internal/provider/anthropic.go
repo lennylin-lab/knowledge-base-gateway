@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/knowledge-base/knowledge-base-gateway/internal/model"
 )
@@ -21,6 +22,10 @@ type Anthropic struct {
 	APIKey  string
 	Version string // anthropic-version header; empty uses a pinned default
 	Client  *http.Client
+	// StallTimeout bounds the silent gap between stream frames (first frame
+	// included) in Stream; 0 disables the check. Non-streaming calls are
+	// unaffected and rely on the request context.
+	StallTimeout time.Duration
 }
 
 // NewAnthropic builds the adapter; baseURL should include the API root
@@ -344,7 +349,9 @@ func finishFromStop(reason string) string {
 // deltas so the assembled JSON result is the output text, consistent with the
 // OpenAI/fake shapes.
 func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(model.Event) error) error {
-	resp, err := a.do(ctx, req, true)
+	sd := newStallDetector(ctx, a.StallTimeout)
+	defer sd.stop()
+	resp, err := a.do(sd.ctx, req, true)
 	if err != nil {
 		return err
 	}
@@ -387,9 +394,10 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	var event string
 	for scanner.Scan() {
-		if err := ctx.Err(); err != nil {
-			return &Error{Class: ClassTimeout, Msg: "request canceled or deadline exceeded"}
+		if err := sd.ctx.Err(); err != nil {
+			return sd.err()
 		}
+		sd.frame()
 		line := scanner.Bytes()
 		switch {
 		case bytes.HasPrefix(line, []byte("event:")):
@@ -541,6 +549,11 @@ func (a *Anthropic) Stream(ctx context.Context, req model.Request, emit func(mod
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return &Error{Class: ClassNetwork, Msg: "upstream stream read failed"}
+	}
+	// Cancellation (client, deadline, or stall watchdog) surfaces as a
+	// timeout-class failure, never as truncation.
+	if sd.ctx.Err() != nil {
+		return sd.err()
 	}
 	return &Error{Class: ClassNetwork, Msg: "upstream stream ended without message_stop"}
 }

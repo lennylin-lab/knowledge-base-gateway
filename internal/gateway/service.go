@@ -64,6 +64,15 @@ type Service struct {
 	MaxRetries int           // additional attempts on the primary candidate
 	RetryWait  time.Duration // initial retry delay; grows exponentially, zero disables waits
 
+	// StreamTotalTimeout is the coarse safety cap for one streaming request;
+	// 0 disables it. It is independent of Timeout so the non-streaming
+	// request deadline never bounds a stream that keeps producing frames.
+	// StreamMaxRetries bounds additional pre-output attempts on the primary
+	// candidate in Stream (stall/timeout/network/429/5xx classes); 0 keeps
+	// the historical one-attempt-per-candidate discipline.
+	StreamTotalTimeout time.Duration
+	StreamMaxRetries   int
+
 	providers map[string]provider.Provider // retained for capability lookups
 }
 
@@ -83,6 +92,10 @@ func New(catalog *policy.Catalog, providers map[string]provider.Provider, timeou
 	return &Service{
 		Catalog: catalog, Routes: routes, Timeout: timeout,
 		MaxRetries: maxRetries, RetryWait: 100 * time.Millisecond,
+		// Streaming mirrors the total deadline until the wiring overrides
+		// it; StreamMaxRetries stays 0 so callers that do not opt in keep
+		// one attempt per candidate.
+		StreamTotalTimeout: timeout, StreamMaxRetries: 0,
 		providers: providers,
 	}
 }
@@ -183,6 +196,17 @@ func (s *Service) withDeadline(ctx context.Context) (context.Context, context.Ca
 		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, s.Timeout)
+}
+
+// streamDeadline applies the streaming total cap on top of the caller's
+// context. It is deliberately separate from withDeadline: the non-streaming
+// request deadline must not bound a stream that keeps producing frames, and
+// the stream cap itself can be disabled entirely (StreamTotalTimeout = 0).
+func (s *Service) streamDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.StreamTotalTimeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, s.StreamTotalTimeout)
 }
 
 // attemptTimeout clamps a candidate's own timeout by the remaining total.
@@ -327,14 +351,18 @@ func (s *Service) Embeddings(ctx context.Context, plan Plan, req model.Embedding
 	return model.EmbeddingsResponse{}, plan.Primary(), lastErr
 }
 
-// Stream performs a streaming completion under the configured total deadline.
-// Each attempt admits its route's breaker permit immediately before the
-// provider call and records the outcome immediately after, so half-open
-// probes are never consumed by requests that stop at an earlier candidate.
-// Failover is permitted only while emit has never succeeded; once output
-// reached the client the error is returned as-is with no retry.
+// Stream performs a streaming completion under the streaming total cap
+// (StreamTotalTimeout; 0 disables it). Each attempt admits its route's
+// breaker permit immediately before the provider call and records the
+// outcome immediately after, so half-open probes are never consumed by
+// requests that stop at an earlier candidate. The primary candidate gets
+// 1 + StreamMaxRetries attempts for pre-output retry-eligible failures —
+// upstream stall, timeout, network, 429, 5xx; the remaining candidates get
+// one attempt each for failover. Failover is permitted only while emit has
+// never succeeded; once output reached the client the error is returned
+// as-is with no retry, so a client never sees duplicated content.
 func (s *Service) Stream(ctx context.Context, plan Plan, req model.Request, emit func(model.Event) error) (string, error) {
-	ctx, cancel := s.withDeadline(ctx)
+	ctx, cancel := s.streamDeadline(ctx)
 	defer cancel()
 	outputStarted := false
 	wrapped := func(e model.Event) error {
@@ -347,39 +375,45 @@ func (s *Service) Stream(ctx context.Context, plan Plan, req model.Request, emit
 	var lastErr error
 	bo := s.newBackoff()
 	attempts := 0
-	for _, cand := range plan.Candidates {
+	for i, cand := range plan.Candidates {
 		creq := req
 		creq.Model = cand.UpstreamModel
 		creq.Stream = true
-		if attempts > 0 {
-			if err := waitBackoff(ctx, bo); err != nil {
+		maxTries := 1
+		if i == 0 {
+			maxTries = 1 + s.StreamMaxRetries // bounded retries on the primary only
+		}
+		for try := 0; try < maxTries; try++ {
+			if attempts > 0 {
+				if err := waitBackoff(ctx, bo); err != nil {
+					return cand.ProviderName, err
+				}
+			}
+			// Admit immediately before the attempt; Record always follows the
+			// call below, so an acquired permit is never orphaned.
+			if !s.Routes.AdmitRoute(plan.PublicModel, cand.ProviderName) {
+				break // breaker refused: fail over to the next candidate
+			}
+			attempts++
+			actx, acancel := attemptTimeout(ctx, cand.Timeout)
+			actx, span := tracing.Start(actx, "provider.attempt",
+				tracing.String(tracing.AttrModel, plan.PublicModel),
+				tracing.String(tracing.AttrProvider, cand.ProviderName),
+				attribute.Int(tracing.AttrAttempt, attempts),
+				attribute.Bool("gw.stream", true),
+			)
+			err := cand.Provider.Stream(actx, creq, wrapped)
+			acancel()
+			providerSpanObserve(span, err)
+			span.End()
+			s.Routes.Record(plan.PublicModel, cand.ProviderName, err == nil)
+			if err == nil {
+				return cand.ProviderName, nil
+			}
+			lastErr = err
+			if outputStarted || ctx.Err() != nil || !provider.RetryEligible(err) {
 				return cand.ProviderName, err
 			}
-		}
-		// Admit immediately before the attempt; Record always follows the
-		// call below, so an acquired permit is never orphaned.
-		if !s.Routes.AdmitRoute(plan.PublicModel, cand.ProviderName) {
-			continue // breaker refused: fail over to the next candidate
-		}
-		attempts++
-		actx, acancel := attemptTimeout(ctx, cand.Timeout)
-		actx, span := tracing.Start(actx, "provider.attempt",
-			tracing.String(tracing.AttrModel, plan.PublicModel),
-			tracing.String(tracing.AttrProvider, cand.ProviderName),
-			attribute.Int(tracing.AttrAttempt, attempts),
-			attribute.Bool("gw.stream", true),
-		)
-		err := cand.Provider.Stream(actx, creq, wrapped)
-		acancel()
-		providerSpanObserve(span, err)
-		span.End()
-		s.Routes.Record(plan.PublicModel, cand.ProviderName, err == nil)
-		if err == nil {
-			return cand.ProviderName, nil
-		}
-		lastErr = err
-		if outputStarted || ctx.Err() != nil || !provider.RetryEligible(err) {
-			return cand.ProviderName, err
 		}
 	}
 	if lastErr == nil {
