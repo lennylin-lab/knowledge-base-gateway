@@ -76,6 +76,12 @@ go run ./cmd/gateway
 | `GATEWAY_ASYNC_IDEMPOTENCY_TTL` | `24h` | `Idempotency-Key` mapping retention |
 | `GATEWAY_ASYNC_MAX_RESULT_BYTES` | `1048576` | Stored result size cap (>= 1024); larger responses fail as `result_too_large` |
 | `GATEWAY_ASYNC_DRAIN_TIMEOUT` | `10s` | Graceful-shutdown window for in-flight jobs to commit |
+| `GATEWAY_OTLP_ENABLED` | `false` | Set `true` to install the OpenTelemetry SDK and export spans over OTLP/HTTP (V1.4; independent kill switch — serving, Prometheus, and workers are unaffected either way). See `docs/observability.md` |
+| `GATEWAY_OTLP_ENDPOINT` | `localhost:4318` | OTLP/HTTP collector endpoint (`host:port`) |
+| `GATEWAY_OTLP_INSECURE` | `false` | Set `true` for plain-HTTP export (dev/loopback collectors) |
+| `GATEWAY_OTLP_SAMPLING_RATIO` | `1.0` | Root-span trace sampling ratio 0..1 (spans parented by a sampled caller follow that decision) |
+| `GATEWAY_OTLP_TIMEOUT` | `10s` | Per-export timeout; export failures never block serving |
+| `GATEWAY_SETTLEMENT_BACKLOG_MAX` | `100` | `/readyz` threshold: reserved ledger rows older than 10 minutes above this flip readiness unhealthy |
 | `GATEWAY_DEFAULT_MODELS` | – | Dev-only default models: `subject:chat-model[:embedding-model]` comma-separated. Production slots live in `access_policies`. |
 
 Request size limits: 1 MiB body, 64 messages, 32k characters per message
