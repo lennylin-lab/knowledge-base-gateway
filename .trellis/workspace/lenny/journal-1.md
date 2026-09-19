@@ -306,3 +306,51 @@ Closed the three v1.3 rollout issues in one task. (1) issue #6: the gateway now 
 ### Status
 
 [OK] **Completed**
+
+
+## Session 12: V1.4 async operations roadmap: seven children delivered
+<!-- trellis-session: v=2 fp=c7d2420f2c770533 -->
+
+**Date**: 2026-09-19
+**Task**: V1.4 async operations roadmap: seven children delivered
+**Branch**: `master`
+
+### Summary
+
+Delivered the complete V1.4 async-operations roadmap through seven checked children under the parent task. (1) compat-migrations: V1.3 wire frozen behind extended golden fixtures; schema foundation 0006-0009 (async jobs/results/idempotency, pricing/ledger/budgets, admin credentials/scopes, lifecycle metadata) with constraint-encoded invariants proven by DB-level rejection tests, every down boundary walked, version-5 upgrade path proven; spec gained the migration-batch lifecycle convention. (2) async-responses: POST background jobs with a closed 6-state CAS machine, lease/heartbeat/recovery workers, subject-scoped idempotency hashing, exactly-once local state with documented at-least-once upstream effects, GATEWAY_ASYNC_ENABLED rollback posture; check-pass fixes pinned terminal audit correlation IDs, the poison-snapshot path, and requeue backoff/attempt exhaustion (migration 0011). (3) cost-governance: integer-micros pricing catalog, usage ledger with exactly-once settlement, monetary budgets enforced atomically across instances (same-pool decision), enforcement-off retaining ledger capture, and the child-2 handoff resolved — cancel-after-output settles known usage on the loser path. (4) admin-rbac: scoped admin identities (hashed credentials, plaintext once), a single route-to-scope matrix, subjects.tenant_id as sole tenant authority, legacy token as bootstrap platform-admin; check fixed a real tenant-boundary gap in key creation. (5) data-lifecycle: verify-before-delete archive sweeps, legal holds, tenant-scoped exports with management-log platform-scope, KeyTTL enforcement closing the child-2 debt, cmd/maintain; plus a pinned race regression in pg Create. (6) observability: OTLP with independent kill switch, trace context persisted through jobs, dependency readiness checks; check fixed an always-200 span status fabrication. (7) rollout-validation: real HTTP+PG+worker staged rehearsals found two production-only defects (jobs sweep never converged against the ledger FK; result-expiry sweep SQL rejected by PostgreSQL) — both fixed with bite-proven regressions; 16-step cancel-vs-commit matrix clean; release checklist in docs/release-v1.4.md. All gates green throughout: -race suites with real PostgreSQL/Redis zero skips, migration lifecycle to version 12, replay 12/12, golden fixtures byte-identical, container smoke passing.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `181c524` | test: freeze v1.3 wire behavior behind golden fixtures |
+| `f034816` | feat: add v1.4 schema foundation with constraint-encoded invariants |
+| `2b9cf06` | docs: record migration batch lifecycle conventions in backend specs |
+| `80e357a` | feat: add async responses job lifecycle with lease-based workers |
+| `c9bae23` | feat: gate async operations behind flags and config knobs |
+| `05ee89d` | feat: add async job payload and requeue backoff migrations |
+| `e2a1f6a` | docs: record async exactly-once state conventions in backend specs |
+| `78d91dc` | feat: add integer-micros accounting with pricing and budget gates |
+| `f209237` | feat: integrate money reservation and settle into all serving paths |
+| `8045fe3` | docs: document ledger settle-on-cancel exception and budget operations |
+| `fe07b4d` | feat: merge ledger cost into admin usage view |
+| `3409a9e` | feat: add scoped admin identities with hashed credential lifecycle |
+| `843eea3` | feat: enforce admin scope matrix and tenant boundaries across admin routes |
+| `94ccd43` | docs: add admin RBAC reference and update operations guide |
+| `c2f6903` | docs: capture admin RBAC matrix and tenant authority conventions in specs |
+| `c254df6` | feat: add retention sweeper with verify-before-delete archive lifecycle |
+| `3386778` | feat: enforce idempotency key TTL and expose lifecycle admin endpoints |
+| `b32f8be` | docs: add data lifecycle runbook and record sweep discipline in specs |
+| `3de9e9e` | feat: add opentelemetry tracing with independent kill switch |
+| `096ccef` | feat: propagate trace context through async jobs and serving spans |
+| `3ac0a40` | feat: add dependency readiness checks and async/cost telemetry |
+| `37b347c` | docs: add observability reference and record span status convention |
+| `21c85ff` | fix: make lifecycle sweeps converge against ledger-anchored jobs |
+| `4c6f152` | fix: correct async result-expiry sweep SQL for postgres |
+| `66a9424` | test: add staged rollout and rollback rehearsal over real services |
+| `6027535` | docs: add v1.4 release checklist |
+| `aec717a` | docs: record release rehearsal conventions in backend specs |
+
+### Status
+
+[OK] **Completed**

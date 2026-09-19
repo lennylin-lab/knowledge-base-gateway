@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 11
-- **Last Active**: 2026-09-17
+- **Total Sessions**: 12
+- **Last Active**: 2026-09-19
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~308 | Active |
+| `journal-1.md` | ~356 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 12 | 2026-09-19 | V1.4 async operations roadmap: seven children delivered | `181c524`, `f034816`, `2b9cf06`, `80e357a`, `c9bae23`, `05ee89d`, `e2a1f6a`, `78d91dc`, `f209237`, `8045fe3`, `fe07b4d`, `3409a9e`, `843eea3`, `94ccd43`, `c2f6903`, `c254df6`, `3386778`, `b32f8be`, `3de9e9e`, `096ccef`, `3ac0a40`, `37b347c`, `21c85ff`, `4c6f152`, `66a9424`, `6027535`, `aec717a` | `master` |
 | 11 | 2026-09-17 | Control plane follow-ups: dimensions, defaults, ceilings | `054454a`, `c6ade45`, `e2ad49d`, `4236be5`, `86a3bed`, `284f2ec`, `5adbed5` | `master` |
 | 10 | 2026-09-16 | Model control plane, integrations docs, and issue triage | `1137abc`, `03d8bd8`, `03d0fc6`, `4841408`, `16a37cd`, `7c48eae`, `33f0eb0` | `master` |
 | 9 | 2026-09-16 | Streaming pipeline completion and SDK/CI verification | `5c851a9`, `bef7faf`, `a120c2f`, `a2ee970`, `2bc8582`, `fa37a52`, `de4ba86`, `d97693d`, `736edbb`, `8a7ce37`, `03bfd4d` | `master` |
