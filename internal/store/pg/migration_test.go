@@ -79,7 +79,7 @@ func requireVersion(t *testing.T, m *migrate.Migrate, want uint, dirty bool) {
 // versioned migration tool (fresh up to the latest version, second up as a
 // no-op), exercises the key lifecycle, audit, and V1.2 management stores on
 // the real schema, then rolls every boundary back down to the empty database
-// (0009 through 0001) verifying each down script removes exactly its own
+// (0011 through 0001) verifying each down script removes exactly its own
 // artifacts, and re-applies the whole chain to confirm version tracking. It
 // requires a real PostgreSQL instance and is skipped when TEST_DATABASE_URL
 // is not set. The V1.4-specific upgrade path and schema constraints live in
@@ -94,7 +94,7 @@ func TestMigrationsAndStores(t *testing.T) {
 
 	// The migration tool owns schema changes: clean slate including its
 	// bookkeeping table, then drive it like cmd/migrate does. The list covers
-	// every table any migration (0001-0009) can create, dependents first.
+	// every table any migration (0001-0010) can create, dependents first.
 	mdb, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("migrate connect: %v", err)
@@ -103,14 +103,14 @@ func TestMigrationsAndStores(t *testing.T) {
 	_, _ = mdb.ExecContext(ctx, "DROP TABLE IF EXISTS schema_migrations")
 	_, _ = mdb.ExecContext(ctx, `DROP TABLE IF EXISTS data_exports, archive_runs, retention_policies,
 		admin_credentials, budget_policies, usage_ledger, pricing_catalog,
-		idempotency_keys, async_job_results, async_jobs,
+		async_job_requests, idempotency_keys, async_job_results, async_jobs,
 		llm_requests, access_policies, model_routes, model_catalog, api_keys, subjects, tenants, providers, admin_audit CASCADE`)
 
 	m := newTestMigrator(t, mdb)
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	requireVersion(t, m, 9, false)
+	requireVersion(t, m, 11, false)
 	if err := m.Up(); !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("second up must be a no-op, got %v", err)
 	}
@@ -534,6 +534,36 @@ func TestMigrationsAndStores(t *testing.T) {
 	// Roll back each V1.4 migration one boundary at a time and confirm every
 	// down script removes exactly its own artifacts.
 	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0011: %v", err)
+	}
+	requireVersion(t, m, 10, false)
+	var backoffArtifacts int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT (SELECT count(*) FROM information_schema.columns
+		        WHERE table_name = 'async_jobs' AND column_name = 'visible_at')
+		     + (SELECT count(*) FROM pg_indexes
+		        WHERE indexname = 'idx_async_jobs_claim_ready')`).Scan(&backoffArtifacts); err != nil {
+		t.Fatalf("0011 down check: %v", err)
+	}
+	if backoffArtifacts != 0 {
+		t.Fatal("0011 down migration left the backoff column or claim index behind")
+	}
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("roll back 0010: %v", err)
+	}
+	requireVersion(t, m, 9, false)
+	var requestTables int
+	if err := mdb.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_name IN ('async_job_requests')`).Scan(&requestTables); err != nil {
+		t.Fatalf("0010 down check: %v", err)
+	}
+	if requestTables != 0 {
+		t.Fatal("0010 down migration left async_job_requests behind")
+	}
+
+	if err := m.Steps(-1); err != nil {
 		t.Fatalf("roll back 0009: %v", err)
 	}
 	requireVersion(t, m, 8, false)
@@ -682,11 +712,11 @@ func TestMigrationsAndStores(t *testing.T) {
 	}
 
 	// Re-apply forward to prove version tracking recovers cleanly through the
-	// whole chain (0001-0009).
+	// whole chain (0001-0011).
 	if err := m.Up(); err != nil {
 		t.Fatalf("re-up: %v", err)
 	}
-	requireVersion(t, m, 9, false)
+	requireVersion(t, m, 11, false)
 }
 
 // TestVersion5UpgradePath proves the V1.4 rollout contract: an existing
@@ -710,7 +740,7 @@ func TestVersion5UpgradePath(t *testing.T) {
 	_, _ = mdb.ExecContext(ctx, "DROP TABLE IF EXISTS schema_migrations")
 	_, _ = mdb.ExecContext(ctx, `DROP TABLE IF EXISTS data_exports, archive_runs, retention_policies,
 		admin_credentials, budget_policies, usage_ledger, pricing_catalog,
-		idempotency_keys, async_job_results, async_jobs,
+		async_job_requests, idempotency_keys, async_job_results, async_jobs,
 		llm_requests, access_policies, model_routes, model_catalog, api_keys, subjects, tenants, providers, admin_audit CASCADE`)
 
 	m := newTestMigrator(t, mdb)
@@ -738,7 +768,7 @@ func TestVersion5UpgradePath(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("upgrade 5 -> head: %v", err)
 	}
-	requireVersion(t, m, 9, false)
+	requireVersion(t, m, 11, false)
 	var v13Artifacts int
 	if err := mdb.QueryRowContext(ctx, `
 		SELECT (SELECT count(*) FROM information_schema.columns
@@ -783,14 +813,14 @@ func TestV14SchemaConstraints(t *testing.T) {
 	_, _ = mdb.ExecContext(ctx, "DROP TABLE IF EXISTS schema_migrations")
 	_, _ = mdb.ExecContext(ctx, `DROP TABLE IF EXISTS data_exports, archive_runs, retention_policies,
 		admin_credentials, budget_policies, usage_ledger, pricing_catalog,
-		idempotency_keys, async_job_results, async_jobs,
+		async_job_requests, idempotency_keys, async_job_results, async_jobs,
 		llm_requests, access_policies, model_routes, model_catalog, api_keys, subjects, tenants, providers, admin_audit CASCADE`)
 
 	m := newTestMigrator(t, mdb)
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	requireVersion(t, m, 9, false)
+	requireVersion(t, m, 11, false)
 
 	// Fixture rows: a second tenant so cross-owner attempts have a target.
 	for _, stmt := range []string{
@@ -840,6 +870,16 @@ func TestV14SchemaConstraints(t *testing.T) {
 	rejected(t, "duplicate idempotency (subject, key hash)", `INSERT INTO idempotency_keys
 		(id, subject_id, key_hash, request_digest, job_id, expires_at)
 		VALUES ('idem_dup', 'subject_default', 'hash-a', 'digest-other', 'job_ok', now() + interval '1 day')`)
+
+	// 0010: every job at most one request snapshot, and it must carry a payload.
+	if _, err := mdb.ExecContext(ctx, `INSERT INTO async_job_requests (job_id, request)
+		VALUES ('job_ok', '{"public_model":"gateway-echo"}')`); err != nil {
+		t.Fatalf("job request fixture: %v", err)
+	}
+	rejected(t, "duplicate job request payload", `INSERT INTO async_job_requests (job_id, request)
+		VALUES ('job_ok', '{"public_model":"gateway-echo"}')`)
+	rejected(t, "job request without a payload", `INSERT INTO async_job_requests (job_id, request)
+		VALUES ('job_ok', NULL)`)
 
 	// --- 0007 cost governance --------------------------------------------------
 	rejected(t, "negative input price", `INSERT INTO pricing_catalog
