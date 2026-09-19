@@ -183,6 +183,32 @@ the same commit.
 change chunk fields; the fixtures turn that into a test failure. Note the
 correct stream chunk `object` is `chat.completion.chunk`.
 
+### Convention: Async job state is exactly-once, upstream effects at-least-once
+
+**What**: `internal/async` owns a closed 6-state job machine where every
+transition is a status/lease-keyed CAS (single conditional DB update decides
+each race). Exactly one racer (cancel / commit / recover / claim /
+heartbeat-loss) performs the one terminal audit + settlement; losers release
+their reservation and write nothing — pinned by iteration tests on both
+stores. Requeues: retry-expecting paths (transient re-admission, limiter
+denial, retryable upstream failure) consume an attempt and delay via
+`visible_at` backoff, terminal-failing with a stable class on exhaustion;
+infrastructure outages requeue with backoff but **never** consume an attempt
+or terminal-fail — an outage is never disguised as a job outcome.
+
+**Why**: Earlier revisions recycled jobs past `MaxAttempts` on timeouts,
+lost terminal commits in the drain window (commits rode the cancelled pool
+context), and duplicated audit correlation IDs from stale claim copies; the
+CAS discipline plus these pins close all three classes.
+
+**Boundary**: Upstream provider effects are at-least-once (a crash between
+the upstream call and the terminal commit re-executes the job — documented);
+local state and audit are exactly-once. Child-3 handoff: when cancel wins
+after output, the losing worker's observed usage is dropped at
+`Pool.handoff` — the cost-governance child must record usage on exactly that
+path or settle from the stored result. Idempotency `KeyTTL` enforcement is
+owned by the data-lifecycle child.
+
 ### Convention: Provider adapters share one offline contract suite
 
 **What**: `internal/provider/contract_test.go` runs the same scenario set
