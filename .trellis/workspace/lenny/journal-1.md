@@ -354,3 +354,37 @@ Delivered the complete V1.4 async-operations roadmap through seven checked child
 ### Status
 
 [OK] **Completed**
+
+
+## Session 13: 流式卡顿超时替代总时长超时（issue #9）
+<!-- trellis-session: v=2 fp=7b5a7411a25c2982 -->
+
+**Date**: 2026-09-20
+**Task**: 流式卡顿超时替代总时长超时（issue #9）
+**Branch**: `master`
+
+### Summary
+
+修复网关 LLM 流式超时语义：从一次响应总时长（60s）改为帧间卡顿检测，首帧前卡顿可重试满 10 次，健康长流不再被请求 deadline 误杀。
+
+### Main Changes
+
+- provider 层新增 stallDetector 帧间看门狗（专用 goroutine 持有计时器 + kick channel 逐帧 re-arm，避免 Timer.Reset 竞态），接入 openai/anthropic SSE 读取循环，窗口覆盖 TTFT，卡顿判 ClassTimeout；顺带修复 anthropic 无缓冲行时取消被误分类为网络截断。gateway 层 Stream 改用独立 StreamTotalTimeout（0=不限制）与 StreamMaxRetries（默认 10）首选路由 pre-output 重试预算；outputStarted 后绝不重试，客户端不会看到重复内容。config 新增 GATEWAY_STREAM_STALL_TIMEOUT（30s，0=关）/GATEWAY_STREAM_TOTAL_TIMEOUT（10m，0=不限）/GATEWAY_STREAM_MAX_RETRIES（10，0..10），显式 0 为回滚开关。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `90e5de8` | feat: replace stream total timeout with frame-gap stall detection |
+
+### Testing
+
+- [OK] go test ./... 24 包全绿；provider/gateway 加 -race 通过；gofmt/vet 干净。新增测试：合同三场景（首帧卡顿/出帧中卡顿/慢节奏健康流——累计超窗但逐帧在窗内）、gateway 四场景（逃逸请求 deadline/流式上限兜底/重试至成功/满预算终止/出帧后不重试）、config 默认值与非法值。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 如需发布：三 env 回滚开关可近似还原旧行为（STALL=0 TOTAL=60s RETRIES=2）。
