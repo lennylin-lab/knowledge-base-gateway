@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -285,9 +286,11 @@ func (d *DB) QueryAudit(ctx context.Context, f mgmt.AuditFilter) ([]audit.Event,
 // per model and protocol. P50/P95 are true PostgreSQL percentiles over the
 // filtered window. First-token percentiles are computed over the rows that
 // recorded one (streams); groups without any recorded value report null —
-// never a fabricated zero. cost_micros sums recorded estimates and stays null
-// when no row carries a known cost; pricing configuration does not exist yet,
-// so in practice it is staged null.
+// never a fabricated zero. The V1.4 cost fields come from the settlement
+// ledger: CostMicros sums known settled cost (null when none is known),
+// UnknownCostRequests counts settled rows whose cost stayed unknown (never
+// counted as zero), and PriceVersions names the distinct price versions
+// behind the known cost.
 func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, error) {
 	rows, err := d.Pool.Query(ctx, `
 		SELECT model, COALESCE(protocol,'chat') AS protocol,
@@ -326,7 +329,75 @@ func (d *DB) Usage(ctx context.Context, f mgmt.AuditFilter) ([]mgmt.UsageRow, er
 		}
 		out = append(out, s)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return d.mergeLedgerCost(ctx, f, out)
+}
+
+// mergeLedgerCost overlays the settlement-ledger cost aggregates onto the
+// usage rows (matched by model and protocol). Ledger rows for models with no
+// audit traffic in the window still appear, so costs stay explainable even
+// when the audit row is missing.
+func (d *DB) mergeLedgerCost(ctx context.Context, f mgmt.AuditFilter, rows []mgmt.UsageRow) ([]mgmt.UsageRow, error) {
+	costRows, err := d.Pool.Query(ctx, `
+		SELECT public_model, COALESCE(protocol,'chat') AS protocol,
+		       sum(cost_micros),
+		       count(*) FILTER (WHERE cost_micros IS NULL),
+		       array_agg(DISTINCT price_version) FILTER (WHERE price_version IS NOT NULL)
+		FROM usage_ledger
+		WHERE settle_status = 'settled'
+		  AND ($1 = '' OR subject_id = $1)
+		  AND ($2 = '' OR public_model = $2)
+		  AND ($3::timestamptz IS NULL OR settled_at >= $3)
+		  AND ($4::timestamptz IS NULL OR settled_at <= $4)
+		GROUP BY public_model, protocol`,
+		f.Subject, f.Model, nullTime(f.From), nullTime(f.To))
+	if err != nil {
+		return nil, err
+	}
+	defer costRows.Close()
+	type key struct{ model, protocol string }
+	ledger := map[key]*mgmt.UsageRow{}
+	for costRows.Next() {
+		var k key
+		var s mgmt.UsageRow
+		var versions []int
+		if err := costRows.Scan(&k.model, &k.protocol, &s.CostMicros,
+			&s.UnknownCostRequests, &versions); err != nil {
+			return nil, err
+		}
+		if len(versions) > 0 {
+			slices.Sort(versions)
+			s.PriceVersions = versions
+		}
+		ledger[k] = &s
+	}
+	if err := costRows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		l, ok := ledger[key{rows[i].Model, rows[i].Protocol}]
+		if !ok {
+			continue
+		}
+		if l.CostMicros != nil {
+			rows[i].CostMicros = l.CostMicros
+		}
+		rows[i].UnknownCostRequests = l.UnknownCostRequests
+		rows[i].PriceVersions = l.PriceVersions
+		delete(ledger, key{rows[i].Model, rows[i].Protocol})
+	}
+	// Ledger-only groups (cost evidence without audit rows in the window)
+	// append after the audit-derived rows.
+	for k, l := range ledger {
+		rows = append(rows, mgmt.UsageRow{
+			Model: k.model, Protocol: k.protocol,
+			CostMicros: l.CostMicros, UnknownCostRequests: l.UnknownCostRequests,
+			PriceVersions: l.PriceVersions,
+		})
+	}
+	return rows, nil
 }
 
 // writeOp inserts a management-operation record on an executor that is
