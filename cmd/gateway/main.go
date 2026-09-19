@@ -27,6 +27,7 @@ import (
 	"github.com/knowledge-base/knowledge-base-gateway/internal/envfile"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/gateway"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/httpapi"
+	"github.com/knowledge-base/knowledge-base-gateway/internal/lifecycle"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/limiter"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/metrics"
 	"github.com/knowledge-base/knowledge-base-gateway/internal/mgmt"
@@ -283,6 +284,26 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		auditSink = audit.NewMemorySink(logger)
 	}
 
+	// V1.4 data lifecycle: retention sweeps, archives, and exports behind the
+	// admin API. GATEWAY_LIFECYCLE_ENABLED=false is the documented rollback
+	// point (endpoints 404, maintenance command refuses to run). Retention is
+	// inert until retention_policies rows exist, and scheduled sweeps belong
+	// to cmd/maintain — the gateway only serves operator-triggered runs.
+	var lifecycleAdmin *lifecycle.Admin
+	if cfg.LifecycleEnabled && dbw != nil {
+		lcStore := &pgstore.LifecycleStore{DB: dbw}
+		admin, err := lifecycle.NewAdmin(lifecycle.AdminDeps{
+			Store: lcStore, Export: lcStore,
+			Sink:    lifecycle.NewFSArchiveSink(cfg.LifecycleArchiveDir),
+			Metrics: reg, Logger: logger, Now: time.Now,
+		})
+		if err != nil {
+			return fmt.Errorf("lifecycle wiring: %w", err)
+		}
+		lifecycleAdmin = admin
+		logger.Info("lifecycle admin enabled", "archive_dir", cfg.LifecycleArchiveDir)
+	}
+
 	// Management service: database mode uses the PostgreSQL queries (the DB
 	// satisfies mgmt.Service); development mode uses the in-memory service
 	// over the catalog, route table, and audit sink.
@@ -510,6 +531,7 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 				ApplyModelChange: applyModelChange, ProviderRuntime: providerRuntime,
 				ApplyPolicyChange: applyPolicyChange,
 				Accounting:        ledgerStore, // nil in development mode
+				Lifecycle:         lifecycleAdmin,
 			}),
 		}
 	}

@@ -174,6 +174,11 @@ type Store interface {
 	// ExpireDueResults transitions terminal jobs whose result TTL passed to
 	// expired and drops their results. Returns the number of jobs expired.
 	ExpireDueResults(ctx context.Context, now time.Time) (int, error)
+	// SweepExpiredIdempotencyKeys deletes idempotency mappings whose
+	// expires_at passed (KeyTTL reclamation). The Create replay path
+	// enforces the same TTL, so the sweep is bounded reclamation, never a
+	// correctness dependency. Returns the number of keys removed.
+	SweepExpiredIdempotencyKeys(ctx context.Context, now time.Time) (int, error)
 	// QueueDepth reports the number of queued jobs (operational metric).
 	QueueDepth(ctx context.Context) (int, error)
 	// Ready reports store health for /readyz.

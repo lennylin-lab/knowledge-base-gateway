@@ -66,6 +66,19 @@ func principalFromContext(ctx context.Context) (adminauth.Principal, bool) {
 //	  /admin/management-log       GET           viewer          global
 //	  /admin/prices               GET/POST      billing         global
 //	  /admin/budgets              GET/POST      billing         tenant-checkable
+//	  /admin/lifecycle/policies   GET           viewer          global
+//	  /admin/lifecycle/policies   POST          platform-admin  global
+//	  /admin/lifecycle/runs       GET           viewer          global
+//	  /admin/lifecycle/runs       POST          platform-admin  global
+//	  /admin/exports              GET/POST      viewer          tenant-predicated
+//
+// Lifecycle notes: retention policy configuration and sweep triggering are
+// platform infrastructure (platform-admin, global-only); policy views and
+// run history are platform operational metadata (viewer, global-only, like
+// the management log). Exports are reads of audit/usage data, so viewer
+// suffices (billing implies viewer, covering usage exports), with the
+// caller's tenant boundary applied as a mandatory predicate inside the
+// handler and service — and the management log never tenant-exportable.
 func adminRoutePolicy(method, path string) (scope adminauth.Scope, globalOnly bool) {
 	switch {
 	case path == "/admin/keys", strings.HasPrefix(path, "/admin/keys/"):
@@ -92,6 +105,16 @@ func adminRoutePolicy(method, path string) (scope adminauth.Scope, globalOnly bo
 		return adminauth.ScopeBilling, true
 	case path == "/admin/budgets":
 		return adminauth.ScopeBilling, false
+	case path == "/admin/lifecycle/policies" && method == http.MethodGet:
+		return adminauth.ScopeViewer, true
+	case path == "/admin/lifecycle/policies":
+		return adminauth.ScopePlatformAdmin, true
+	case path == "/admin/lifecycle/runs" && method == http.MethodGet:
+		return adminauth.ScopeViewer, true
+	case path == "/admin/lifecycle/runs":
+		return adminauth.ScopePlatformAdmin, true
+	case path == "/admin/exports":
+		return adminauth.ScopeViewer, false
 	default:
 		return adminauth.ScopePlatformAdmin, true
 	}

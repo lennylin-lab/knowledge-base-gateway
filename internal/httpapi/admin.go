@@ -56,6 +56,10 @@ type AdminDeps struct {
 	// mode). Nil disables /admin/prices and /admin/budgets and omits the
 	// budget-utilization section of /admin/usage.
 	Accounting AccountingAdmin
+	// Lifecycle is the retention/archive/export management surface (V1.4,
+	// database mode with the lifecycle flag on — the documented rollback
+	// point). Nil disables /admin/lifecycle/* and /admin/exports (404).
+	Lifecycle LifecycleAdmin
 }
 
 // Enabled reports whether the admin API accepts any authentication path.
@@ -133,6 +137,9 @@ func NewAdminMux(deps AdminDeps) *http.ServeMux {
 	}
 	if deps.Accounting != nil {
 		registerAccountingAdmin(mux, guard, deps)
+	}
+	if deps.Lifecycle != nil {
+		registerLifecycleAdmin(mux, guard, deps)
 	}
 	return mux
 }

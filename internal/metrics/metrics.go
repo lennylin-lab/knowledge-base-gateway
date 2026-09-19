@@ -31,6 +31,9 @@ type Registry struct {
 	queueDepth         prometheus.Gauge
 	budgetDenials      *prometheus.CounterVec
 	settlementFailures prometheus.Counter
+	lifecycleArchived  *prometheus.CounterVec
+	lifecycleDeleted   *prometheus.CounterVec
+	lifecycleExports   prometheus.Counter
 }
 
 // New creates a registry with the gateway collectors plus the standard Go
@@ -75,10 +78,23 @@ func New() *Registry {
 		Name: "gateway_ledger_settlement_failures_total",
 		Help: "Usage-ledger settlements that failed and remain retryable (reserved rows kept).",
 	})
+	r.lifecycleArchived = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_lifecycle_rows_archived_total",
+		Help: "Rows moved to the archive sink by retention sweeps, per table.",
+	}, []string{"table"})
+	r.lifecycleDeleted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_lifecycle_rows_deleted_total",
+		Help: "Rows deleted after a verified archive, per table.",
+	}, []string{"table"})
+	r.lifecycleExports = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_lifecycle_exports_total",
+		Help: "Completed data exports.",
+	})
 
 	reg.MustRegister(
 		r.requests, r.upstreamErrors, r.tokens, r.rateLimit, r.duration,
 		r.asyncJobs, r.queueDepth, r.budgetDenials, r.settlementFailures,
+		r.lifecycleArchived, r.lifecycleDeleted, r.lifecycleExports,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -131,6 +147,23 @@ func (r *Registry) IncBudgetDenial(scope string) {
 // IncSettlementFailure increments gateway_ledger_settlement_failures_total.
 func (r *Registry) IncSettlementFailure() {
 	r.settlementFailures.Inc()
+}
+
+// IncLifecycleArchived adds n to gateway_lifecycle_rows_archived_total for
+// one governed table.
+func (r *Registry) IncLifecycleArchived(table string, n int64) {
+	r.lifecycleArchived.WithLabelValues(table).Add(float64(n))
+}
+
+// IncLifecycleDeleted adds n to gateway_lifecycle_rows_deleted_total for one
+// governed table.
+func (r *Registry) IncLifecycleDeleted(table string, n int64) {
+	r.lifecycleDeleted.WithLabelValues(table).Add(float64(n))
+}
+
+// IncLifecycleExport increments gateway_lifecycle_exports_total.
+func (r *Registry) IncLifecycleExport() {
+	r.lifecycleExports.Inc()
 }
 
 // Handler serves the Prometheus text exposition for this registry.

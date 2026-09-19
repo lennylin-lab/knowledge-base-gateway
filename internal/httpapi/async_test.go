@@ -253,6 +253,13 @@ func (s ctxFaithfulStore) ExpireDueResults(ctx context.Context, now time.Time) (
 	return s.inner.ExpireDueResults(ctx, now)
 }
 
+func (s ctxFaithfulStore) SweepExpiredIdempotencyKeys(ctx context.Context, now time.Time) (int, error) {
+	if err := s.check(ctx); err != nil {
+		return 0, err
+	}
+	return s.inner.SweepExpiredIdempotencyKeys(ctx, now)
+}
+
 func (s ctxFaithfulStore) QueueDepth(ctx context.Context) (int, error) {
 	if err := s.check(ctx); err != nil {
 		return 0, err

@@ -294,6 +294,16 @@ func (p *Pool) sweep() {
 		} else if n > 0 {
 			p.incExpired(n)
 		}
+		// KeyTTL reclamation: the idempotency mapping's expires_at is
+		// enforced at lookup time; the sweep only reclaims the rows so the
+		// mapping table cannot grow without bound.
+		if n, err := p.deps.Store.SweepExpiredIdempotencyKeys(p.ctx, p.deps.Now()); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				p.log().Error("async: idempotency key sweep failed", "error", err)
+			}
+		} else if n > 0 {
+			p.log().Info("async: swept expired idempotency keys", "count", n)
+		}
 		if depth, err := p.deps.Store.QueueDepth(p.ctx); err == nil {
 			p.setQueueDepth(depth)
 		}

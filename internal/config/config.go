@@ -95,6 +95,16 @@ type Config struct {
 	// enforcement is off; ledger capture is automatic in database mode).
 	BudgetsEnabled bool
 
+	// V1.4 data lifecycle. LifecycleEnabled gates every lifecycle operation
+	// (the documented rollback point: "false" disables the admin lifecycle
+	// surface and the maintenance command refuses to run). LifecycleArchiveDir
+	// is the filesystem archive-sink root; production configuration must
+	// point it at a durable location. Retention only acts where a
+	// retention_policies row exists (absence = keep forever), so a default-on
+	// flag is inert until policies are configured.
+	LifecycleEnabled    bool
+	LifecycleArchiveDir string
+
 	// DefaultModels carries the local-development default-model assignments
 	// (GATEWAY_DEFAULT_MODELS). In database mode the access_policies columns
 	// are authoritative and this list is ignored.
@@ -296,6 +306,11 @@ func FromEnv() (Config, error) {
 	// capture in database mode is unconditional, so enforcement can be
 	// rolled back without losing cost evidence.
 	c.BudgetsEnabled = os.Getenv("GATEWAY_BUDGETS_ENABLED") == "true"
+
+	// V1.4 data lifecycle: retention sweeps, archives, and exports. Opt-out
+	// rollback switch; inert until retention_policies rows are configured.
+	c.LifecycleEnabled = os.Getenv("GATEWAY_LIFECYCLE_ENABLED") != "false"
+	c.LifecycleArchiveDir = env("GATEWAY_LIFECYCLE_ARCHIVE_DIR", "archives")
 
 	// GATEWAY_DEFAULT_MODELS="subject:chat-model[:embedding-model],..."
 	// Development-mode default-model assignments; in database mode the

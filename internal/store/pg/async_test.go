@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -194,6 +195,109 @@ func TestAsyncStoreCreateIdempotency(t *testing.T) {
 	}
 	if err := s.Heartbeat(ctx, cl.Job.ID, "w", time.Minute, now); err != nil {
 		t.Fatalf("heartbeat: %v", err)
+	}
+}
+
+// TestAsyncStoreCreateSameKeyRace pins the concurrent-creation discipline on
+// the (subject, key_hash) mapping: N barrier-started creators collide on one
+// fresh key, and every outcome must be a real result — a fresh job, a replay
+// of the one winner's job, or (unreachable with identical digests, kept for
+// the contract) a conflict. A zero outcome with nil error was a silent fake
+// success: the retry loop's err==nil shortcut returned the retryable result
+// of a lost mapping insert instead of re-reading the winner. Exactly one
+// fresh job row may land.
+func TestAsyncStoreCreateSameKeyRace(t *testing.T) {
+	s, db := newAsyncTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	const racers = 16
+	type raceResult struct {
+		racer int
+		jobID string
+		out   async.CreateOutcome
+		err   error
+	}
+	results := make(chan raceResult, racers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			jobID := fmt.Sprintf("job-race-%d", i)
+			out, err := s.Create(ctx, asyncCreateInputWithKey(jobID, "hash-race", now))
+			results <- raceResult{racer: i, jobID: jobID, out: out, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	fresh, replay, conflict := 0, 0, 0
+	for r := range results {
+		switch {
+		case errors.Is(r.err, async.ErrConflict):
+			conflict++ // same digest, so not expected — but a legal outcome
+		case r.err != nil:
+			t.Fatalf("racer %d: unexpected error %v", r.racer, r.err)
+		case r.out.Job.ID == "" && !r.out.Replay:
+			t.Fatalf("racer %d: zero outcome with nil error (silent fake success)", r.racer)
+		case r.out.Replay:
+			replay++
+			if r.out.Job.ID == "" {
+				t.Fatalf("racer %d: replay without a job id", r.racer)
+			}
+		default:
+			fresh++
+			if r.out.Job.ID != r.jobID {
+				t.Fatalf("racer %d: fresh job id = %q, want own %q", r.racer, r.out.Job.ID, r.jobID)
+			}
+		}
+	}
+	if fresh != 1 {
+		t.Fatalf("fresh jobs = %d (replays=%d conflicts=%d), want exactly one winner", fresh, replay, conflict)
+	}
+
+	// Exactly one job row and one mapping landed, and every replay points at
+	// the winner.
+	var jobs int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM async_jobs WHERE job_id LIKE 'job-race-%'`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Fatalf("job rows = %d, want 1 (duplicate creation must collapse)", jobs)
+	}
+	var mappedJob string
+	if err := db.QueryRowContext(ctx,
+		`SELECT job_id FROM idempotency_keys WHERE key_hash = 'hash-race'`).Scan(&mappedJob); err != nil {
+		t.Fatal(err)
+	}
+	var storedJobs []string
+	rows, err := db.QueryContext(ctx, `SELECT job_id FROM async_jobs WHERE job_id LIKE 'job-race-%'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		storedJobs = append(storedJobs, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(storedJobs) != 1 || storedJobs[0] != mappedJob {
+		t.Fatalf("mapping job %q does not match the single stored job %v", mappedJob, storedJobs)
+	}
+	// The mapping is the live one (KeyTTL 1h): a replay must still find it.
+	replayOut, err := s.Create(ctx, asyncCreateInputWithKey("job-race-after", "hash-race", now))
+	if err != nil || !replayOut.Replay || replayOut.Job.ID != mappedJob {
+		t.Fatalf("post-race replay = %+v err=%v (want %q)", replayOut, err, mappedJob)
 	}
 }
 

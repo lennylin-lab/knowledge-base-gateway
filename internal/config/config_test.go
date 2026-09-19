@@ -407,3 +407,37 @@ func TestBudgetsEnabledFlag(t *testing.T) {
 		t.Errorf("only the exact string \"true\" enables: enabled=%v err=%v", cfg.BudgetsEnabled, err)
 	}
 }
+
+// TestLifecycleFlags mirrors the rollback-switch convention for the V1.4
+// data lifecycle: default on but inert until retention_policies rows exist
+// (absence of a policy is a hold), with the exact string "false" as the
+// documented opt-out, and a non-empty archive-sink root always configured.
+func TestLifecycleFlags(t *testing.T) {
+	base := map[string]string{
+		"GATEWAY_API_KEYS": "key-1:tenant-a:sk-abc",
+		"GATEWAY_MODELS":   "gpt-a:fake:gpt-a",
+	}
+	setEnv(t, base)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LifecycleEnabled {
+		t.Error("lifecycle must default to enabled (inert without retention policies)")
+	}
+	if cfg.LifecycleArchiveDir == "" {
+		t.Error("archive sink root must have a non-empty default")
+	}
+	setEnv(t, map[string]string{
+		"GATEWAY_API_KEYS":              base["GATEWAY_API_KEYS"],
+		"GATEWAY_MODELS":                base["GATEWAY_MODELS"],
+		"GATEWAY_LIFECYCLE_ENABLED":     "false",
+		"GATEWAY_LIFECYCLE_ARCHIVE_DIR": "/var/lib/kbgw/archives",
+	})
+	if cfg, err = FromEnv(); err != nil || cfg.LifecycleEnabled {
+		t.Errorf("GATEWAY_LIFECYCLE_ENABLED=false must disable: enabled=%v err=%v", cfg.LifecycleEnabled, err)
+	}
+	if cfg.LifecycleArchiveDir != "/var/lib/kbgw/archives" {
+		t.Errorf("archive dir override = %q", cfg.LifecycleArchiveDir)
+	}
+}

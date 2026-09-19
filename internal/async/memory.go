@@ -20,8 +20,16 @@ type MemoryStore struct {
 	mu   sync.Mutex
 	now  func() time.Time
 	jobs map[string]*memJob
-	idem map[string]string // subject + "\x00" + key hash -> job ID
+	// idem maps subject + "\x00" + key hash to the key's mapping: the job it
+	// created and its expiry (the persisted KeyTTL contract).
+	idem map[string]memIdem
 	seq  int
+}
+
+// memIdem is one idempotency mapping with its expiry.
+type memIdem struct {
+	jobID     string
+	expiresAt time.Time
 }
 
 // memJob is one job plus its payload, terminal result, and retry backoff.
@@ -41,24 +49,33 @@ func NewMemoryStore(now func() time.Time) *MemoryStore {
 	if now == nil {
 		now = time.Now
 	}
-	return &MemoryStore{now: now, jobs: map[string]*memJob{}, idem: map[string]string{}}
+	return &MemoryStore{now: now, jobs: map[string]*memJob{}, idem: map[string]memIdem{}}
 }
 
 // Create implements Store. The whole decision runs under the mutex, so the
-// idempotency mapping is race-free by construction.
+// idempotency mapping is race-free by construction. A mapping past its
+// expires_at no longer replays (the KeyTTL contract): it is dropped and the
+// request creates a fresh job, exactly as the PostgreSQL store does.
 func (m *MemoryStore) Create(_ context.Context, in CreateInput) (CreateOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if in.KeyHash != "" {
-		if id, ok := m.idem[in.SubjectID+"\x00"+in.KeyHash]; ok {
-			existing, ok := m.jobs[id]
-			if !ok {
-				return CreateOutcome{}, fmt.Errorf("%w: idempotency mapping references missing job", ErrUnavailable)
+		mapKey := in.SubjectID + "\x00" + in.KeyHash
+		if entry, ok := m.idem[mapKey]; ok {
+			if in.Now.After(entry.expiresAt) {
+				// Expired key: the replay window closed; remove the mapping
+				// and fall through to fresh creation.
+				delete(m.idem, mapKey)
+			} else {
+				existing, ok := m.jobs[entry.jobID]
+				if !ok {
+					return CreateOutcome{}, fmt.Errorf("%w: idempotency mapping references missing job", ErrUnavailable)
+				}
+				if existing.job.RequestDigest != in.RequestDigest {
+					return CreateOutcome{}, ErrConflict
+				}
+				return CreateOutcome{Job: existing.job, Replay: true}, nil
 			}
-			if existing.job.RequestDigest != in.RequestDigest {
-				return CreateOutcome{}, ErrConflict
-			}
-			return CreateOutcome{Job: existing.job, Replay: true}, nil
 		}
 	}
 	if _, dup := m.jobs[in.JobID]; dup {
@@ -75,7 +92,7 @@ func (m *MemoryStore) Create(_ context.Context, in CreateInput) (CreateOutcome, 
 	rec := &memJob{job: j, request: in.Request} // fresh jobs are immediately claimable
 	m.jobs[in.JobID] = rec
 	if in.KeyHash != "" {
-		m.idem[in.SubjectID+"\x00"+in.KeyHash] = in.JobID
+		m.idem[in.SubjectID+"\x00"+in.KeyHash] = memIdem{jobID: in.JobID, expiresAt: in.Now.Add(in.KeyTTL)}
 	}
 	return CreateOutcome{Job: j}, nil
 }
@@ -311,6 +328,21 @@ func (m *MemoryStore) QueueDepth(_ context.Context) (int, error) {
 	n := 0
 	for _, rec := range m.jobs {
 		if rec.job.Status == StatusQueued {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// SweepExpiredIdempotencyKeys implements Store: removes mappings whose
+// expires_at passed.
+func (m *MemoryStore) SweepExpiredIdempotencyKeys(_ context.Context, now time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for k, entry := range m.idem {
+		if now.After(entry.expiresAt) {
+			delete(m.idem, k)
 			n++
 		}
 	}

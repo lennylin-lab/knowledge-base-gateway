@@ -81,7 +81,7 @@ func isUniqueViolation(err error) bool {
 func (s AsyncStore) Create(ctx context.Context, in async.CreateInput) (async.CreateOutcome, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		out, retryable, err := s.createOnce(ctx, in)
-		if err == nil {
+		if err == nil && !retryable {
 			return out, nil
 		}
 		if !retryable {
@@ -99,7 +99,7 @@ func (s AsyncStore) createOnce(ctx context.Context, in async.CreateInput) (out a
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after Commit
 
 	if in.KeyHash != "" {
-		job, found, err := lookupIdempotentJob(ctx, tx, in.SubjectID, in.KeyHash)
+		job, found, err := lookupIdempotentJob(ctx, tx, in.SubjectID, in.KeyHash, in.Now)
 		if err != nil {
 			return async.CreateOutcome{}, false, unavailable(err)
 		}
@@ -108,6 +108,19 @@ func (s AsyncStore) createOnce(ctx context.Context, in async.CreateInput) (out a
 				return async.CreateOutcome{}, false, async.ErrConflict
 			}
 			return async.CreateOutcome{Job: job, Replay: true}, false, nil
+		}
+		// An expired mapping is treated as absent: the KeyTTL replay window
+		// closed, so this request creates a fresh job.
+		if in.KeyHash != "" {
+			// Reclaim the expired mapping inside this transaction so the
+			// (subject, key_hash) unique index admits the fresh one. Racing
+			// creators serialize on the delete: the loser's insert hits the
+			// winner's new mapping and the retry replays it.
+			if _, err := tx.Exec(ctx,
+				`DELETE FROM idempotency_keys WHERE subject_id = $1 AND key_hash = $2 AND expires_at <= $3`,
+				in.SubjectID, in.KeyHash, in.Now); err != nil {
+				return async.CreateOutcome{}, false, unavailable(err)
+			}
 		}
 	}
 
@@ -152,12 +165,15 @@ func (s AsyncStore) createOnce(ctx context.Context, in async.CreateInput) (out a
 	return async.CreateOutcome{Job: j}, false, nil
 }
 
-// lookupIdempotentJob resolves a (subject, key hash) mapping to its job.
-func lookupIdempotentJob(ctx context.Context, tx pgx.Tx, subject, keyHash string) (async.Job, bool, error) {
+// lookupIdempotentJob resolves a (subject, key hash) mapping to its job. The
+// expires_at predicate enforces the KeyTTL contract at the lookup boundary:
+// an expired key no longer replays, regardless of whether the reclamation
+// sweep has run yet.
+func lookupIdempotentJob(ctx context.Context, tx pgx.Tx, subject, keyHash string, now time.Time) (async.Job, bool, error) {
 	row := tx.QueryRow(ctx, `
 		SELECT `+jobColumnsQualified+` FROM async_jobs j
 		JOIN idempotency_keys k ON k.job_id = j.job_id
-		WHERE k.subject_id = $1 AND k.key_hash = $2`, subject, keyHash)
+		WHERE k.subject_id = $1 AND k.key_hash = $2 AND k.expires_at > $3`, subject, keyHash, now)
 	job, err := scanJob(row.Scan)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -635,6 +651,17 @@ func (s AsyncStore) QueueDepth(ctx context.Context) (int, error) {
 		return 0, unavailable(err)
 	}
 	return n, nil
+}
+
+// SweepExpiredIdempotencyKeys implements async.Store: removes idempotency
+// mappings past expires_at. Enforcement already happens on the lookup path
+// (the replay query filters on expires_at), so this is bounded reclamation.
+func (s AsyncStore) SweepExpiredIdempotencyKeys(ctx context.Context, now time.Time) (int, error) {
+	tag, err := s.DB.Pool.Exec(ctx, `DELETE FROM idempotency_keys WHERE expires_at < $1`, now)
+	if err != nil {
+		return 0, unavailable(err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // Ready implements async.Store (delegates to the pool ping).
