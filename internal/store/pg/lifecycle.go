@@ -185,6 +185,16 @@ func (s *LifecycleStore) SchemaVersion(ctx context.Context) (int, error) {
 // queued/running jobs are live work, never retention candidates.
 const terminalJobStatuses = `('completed','failed','cancelled','expired')`
 
+// jobsUnanchoredByLedger is the jobs-eligibility guard for the usage_ledger
+// foreign key: a job that still anchors a ledger row cannot be deleted (the
+// ledger row is the durable billing evidence and outlives the job whenever
+// the ledger TTL is longer), and the non-cascading FK would fail the whole
+// batch. Aligning count, select, and delete on this predicate makes the
+// sweep converge instead: ledger-anchored jobs are simply not eligible yet,
+// and the jobs sweep reclaims them in a later cycle once the ledger sweep
+// has aged their rows out.
+const jobsUnanchoredByLedger = `NOT EXISTS (SELECT 1 FROM usage_ledger l WHERE l.job_id = async_jobs.job_id)`
+
 // terminalLedgerStatuses is the ledger eligibility rule: reserved rows are
 // the settlement path's exactly-once input; only settled/released rows —
 // whose billing evidence the archive preserves — age out.
@@ -197,7 +207,7 @@ func (s *LifecycleStore) CountEligible(ctx context.Context, table lifecycle.Tabl
 	case lifecycle.TableRequests:
 		query = `SELECT count(*) FROM llm_requests WHERE created_at < $1`
 	case lifecycle.TableJobs:
-		query = `SELECT count(*) FROM async_jobs WHERE created_at < $1 AND status IN ` + terminalJobStatuses
+		query = `SELECT count(*) FROM async_jobs WHERE created_at < $1 AND status IN ` + terminalJobStatuses + ` AND ` + jobsUnanchoredByLedger
 	case lifecycle.TableResults:
 		query = `SELECT count(*) FROM async_job_results WHERE created_at < $1`
 	case lifecycle.TableLedger:
@@ -331,13 +341,16 @@ func (s *LifecycleStore) selectResults(ctx context.Context, cutoff time.Time, li
 // delete cascade below never removes an unarchived result; the request
 // snapshot (async_job_requests) holds the normalized request payload —
 // content that archives deliberately do not retain — and is removed by the
-// same cascade.
+// same cascade. Jobs that still anchor a usage_ledger row are not eligible
+// (see jobsUnanchoredByLedger): they stay in place until their billing
+// evidence ages out, so batches never fail on the ledger foreign key and
+// never re-archive rows they cannot delete.
 func (s *LifecycleStore) selectJobs(ctx context.Context, cutoff time.Time, limit int, b *lifecycle.Batch) error {
 	rows, err := s.DB.Pool.Query(ctx, `
 		SELECT job_id, subject_id, tenant_id, protocol, public_model, request_digest,
 		       status, attempt_count, COALESCE(final_request_id,''), created_at, updated_at
 		FROM async_jobs
-		WHERE created_at < $1 AND status IN `+terminalJobStatuses+`
+		WHERE created_at < $1 AND status IN `+terminalJobStatuses+` AND `+jobsUnanchoredByLedger+`
 		ORDER BY created_at, job_id
 		LIMIT $2`, cutoff, limit)
 	if err != nil {
@@ -475,7 +488,7 @@ func (s *LifecycleStore) DeleteBatch(ctx context.Context, table lifecycle.TableN
 		tag, err = s.DB.Pool.Exec(ctx, `DELETE FROM async_job_results WHERE job_id = ANY($1)`, b.Keys)
 	case lifecycle.TableJobs:
 		tag, err = s.DB.Pool.Exec(ctx,
-			`DELETE FROM async_jobs WHERE job_id = ANY($1) AND status IN `+terminalJobStatuses, b.Keys)
+			`DELETE FROM async_jobs WHERE job_id = ANY($1) AND status IN `+terminalJobStatuses+` AND `+jobsUnanchoredByLedger, b.Keys)
 	case lifecycle.TableLedger:
 		ids, convErr := toInt64s(b.Keys)
 		if convErr != nil {

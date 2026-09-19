@@ -391,6 +391,111 @@ func readDirBytes(t *testing.T, dir string) string {
 	return b.String()
 }
 
+// TestLifecycleJobsSweepWaitsForLedgerEvidence pins the cross-feature sweep
+// eligibility fix: a terminal job that still anchors a usage_ledger row (the
+// non-cascading billing FK) is not a jobs-sweep candidate. Earlier revisions
+// selected and archived such jobs and then failed the whole run on the FK
+// violation at delete time, so the jobs retention could never converge
+// whenever the ledger TTL outlived the jobs TTL. The sweep must instead skip
+// ledger-anchored jobs (and not re-archive them every run) until the ledger
+// sweep has aged their billing evidence out; the anchored job is then
+// reclaimed by a later jobs run. Ledger rows are never destroyed by the
+// jobs sweep.
+func TestLifecycleJobsSweepWaitsForLedgerEvidence(t *testing.T) {
+	env := newLifecycleTestEnv(t)
+	ctx := context.Background()
+	old := 48 * time.Hour
+
+	// Two expired terminal jobs: one with live billing evidence, one without.
+	env.seedJob(t, "job_lc_anchored", env.subjectA, env.tenantA, "completed", old, false)
+	env.seedJob(t, "job_lc_free", env.subjectA, env.tenantA, "completed", old, false)
+	if _, err := env.store.DB.Pool.Exec(ctx, `
+		INSERT INTO usage_ledger (job_id, subject_id, tenant_id, protocol, public_model,
+		       settle_status, settled_at, cost_micros, currency, price_version, created_at)
+		VALUES ('job_lc_anchored', $1, $2, 'responses', 'gateway-echo',
+		       'settled', $3, 7, 'USD', 1, $3)`,
+		env.subjectA, env.tenantA, time.Now().Add(-old)); err != nil {
+		t.Fatalf("seed anchored ledger row: %v", err)
+	}
+
+	if err := env.store.UpsertRetentionPolicy(ctx, lifecycle.PolicyInput{
+		Table: lifecycle.TableJobs, TTL: 3600, ArchiveBeforeDelete: true, Enabled: true,
+	}, mgmt.AdminOp{Action: "lc_test_op"}); err != nil {
+		t.Fatalf("jobs policy: %v", err)
+	}
+	// The ledger policy outlives the jobs policy: the billing evidence stays.
+	if err := env.store.UpsertRetentionPolicy(ctx, lifecycle.PolicyInput{
+		Table: lifecycle.TableLedger, TTL: 96 * 3600, ArchiveBeforeDelete: true, Enabled: true,
+	}, mgmt.AdminOp{Action: "lc_test_op"}); err != nil {
+		t.Fatalf("ledger policy: %v", err)
+	}
+
+	archiveDir := t.TempDir()
+	sw, err := lifecycle.NewSweeper(lifecycle.SweeperDeps{
+		Store: env.store, Sink: lifecycle.NewFSArchiveSink(archiveDir), Now: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First cycle: the free job is archived and deleted; the anchored job is
+	// skipped whole (not archived, not deleted, run still completes).
+	res, err := sw.Run(ctx, lifecycle.Options{Only: lifecycle.TableJobs})
+	if err != nil {
+		t.Fatalf("first jobs sweep: %v", err)
+	}
+	if res[0].Status != "completed" || res[0].Archived != 1 || res[0].Deleted != 1 {
+		t.Fatalf("first jobs run = %+v, want exactly the unanchored job swept", res[0])
+	}
+	mustCount := func(query string, want int) {
+		t.Helper()
+		var n int
+		if err := env.store.DB.Pool.QueryRow(ctx, query).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Fatalf("query %q = %d, want %d", query, n, want)
+		}
+	}
+	mustCount(`SELECT count(*) FROM async_jobs WHERE job_id = 'job_lc_free'`, 0)
+	mustCount(`SELECT count(*) FROM async_jobs WHERE job_id = 'job_lc_anchored'`, 1)
+	mustCount(`SELECT count(*) FROM usage_ledger WHERE job_id = 'job_lc_anchored'`, 1)
+
+	// Dry-run eligibility agrees: only the anchored job remains, and it is
+	// not reported as sweepable while its ledger row lives.
+	dry, err := sw.Run(ctx, lifecycle.Options{DryRun: true, Only: lifecycle.TableJobs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry[0].Status != "dry-run" || dry[0].Eligible != 0 {
+		t.Fatalf("dry run = %+v, want 0 eligible (anchored job held by ledger)", dry[0])
+	}
+
+	// The ledger row ages out and the ledger sweep archives then deletes it.
+	if _, err := env.store.DB.Pool.Exec(ctx,
+		`UPDATE usage_ledger SET created_at = now() - interval '96 hours', settled_at = now() - interval '96 hours' WHERE job_id = 'job_lc_anchored'`); err != nil {
+		t.Fatal(err)
+	}
+	lres, err := sw.Run(ctx, lifecycle.Options{Only: lifecycle.TableLedger})
+	if err != nil {
+		t.Fatalf("ledger sweep: %v", err)
+	}
+	if lres[0].Status != "completed" || lres[0].Deleted != 1 {
+		t.Fatalf("ledger run = %+v", lres[0])
+	}
+
+	// Second jobs cycle: the anchored job is now reclaimable (archived and
+	// deleted) — the sweep converges without ever having failed a run.
+	res, err = sw.Run(ctx, lifecycle.Options{Only: lifecycle.TableJobs})
+	if err != nil {
+		t.Fatalf("second jobs sweep: %v", err)
+	}
+	if res[0].Status != "completed" || res[0].Archived != 1 || res[0].Deleted != 1 {
+		t.Fatalf("second jobs run = %+v, want the formerly anchored job swept", res[0])
+	}
+	mustCount(`SELECT count(*) FROM async_jobs WHERE job_id LIKE 'job_lc_%'`, 0)
+}
+
 func TestLifecycleStaleRunRecovery(t *testing.T) {
 	env := newLifecycleTestEnv(t)
 	ctx := context.Background()
