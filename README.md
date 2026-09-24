@@ -389,7 +389,28 @@ docker compose stop             # stop everything (keep the data volume)
 docker compose down             # remove containers + network
 docker compose down -v          # also remove the PostgreSQL data volume
 scripts/smoke.sh                # bounded end-to-end smoke (see below)
+scripts/bootstrap-openai.sh     # import OpenAI chat + embedding catalog (see below)
 ```
+
+### OpenAI catalog bootstrap
+
+After `docker compose up -d`, migrations seed only the fake provider and
+`gateway-echo`. To load real OpenAI-compatible chat and embedding models
+(`gpt-5.5`, `qwen3-embedding`, 1536-dim) into the local database:
+
+1. Set upstream credentials in `.env`:
+   `OPENAI_API_KEY__OPENAI_PRIMARY` and `OPENAI_API_KEY__OPENAI_EMBED`
+   (or a shared `OPENAI_API_KEY` fallback).
+2. Run:
+
+```bash
+./scripts/bootstrap-openai.sh
+```
+
+The script is idempotent (`ON CONFLICT` upserts), restarts the gateway to
+reload catalog state, sets `subject_default` default models via the admin
+API, mints a service key, and prints suggested client env lines. Override
+catalog defaults with `GATEWAY_OPENAI_*` variables (see script header).
 
 ### Smoke test
 
