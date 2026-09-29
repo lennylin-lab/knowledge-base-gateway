@@ -1,10 +1,6 @@
 # Gateway-owned container stack: PostgreSQL + Redis + one-shot migration +
 # gateway in database-backed Redis mode.
 #
-# Copy this file to docker-compose.yml before starting the stack:
-#
-#   cp docker-compose.yml.example docker-compose.yml
-#
 # Dependency order:
 #
 #   postgres healthy -\
@@ -89,8 +85,7 @@ services:
   #
   # The admin token follows the throwaway-password policy: a deterministic
   # default keeps the local stack self-contained (the smoke mints keys through
-  # it); production deployments set their own GATEWAY_ADMIN_TOKEN. The admin
-  # port is published to loopback only.
+  # it); production deployments set their own GATEWAY_ADMIN_TOKEN. The admin port is published to loopback only.
   gateway:
     <<: *app-image
     depends_on:
@@ -105,6 +100,12 @@ services:
       GATEWAY_LIMITS_MODE: redis
       GATEWAY_REDIS_ADDR: redis:6379
       GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:-smoke-admin-throwaway}
+      # Reasoning models legitimately pause between stream frames while
+      # thinking (gpt-5.5 pauses of 30-45s were observed mid-tool-call); the
+      # 30s default stall window truncates those runs, so dev widens it.
+      GATEWAY_STREAM_STALL_TIMEOUT: ${GATEWAY_STREAM_STALL_TIMEOUT:-2m}
+      OPENAI_API_KEY__OPENAI_PRIMARY: ${OPENAI_API_KEY__OPENAI_PRIMARY}
+      OPENAI_API_KEY__OPENAI_EMBED: ${OPENAI_API_KEY__OPENAI_EMBED}
     ports:
       - "127.0.0.1:${GATEWAY_HOST_PORT:-8091}:8080"
       - "127.0.0.1:${GATEWAY_ADMIN_HOST_PORT:-8092}:8081"

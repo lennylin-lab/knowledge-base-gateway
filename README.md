@@ -362,14 +362,7 @@ contract.
 all configuration is injected at run time by Compose or the deployment
 environment.
 
-`docker-compose.yml.example` is the safe template for the deployment-shaped
-stack. Copy it to the local, ignored `docker-compose.yml` before starting:
-
-```bash
-cp docker-compose.yml.example docker-compose.yml
-```
-
-The stack runs PostgreSQL and Redis with health checks, a one-shot migration
+`docker-compose.yml` defines the deployment-shaped local stack. The stack runs PostgreSQL and Redis with health checks, a one-shot migration
 job (`cmd/migrate up`, idempotent for a fully-applied schema), and the gateway
 in database-backed Redis mode
 (catalog/routes/policies/keys come from PostgreSQL; the dev-only
