@@ -359,3 +359,29 @@ re-run live before release.
 
 **Why**: Lets fault tests (`internal/gateway/failover_test.go`, `halfopen_probe_test.go`) pin the semantics and keeps vendor protocols isolated in `internal/provider`.
 
+### Convention: Zero-config dev injection is all-or-nothing
+
+**What**: `config.FromEnv` injects development defaults (`DevSubject`/`DevAPIKey`/`DevModel` = `dev`/`sk-dev-local`/`gpt-4o-mini`) only when `GATEWAY_DATABASE_URL` is unset AND `GATEWAY_PROVIDER=fake` AND both `GATEWAY_API_KEYS` and `GATEWAY_MODELS` are unset. Setting either list explicitly opts out entirely — the original "at least one key/model is required" errors fire, and no half is ever silently completed.
+
+**Why**: Completing a half-explicit config would inject a working credential the operator did not choose; failing loudly preserves "explicit configuration must be complete". Parse blocks already reject set-but-empty lists before the injection point, so `len==0` there means genuinely unset.
+
+**Boundary**: Never extend injection to `openai`/`anthropic` (credential enforcement stays) or database mode (the registry is authoritative). The startup summary (`Config.Summary()`) must show what injection produced (`mode=dev provider=fake keys=1 models=1`) — defaults should never need documentation spelunking to trust.
+
+### Scenario: adding a gateway environment knob
+
+1. **Scope / Trigger**: any new `GATEWAY_*` variable read by `internal/config`, i.e. env wiring across the `go run`, `docker compose`, and `.env` deployment paths.
+
+2. **Signatures**: read the var only in `config.FromEnv()` (`internal/config/config.go`) with `env(name, default)` or a validated parse branch; provider credentials may additionally resolve per-provider via `<KIND>_API_KEY__<NAME>` (see `cmd/gateway resolveCredential`).
+
+3. **Contracts**: the variable must appear in (a) the README configuration tables — required / mode switches / operational knobs layer, (b) `.env.example` as a commented line with its default, (c) `docker-compose.yml` `gateway.environment` as `NAME: ${NAME:-<code default>}` when operators are expected to flip it on the compose path. The compose `environment:` block is a whitelist — there is no `env_file`, so a var missing from it is silently dead inside the container even if set in `.env`.
+
+4. **Validation & Error Matrix**: malformed value → startup error naming the variable and the wanted shape (existing style: `GATEWAY_X: want ..., got %q`); unknown value → same; the variable must be added to the `configEnvVars` hermeticity list in `config_test.go` (every var `FromEnv` reads must be unset per test, or exported shell vars flake the suite).
+
+5. **Good/Base/Bad Cases**: Good — knob documented in all three places plus a validated parse branch and test. Base — knob with a safe default that needs no compose exposure (document why in the PRD/design). Bad — knob read via a bare `os.Getenv` outside `config`, or added to `.env.example` but not `docker-compose.yml` while being advertised for compose users (the OTLP dead-config incident, issue #13).
+
+6. **Tests Required**: parse/default boundary tests in `internal/config/config_test.go` asserting the exported constant or default; hermeticity list extended; if the knob feeds `Config.Summary()`, assert the full summary string — the summary is whitelist-only (modes, counts, addresses, on/off switches; never keys, DSNs, or URLs).
+
+7. **Wrong vs Correct**:
+   Wrong: add `GATEWAY_X` to `FromEnv` + `.env.example`, ship. Compose users set it in `.env`, nothing changes (variable never reaches the container), no test catches it.
+   Correct: same change + README row, `GATEWAY_X: ${GATEWAY_X:-<default>}` in `gateway.environment`, hermeticity list entry, and a boundary test; the startup summary line is how operators confirm the knob actually landed (`config effective`).
+
