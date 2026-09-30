@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Go code standards and forbidden patterns for the config-package change"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Structured slog conventions for the startup config-summary line"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Validation-error conventions for preserved GATEWAY_API_KEYS/GATEWAY_MODELS errors"}

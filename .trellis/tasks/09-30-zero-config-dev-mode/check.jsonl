@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Quality bar for reviewing the config and main.go changes"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Verify the summary log line follows structured-logging rules (no secrets)"}
