@@ -9,21 +9,23 @@ requirement document.
 ## Quick start (development, fake provider)
 
 ```bash
-cp .env.example .env
 go run ./cmd/gateway
 ```
 
-The gateway and migration commands load `.env` from the current directory when
-it exists. Existing process environment variables take precedence, so
-production deployments can continue to inject configuration directly without
-using a dotenv file. Keep real credentials in an ignored `.env`, never in
-`.env.example`.
+No configuration needed: with the default fake provider and zero environment
+variables, the gateway injects documented development defaults — see
+"Zero-config startup" under Configuration below. Copy `.env.example` to
+`.env` only when you want explicit settings: the gateway and migration
+commands load `.env` from the current directory when it exists. Existing
+process environment variables take precedence, so production deployments can
+continue to inject configuration directly without using a dotenv file. Keep
+real credentials in an ignored `.env`, never in `.env.example`.
 
 Call it:
 
 ```bash
 curl -s localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-dev-internal-key" \
+  -H "Authorization: Bearer sk-dev-local" \
   -H "X-Request-ID: req-demo-1" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}'
 ```
@@ -50,15 +52,84 @@ go run ./cmd/gateway
 
 ## Configuration
 
+Configuration is layered: nothing is required for local development with the
+fake provider, a handful of variables switch the run mode, and the rest are
+operational knobs with sane defaults that you override only when needed.
+
+### Zero-config startup
+
+`go run ./cmd/gateway` with zero environment variables boots the gateway in
+development mode. `GATEWAY_PROVIDER` defaults to `fake`, and when neither
+`GATEWAY_API_KEYS` nor `GATEWAY_MODELS` is set (and no
+`GATEWAY_DATABASE_URL` is configured), the gateway injects documented
+development defaults: subject `dev`, API key `sk-dev-local`, model
+`gpt-4o-mini` (fake):
+
+```bash
+go run ./cmd/gateway
+curl -s localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-dev-local" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Setting either `GATEWAY_API_KEYS` or `GATEWAY_MODELS` explicitly opts out of
+the injection: explicit configuration must then be complete (both lists), and
+a half-configured gateway fails startup with the original "at least one
+key/model is required" errors — explicit configuration is never silently
+completed with injected entries. Database mode (`GATEWAY_DATABASE_URL` set)
+and real providers (`openai` / `anthropic`, whose credential checks are
+unchanged) are never injected.
+
+At startup the gateway logs one structured line summarizing the effective
+configuration, e.g. `config effective ... summary="mode=dev provider=fake
+keys=1 models=1"` or `mode=database limits=redis responses=on
+embeddings=on async=off budgets=off lifecycle=on otlp=off admin=:8081`
+(`admin=off` while `GATEWAY_ADMIN_TOKEN` is unset). The summary is
+whitelist-only — mode names, counters, addresses, switches — and never
+contains secrets or the DSN.
+
+### Required (0–2 variables)
+
+Zero variables are required for fake-provider development (see "Zero-config
+startup" above). For a real provider in local mode you set its credential —
+that is the only required configuration the gateway has:
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `GATEWAY_ADDR` | `:8080` | Listen address |
-| `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set |
 | `OPENAI_API_KEY` | – | Provider secret; required when provider is `openai` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
 | `<KIND>_API_KEY__<PROVIDER_NAME>` | – | Optional per-provider credential override; see "Per-provider credentials" below |
-| `GATEWAY_API_KEYS` | – | Dev-only: `id:subject:plaintext-key` comma-separated. Production keys live in PostgreSQL (`api_keys` table, salted hashes). |
-| `GATEWAY_MODELS` | – | Dev-only: `public-name:provider:upstream-model` comma-separated. Production catalog lives in PostgreSQL. |
+
+`anthropic` credentials are symmetric (`ANTHROPIC_API_KEY` /
+`ANTHROPIC_BASE_URL`); see the production-mode table below.
+
+### Mode switches
+
+These variables select where configuration and state come from and where the
+process listens. The database-mode variables are also documented with full
+production context in "V1.1 production mode" below.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GATEWAY_ADDR` | `:8080` | Listen address |
+| `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set. Unset (fake) + no DSN + empty dev lists triggers the zero-config injection |
+| `GATEWAY_API_KEYS` | – | Dev-only: `id:subject:plaintext-key` comma-separated. Production keys live in PostgreSQL (`api_keys` table, salted hashes). Unset (fake, no DSN, `GATEWAY_MODELS` also unset) injects the dev default `sk-dev-local`; setting either list opts out of injection |
+| `GATEWAY_MODELS` | – | Dev-only: `public-name:provider:upstream-model` comma-separated. Production catalog lives in PostgreSQL. Unset (fake, no DSN, `GATEWAY_API_KEYS` also unset) injects the dev default `gpt-4o-mini`; setting either list opts out of injection |
+| `GATEWAY_DEFAULT_MODELS` | – | Dev-only default models: `subject:chat-model[:embedding-model]` comma-separated. Production slots live in `access_policies`. Optional even in dev: the injected `dev` subject defaults to the injected model |
+| `GATEWAY_DATABASE_URL` | – | PostgreSQL DSN; enables persistent keys/catalog/routes/policies/audit |
+| `GATEWAY_LIMITS_MODE` | `local` | `local` (dev-only, single instance) or `redis`; selects the backing store for rate/concurrency limits and token quotas |
+| `GATEWAY_REDIS_ADDR` | `127.0.0.1:6379` | Redis address for distributed limits |
+| `GATEWAY_ADMIN_TOKEN` | – | Legacy bootstrap bearer token for the admin API (platform-admin). In database mode the admin API also runs without it once scoped admin credentials exist; see `docs/admin-rbac.md` |
+| `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
+
+### Operational knobs
+
+Defaults are sane; override on demand. These are also the documented
+rollback/rollout switches — none of them are removed in normal operation.
+
+| Variable | Default | Meaning |
+|---|---|---|
 | `GATEWAY_MAX_RETRIES` | `2` | Finite retries for pre-output network/429/5xx/timeout failures (non-streaming requests) |
 | `GATEWAY_STREAM_STALL_TIMEOUT` | `30s` | Max silent gap between stream frames (first frame included); a stall is a timeout-class failure retried like any other pre-output failure. Set `0` to disable (rollback switch) |
 | `GATEWAY_STREAM_TOTAL_TIMEOUT` | `10m` | Coarse safety cap for one streaming request; healthy streams are never bound by the non-streaming request deadline. Set `0` to disable |
@@ -85,7 +156,6 @@ go run ./cmd/gateway
 | `GATEWAY_OTLP_SAMPLING_RATIO` | `1.0` | Root-span trace sampling ratio 0..1 (spans parented by a sampled caller follow that decision) |
 | `GATEWAY_OTLP_TIMEOUT` | `10s` | Per-export timeout; export failures never block serving |
 | `GATEWAY_SETTLEMENT_BACKLOG_MAX` | `100` | `/readyz` threshold: reserved ledger rows older than 10 minutes above this flip readiness unhealthy |
-| `GATEWAY_DEFAULT_MODELS` | – | Dev-only default models: `subject:chat-model[:embedding-model]` comma-separated. Production slots live in `access_policies`. |
 
 Request size limits: 1 MiB body, 64 messages, 32k characters per message
 (constants in `internal/config`).
