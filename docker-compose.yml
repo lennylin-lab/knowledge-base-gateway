@@ -104,6 +104,13 @@ services:
       # thinking (gpt-5.5 pauses of 30-45s were observed mid-tool-call); the
       # 30s default stall window truncates those runs, so dev widens it.
       GATEWAY_STREAM_STALL_TIMEOUT: ${GATEWAY_STREAM_STALL_TIMEOUT:-2m}
+      # OTLP trace export passthrough so .env values reach the container.
+      # NOTE: inside the container "localhost:4318" is the gateway itself —
+      # point GATEWAY_OTLP_ENDPOINT at the collector's in-network address
+      # (or host.docker.internal:4318 for a host-side collector).
+      GATEWAY_OTLP_ENABLED: ${GATEWAY_OTLP_ENABLED:-false}
+      GATEWAY_OTLP_ENDPOINT: ${GATEWAY_OTLP_ENDPOINT:-localhost:4318}
+      GATEWAY_OTLP_INSECURE: ${GATEWAY_OTLP_INSECURE:-false}
       OPENAI_API_KEY__OPENAI_PRIMARY: ${OPENAI_API_KEY__OPENAI_PRIMARY}
       OPENAI_API_KEY__OPENAI_EMBED: ${OPENAI_API_KEY__OPENAI_EMBED}
     ports:
