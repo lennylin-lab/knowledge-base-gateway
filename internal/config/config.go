@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+// Development-mode zero-config defaults: when the default fake provider is
+// active, no database is configured, and neither GATEWAY_API_KEYS nor
+// GATEWAY_MODELS is set, FromEnv injects this documented throwaway identity
+// so `go run ./cmd/gateway` boots with zero configuration. Fake provider
+// only — real provider credentials are never given a convenient default.
+const (
+	DevSubject = "dev"
+	DevAPIKey  = "sk-dev-local" // documented throwaway; fake provider only
+	DevModel   = "gpt-4o-mini"  // matches existing README/.env.example examples
+)
+
 // KeyEntry describes one configured API key for development mode.
 // Format: "<key-id>:<subject>:<plaintext-key>" (comma separated in GATEWAY_API_KEYS).
 type KeyEntry struct {
@@ -237,9 +248,6 @@ func FromEnv() (Config, error) {
 			return c, fmt.Errorf("GATEWAY_API_KEYS: at least one key is required")
 		}
 	}
-	if c.DatabaseURL == "" && len(c.Keys) == 0 {
-		return c, fmt.Errorf("GATEWAY_API_KEYS: at least one key is required")
-	}
 
 	// Models: GATEWAY_MODELS="<public>:<provider>:<upstream>[,<public>:...]"
 	if raw := os.Getenv("GATEWAY_MODELS"); raw != "" {
@@ -257,6 +265,22 @@ func FromEnv() (Config, error) {
 		if len(c.Models) == 0 {
 			return c, fmt.Errorf("GATEWAY_MODELS: at least one model is required")
 		}
+	}
+
+	// Zero-config dev convenience: with the default fake provider, no
+	// database, and neither dev list supplied, inject documented development
+	// defaults so `go run ./cmd/gateway` boots with zero configuration.
+	// Explicit partial configuration is deliberately NOT completed: setting
+	// either list opts out (the required-list validations below then report
+	// what is missing), so an explicit deployment can never silently gain an
+	// injected key or model. The parse blocks above already reject a set but
+	// effectively empty list, so len==0 here means "unset".
+	if c.DatabaseURL == "" && c.Provider == "fake" && len(c.Keys) == 0 && len(c.Models) == 0 {
+		c.Keys = []KeyEntry{{ID: DevSubject, Subject: DevSubject, PlaintextKey: DevAPIKey}}
+		c.Models = []ModelEntry{{PublicName: DevModel, Provider: "fake", UpstreamModel: DevModel, Enabled: true}}
+	}
+	if c.DatabaseURL == "" && len(c.Keys) == 0 {
+		return c, fmt.Errorf("GATEWAY_API_KEYS: at least one key is required")
 	}
 	if c.DatabaseURL == "" && len(c.Models) == 0 {
 		return c, fmt.Errorf("GATEWAY_MODELS: at least one model is required")
@@ -433,4 +457,33 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// Summary renders the effective configuration as one whitelist-only
+// key=value line for the startup log. Only mode names, counters, addresses,
+// and on/off switches appear: there is no code path through which a secret,
+// the DSN, or key material could enter the string.
+func (c Config) Summary() string {
+	if c.DatabaseURL != "" {
+		return fmt.Sprintf("mode=database limits=%s responses=%s embeddings=%s async=%s budgets=%s lifecycle=%s otlp=%s admin=%s",
+			c.LimitsMode, onOff(c.ResponsesEnabled), onOff(c.EmbeddingsEnabled), onOff(c.AsyncEnabled),
+			onOff(c.BudgetsEnabled), onOff(c.LifecycleEnabled), onOff(c.OTLPEnabled), c.adminSummary())
+	}
+	return fmt.Sprintf("mode=dev provider=%s keys=%d models=%d", c.Provider, len(c.Keys), len(c.Models))
+}
+
+// adminSummary reports the admin-API state: the listen address when the
+// legacy bootstrap token enables it, the literal "off" otherwise.
+func (c Config) adminSummary() string {
+	if c.AdminToken == "" {
+		return "off"
+	}
+	return c.AdminAddr
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }

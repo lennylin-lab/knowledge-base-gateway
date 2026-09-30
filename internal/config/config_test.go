@@ -20,6 +20,13 @@ var configEnvVars = []string{
 	"GATEWAY_ADMIN_TOKEN", "GATEWAY_ADMIN_ADDR",
 	"GATEWAY_ALLOW_INSECURE_BASE_URLS", "GATEWAY_RESPONSES_ENABLED",
 	"GATEWAY_EMBEDDINGS_ENABLED", "GATEWAY_DEFAULT_MODELS",
+	"GATEWAY_ASYNC_ENABLED", "GATEWAY_ASYNC_WORKERS", "GATEWAY_ASYNC_POLL_INTERVAL",
+	"GATEWAY_ASYNC_LEASE", "GATEWAY_ASYNC_JOB_TIMEOUT", "GATEWAY_ASYNC_MAX_ATTEMPTS",
+	"GATEWAY_ASYNC_RESULT_TTL", "GATEWAY_ASYNC_IDEMPOTENCY_TTL",
+	"GATEWAY_ASYNC_MAX_RESULT_BYTES", "GATEWAY_ASYNC_DRAIN_TIMEOUT",
+	"GATEWAY_BUDGETS_ENABLED", "GATEWAY_LIFECYCLE_ENABLED", "GATEWAY_LIFECYCLE_ARCHIVE_DIR",
+	"GATEWAY_OTLP_ENABLED", "GATEWAY_OTLP_ENDPOINT", "GATEWAY_OTLP_INSECURE",
+	"GATEWAY_OTLP_SAMPLING_RATIO", "GATEWAY_OTLP_TIMEOUT", "GATEWAY_SETTLEMENT_BACKLOG_MAX",
 }
 
 func setEnv(t *testing.T, kv map[string]string) {
@@ -519,5 +526,180 @@ func TestLifecycleFlags(t *testing.T) {
 	}
 	if cfg.LifecycleArchiveDir != "/var/lib/kbgw/archives" {
 		t.Errorf("archive dir override = %q", cfg.LifecycleArchiveDir)
+	}
+}
+
+// TestFromEnvZeroConfigInjection pins the issue-#13 zero-config contract:
+// with the default fake provider, no database, and neither dev list
+// supplied, FromEnv injects the documented development defaults so
+// `go run ./cmd/gateway` boots with zero configuration. Database mode and
+// non-fake providers never take the injection branch.
+func TestFromEnvZeroConfigInjection(t *testing.T) {
+	t.Run("zero environment injects dev defaults", func(t *testing.T) {
+		setEnv(t, nil) // fake provider is the default; nothing else set
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatalf("zero-config startup rejected: %v", err)
+		}
+		if len(cfg.Keys) != 1 {
+			t.Fatalf("keys = %+v, want exactly the injected dev key", cfg.Keys)
+		}
+		if k := cfg.Keys[0]; k.ID != DevSubject || k.Subject != DevSubject || k.PlaintextKey != DevAPIKey {
+			t.Errorf("injected key = %+v, want id/subject %q and key %q", k, DevSubject, DevAPIKey)
+		}
+		if len(cfg.Models) != 1 {
+			t.Fatalf("models = %+v, want exactly the injected dev model", cfg.Models)
+		}
+		if m := cfg.Models[0]; m.PublicName != DevModel || m.Provider != "fake" || m.UpstreamModel != DevModel || !m.Enabled {
+			t.Errorf("injected model = %+v, want fake %q", m, DevModel)
+		}
+	})
+
+	t.Run("database mode is never injected", func(t *testing.T) {
+		setEnv(t, map[string]string{"GATEWAY_DATABASE_URL": "postgres://db.example/gw"})
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatalf("database mode without dev lists rejected: %v", err)
+		}
+		if len(cfg.Keys) != 0 || len(cfg.Models) != 0 {
+			t.Errorf("database mode must not inject dev defaults: keys=%d models=%d", len(cfg.Keys), len(cfg.Models))
+		}
+	})
+
+	t.Run("non-fake provider is never injected", func(t *testing.T) {
+		setEnv(t, map[string]string{"GATEWAY_PROVIDER": "openai"})
+		cfg, err := FromEnv()
+		if err == nil || !strings.Contains(err.Error(), "GATEWAY_API_KEYS: at least one key is required") {
+			t.Fatalf("err = %v, want the at-least-one-key validation error", err)
+		}
+		if len(cfg.Keys) != 0 {
+			t.Errorf("no key may be injected for a non-fake provider: %+v", cfg.Keys)
+		}
+	})
+}
+
+// TestFromEnvPartialConfigOptsOutOfInjection pins the explicit-configuration
+// boundary: setting either dev list opts out of the zero-config injection,
+// so a half-configured gateway keeps failing with the original
+// "at least one key/model is required" errors instead of silently gaining
+// injected entries.
+func TestFromEnvPartialConfigOptsOutOfInjection(t *testing.T) {
+	for name, tt := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"only keys": {
+			env:  map[string]string{"GATEWAY_API_KEYS": "k1:dev:sk-x"},
+			want: "GATEWAY_MODELS: at least one model is required",
+		},
+		"only models": {
+			// A name distinct from DevModel so the no-injection check below
+			// can tell an explicit entry apart from an injected one.
+			env:  map[string]string{"GATEWAY_MODELS": "my-model:fake:my-model"},
+			want: "GATEWAY_API_KEYS: at least one key is required",
+		},
+		"keys set but effectively empty": {
+			env:  map[string]string{"GATEWAY_API_KEYS": " "},
+			want: "GATEWAY_API_KEYS: at least one key is required",
+		},
+		"models set but effectively empty": {
+			env:  map[string]string{"GATEWAY_MODELS": " "},
+			want: "GATEWAY_MODELS: at least one model is required",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setEnv(t, tt.env)
+			cfg, err := FromEnv()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %v, want %q", err, tt.want)
+			}
+			for _, k := range cfg.Keys {
+				if k.PlaintextKey == DevAPIKey {
+					t.Errorf("injected dev key present despite explicit configuration: %+v", k)
+				}
+			}
+			for _, m := range cfg.Models {
+				if m.PublicName == DevModel && m.Provider == "fake" && m.UpstreamModel == DevModel {
+					t.Errorf("injected dev model present despite explicit configuration: %+v", m)
+				}
+			}
+		})
+	}
+}
+
+// TestFromEnvProviderCredentialEnforcementUnchanged: real providers keep
+// their credential enforcement; the zero-config injection is fake-only.
+func TestFromEnvProviderCredentialEnforcementUnchanged(t *testing.T) {
+	setEnv(t, map[string]string{
+		"GATEWAY_API_KEYS": "k1:dev:sk-x",
+		"GATEWAY_MODELS":   "gpt-4o-mini:openai:gpt-4o-mini",
+		"GATEWAY_PROVIDER": "openai",
+	})
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "OPENAI_API_KEY must be set when GATEWAY_PROVIDER=openai") {
+		t.Fatalf("err = %v, want the openai credential error", err)
+	}
+}
+
+// TestSummary pins the startup summary line for both modes with exact
+// full-string expectations. The summary is whitelist-only: a DSN or token
+// value set in the environment must never appear in it.
+func TestSummary(t *testing.T) {
+	// Database mode with defaults: admin off without GATEWAY_ADMIN_TOKEN.
+	setEnv(t, map[string]string{"GATEWAY_DATABASE_URL": "postgres://db.example/gw"})
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "mode=database limits=local responses=on embeddings=on async=off budgets=off lifecycle=on otlp=off admin=off"
+	if got := cfg.Summary(); got != want {
+		t.Errorf("database summary = %q, want %q", got, want)
+	}
+
+	// Database mode with every switch flipped and the admin token set.
+	setEnv(t, map[string]string{
+		"GATEWAY_DATABASE_URL":       "postgres://secret-user:secret-pass@db.example/gw",
+		"GATEWAY_LIMITS_MODE":        "redis",
+		"GATEWAY_ADMIN_TOKEN":        "super-secret-admin-token",
+		"GATEWAY_ADMIN_ADDR":         ":9090",
+		"GATEWAY_RESPONSES_ENABLED":  "false",
+		"GATEWAY_EMBEDDINGS_ENABLED": "false",
+		"GATEWAY_ASYNC_ENABLED":      "true",
+		"GATEWAY_BUDGETS_ENABLED":    "true",
+		"GATEWAY_LIFECYCLE_ENABLED":  "false",
+		"GATEWAY_OTLP_ENABLED":       "true",
+	})
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "mode=database limits=redis responses=off embeddings=off async=on budgets=on lifecycle=off otlp=on admin=:9090"
+	if got := cfg.Summary(); got != want {
+		t.Errorf("database summary = %q, want %q", got, want)
+	}
+	if s := cfg.Summary(); strings.Contains(s, "secret") {
+		t.Errorf("summary must not contain DSN or token values: %q", s)
+	}
+
+	// Dev mode with the injected zero-config defaults.
+	setEnv(t, nil)
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Summary(), "mode=dev provider=fake keys=1 models=1"; got != want {
+		t.Errorf("dev summary = %q, want %q", got, want)
+	}
+
+	// Dev mode with explicit lists counts them.
+	setEnv(t, map[string]string{
+		"GATEWAY_API_KEYS": "k1:tenant-a:sk-x,k2:tenant-b:sk-y",
+		"GATEWAY_MODELS":   "gpt-a:fake:gpt-a",
+	})
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Summary(), "mode=dev provider=fake keys=2 models=1"; got != want {
+		t.Errorf("dev summary = %q, want %q", got, want)
 	}
 }

@@ -90,6 +90,11 @@ func main() {
 // HTTP listener starts, so an invalid provider registry can never reach a
 // state where /readyz could report ready.
 func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	// One-line effective-configuration summary so operators can verify what
+	// the process actually booted with. Whitelist-only by construction (see
+	// Config.Summary): never a secret, DSN, or key value.
+	logger.Info("config effective", "summary", cfg.Summary())
+
 	// Optional PostgreSQL persistence. When configured, catalog, routes,
 	// policies, keys, and audit records live in the database.
 	var (
