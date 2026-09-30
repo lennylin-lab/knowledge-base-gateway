@@ -388,3 +388,29 @@ Delivered the complete V1.4 async-operations roadmap through seven checked child
 ### Next Steps
 
 - 如需发布：三 env 回滚开关可近似还原旧行为（STALL=0 TOTAL=60s RETRIES=2）。
+
+
+## Session 14: 零配置启动与默认值可信度（issue #13）
+<!-- trellis-session: v=2 fp=a9dd7437ddb01500 -->
+
+**Date**: 2026-09-30
+**Task**: 零配置启动与默认值可信度（issue #13）
+**Branch**: `feature/zero-config-dev-mode`
+
+### Summary
+
+完成 issue #13：fake provider 零环境变量裸跑启动（注入 dev/sk-dev-local/gpt-4o-mini，半配置不注入）、启动时一行 config effective 摘要（白名单无密钥）、README 配置表三层分层、.env.example 分节补 compose 插值块、修复 compose OTLP 死配置透传（实测 otlp=on/off 双向）。trellis-check 全项 PASS。spec 沉淀：零配置注入 all-or-nothing 约定 + 新增 env 旋钮的七段式场景规范（README/.env.example/compose 白名单/测试 hermeticity 四路缺一不可）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `72d78b3` | feat(config): zero-config fake startup and effective-config summary |
+| `8806d41` | fix(compose): pass OTLP switches through gateway environment |
+| `ab53fd9` | docs(config): layer configuration table and env example, document zero-config |
+| `0e74a60` | docs(spec): record env-knob wiring and zero-config injection conventions |
+| `9e0bff7` | chore(task): add zero-config-dev-mode task artifacts |
+
+### Status
+
+[OK] **Completed**
