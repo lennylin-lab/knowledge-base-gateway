@@ -8,6 +8,8 @@
 
 This directory contains guidelines for backend development. Fill in each file with your project's specific conventions.
 
+Cross-repo architecture and change handoffs live in `../knowledge-base-docs/` (`architecture.md` and `subsystems/gateway/list.md`), while repo-local `docs/` holds gateway-only documentation (see `../guides/cross-workspace-docs-guide.md`).
+
 ---
 
 ## Guidelines Index

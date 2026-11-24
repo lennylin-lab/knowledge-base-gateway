@@ -23,10 +23,19 @@ These guides help you **ask the right questions before coding**.
 |-------|---------|-------------|
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| [Cross-Workspace Docs Guide](./cross-workspace-docs-guide.md) | Repo-local `docs/` vs `../knowledge-base-docs/` handoffs | Checking incoming adaptations or publishing cross-repo contract changes |
 
 ---
 
 ## Quick Reference: Thinking Triggers
+
+### When to Think About Cross-Workspace Docs
+
+- [ ] Starting cross-repo adaptation work → check `../knowledge-base-docs/subsystems/gateway/list.md`
+- [ ] Changing `/v1/*` or `/admin/*` contracts, error codes, model discovery fields, `GATEWAY_*` env vars, DB/Redis requirements, or container images
+- [ ] Deciding whether a new document belongs in repo-local `docs/` or `../knowledge-base-docs/`
+
+→ Read [Cross-Workspace Docs Guide](./cross-workspace-docs-guide.md)
 
 ### When to Think About Cross-Layer Issues
 

@@ -6,7 +6,7 @@ Run `gofmt` and `go test ./...`; add static analysis when the Go module is intro
 
 Do not add heavyweight frameworks without a documented need, expose provider SDK types through HTTP, accept client-supplied upstream URLs, store plaintext keys, or use unbounded retries/goroutines. Do not modify `../knowledge-base-server` for gateway-only work.
 
-Review auth-before-provider ordering, stable error envelopes, IDs, bounded resources, stream cancellation, migration coverage, and provider failure paths.
+Review auth-before-provider ordering, stable error envelopes, IDs, bounded resources, stream cancellation, migration coverage, provider failure paths, and cross-workspace docs sync per `.trellis/spec/guides/cross-workspace-docs-guide.md` (adapted items checked `- [x]` in `../knowledge-base-docs/subsystems/gateway/list.md`; outgoing contract changes published to affected target subsystems; repo-only docs kept in `docs/`).
 
 ### Convention: Mature infrastructure behind local interfaces
 
