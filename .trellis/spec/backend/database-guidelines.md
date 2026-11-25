@@ -8,6 +8,14 @@ Keep SQL under `internal/store`, expose domain-focused store interfaces, use par
 
 Every schema change requires a new forward migration and a real PostgreSQL-compatible migration test. Do not edit applied migrations or auto-create schema at process startup. Do not build SQL by concatenation, log secrets, or treat unavailable token usage as zero; it remains unknown.
 
+### Convention: Storage dependencies are external and handed off via cross-workspace docs
+
+**What**: `knowledge-base-gateway`'s deployment orchestration (`docker-compose.yml`) does not define or run PostgreSQL or Redis containers; both are provided externally (`knowledge-base-database` or `knowledge-base-deploy`) and injected via `GATEWAY_DATABASE_URL`, `GATEWAY_LIMITS_MODE`, and `GATEWAY_REDIS_ADDR`.
+
+**Why**: Storage provisioning, upgrades, security configuration, and persistence are owned centrally by `knowledge-base-database` and `knowledge-base-deploy` rather than duplicated per application repository.
+
+**Boundary**: Whenever a change in `knowledge-base-gateway` introduces or alters a storage dependency (PostgreSQL engine version, required extensions, database/role initialization, migration/entrypoint behavior, Redis engine version, authentication/URL format, persistence assumptions, or key prefix namespaces), write self-contained change notes to **both** `../knowledge-base-docs/subsystems/database/<YYYY-MM-DD>/<slug>.md` and `../knowledge-base-docs/subsystems/deploy/<YYYY-MM-DD>/<slug>.md`, and add unchecked `- [ ]` entries to both `list.md` files per `.trellis/spec/guides/cross-workspace-docs-guide.md`.
+
 ### Convention: Migrations are applied by cmd/migrate, never by the process
 
 **What**: Schema changes live in `migrations/` as golang-migrate files

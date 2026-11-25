@@ -54,23 +54,13 @@ lifecycle step; adding a new env-gated test requires adding its package to the
 integration step's package list. Provider secrets are masked (`add-mask` runs
 first) and never echoed; service credentials are job-local.
 
-### Convention: Container stack runs migrations one-shot, never the process
+### Convention: Container stack runs migrations one-shot against external storage, never the process
 
-**What**: `docker-compose.yml` runs the schema migration as a dedicated
-one-shot `migrate` service (`cmd/migrate up`, gated by
-`service_completed_successfully`) before the gateway starts; the gateway
-container never touches schema. Host ports bind to `127.0.0.1` only; the
-runtime image is non-root with a numeric `USER` and an empty `Env` (DSN and
-credentials are compose-run config only, never baked into layers).
+**What**: `docker-compose.yml` orchestrates only `migrate` and `gateway` — it does **not** provision PostgreSQL or Redis containers. Storage dependencies are external (provided by `knowledge-base-database` or `knowledge-base-deploy`) and injected via `GATEWAY_DATABASE_URL`, `GATEWAY_LIMITS_MODE`, and `GATEWAY_REDIS_ADDR`. The schema migration runs as a dedicated one-shot `migrate` service (`cmd/migrate up`, gated by `service_completed_successfully`) before the gateway starts; the gateway container never touches schema. Host ports bind to `127.0.0.1` only; the runtime image is non-root with a numeric `USER` and an empty `Env` (DSN and credentials are run-time config only, never baked into layers).
 
-**Why**: Startup schema mutation hides drift (see database guidelines); baked
-DSNs leak into image history; loopback binding keeps dev stacks off shared
-networks.
+**Why**: Startup schema mutation hides drift (see database guidelines); baked DSNs leak into image history; loopback binding keeps dev stacks off shared networks; keeping storage out of gateway's compose avoids duplicating infrastructure across repos and centralizes storage lifecycle in `database` and `deploy`.
 
-**Boundary**: `scripts/smoke.sh` is the acceptance path — keep per-phase
-`--timeout` budgets separate (a shared deadline lets a slow migration starve
-the health-check phase into a false failure) and keep exit codes documented.
-The smoke never echoes the DSN, including in failure log dumps.
+**Boundary**: `scripts/smoke.sh` is the acceptance path against external PostgreSQL/Redis — keep per-phase `--timeout` budgets separate (a shared deadline lets a slow migration starve the health-check phase into a false failure) and keep exit codes documented. The smoke never echoes the DSN, including in failure log dumps. Whenever storage dependencies change (PostgreSQL version/extensions/schema/migrations, Redis version/auth/persistence/key prefixes), submit change notes to both `../knowledge-base-docs/subsystems/database/` and `../knowledge-base-docs/subsystems/deploy/` (and register them in each target's `list.md`).
 
 ### Convention: Provider URL validation skips the fake provider
 
