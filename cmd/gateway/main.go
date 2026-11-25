@@ -275,7 +275,11 @@ func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	var quotaGate quota.Gate
 	var rdb *redis.Client
 	if cfg.RedisEnabled {
-		rdb = redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+		client, err := newRedisClient(cfg.RedisAddr)
+		if err != nil {
+			return fmt.Errorf("redis configuration: %w", err)
+		}
+		rdb = client
 		rl := limiter.NewRedis(rdb, "gw", cfg.RatePerMinute, cfg.MaxConcurrent)
 		if dbw != nil {
 			if limits, err := dbw.LoadLimits(ctx); err == nil {
@@ -805,9 +809,38 @@ func providerViews(providers map[string]provider.Provider) []mgmt.ProviderView {
 	return out
 }
 
+// newRedisClient builds a client from GATEWAY_REDIS_ADDR, which is a
+// redis:// or rediss:// URL. The URL carries the password (and optional ACL
+// username, database number, and TLS settings) without adding separate
+// credential variables, mirroring how GATEWAY_DATABASE_URL is parsed as a DSN.
+func newRedisClient(addr string) (*redis.Client, error) {
+	opts, err := redisOptions(addr)
+	if err != nil {
+		return nil, err
+	}
+	return redis.NewClient(opts), nil
+}
+
+// redisOptions parses GATEWAY_REDIS_ADDR. Parse failures are classified
+// rather than wrapped: net/url errors embed the raw URL, password included.
+// A bare host:port is rejected; the URL form is the only accepted shape.
+func redisOptions(addr string) (*redis.Options, error) {
+	if !strings.HasPrefix(addr, "redis://") && !strings.HasPrefix(addr, "rediss://") {
+		return nil, errors.New("GATEWAY_REDIS_ADDR must be a redis:// or rediss:// URL")
+	}
+	opts, err := redis.ParseURL(addr)
+	if err != nil {
+		return nil, errors.New("GATEWAY_REDIS_ADDR must be a valid redis:// or rediss:// URL")
+	}
+	return opts, nil
+}
+
 // redisReady pings Redis for readiness checks.
 func redisReady(ctx context.Context, addr string) error {
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	rdb, err := newRedisClient(addr)
+	if err != nil {
+		return err
+	}
 	defer rdb.Close()
 	return rdb.Ping(ctx).Err()
 }

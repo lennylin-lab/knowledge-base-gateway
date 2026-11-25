@@ -10,7 +10,7 @@ Every schema change requires a new forward migration and a real PostgreSQL-compa
 
 ### Convention: Storage dependencies are external and handed off via cross-workspace docs
 
-**What**: `knowledge-base-gateway`'s deployment orchestration (`docker-compose.yml`) does not define or run PostgreSQL or Redis containers; both are provided externally (`knowledge-base-database` or `knowledge-base-deploy`) and injected via `GATEWAY_DATABASE_URL`, `GATEWAY_LIMITS_MODE`, and `GATEWAY_REDIS_ADDR`.
+**What**: `knowledge-base-gateway`'s deployment orchestration (`docker-compose.yml`) does not define or run PostgreSQL or Redis containers; both are provided externally (`knowledge-base-database` or `knowledge-base-deploy`) and injected via `GATEWAY_DATABASE_URL`, `GATEWAY_LIMITS_MODE`, and `GATEWAY_REDIS_ADDR` (a `redis://`/`rediss://` URL; credentials live in the URL and a bare `host:port` is rejected).
 
 **Why**: Storage provisioning, upgrades, security configuration, and persistence are owned centrally by `knowledge-base-database` and `knowledge-base-deploy` rather than duplicated per application repository.
 

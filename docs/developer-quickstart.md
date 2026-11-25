@@ -198,5 +198,8 @@ Dashboards should treat `null` as "not measured yet", not zero.
 PostgreSQL persistence, Redis limiting, and real providers are configured
 through `GATEWAY_DATABASE_URL`, `GATEWAY_LIMITS_MODE=redis`, and the
 provider registry; see the main `README.md` and the container stack section.
+`GATEWAY_REDIS_ADDR` must be a `redis://` / `rediss://` URL carrying the
+password (and optional ACL username / DB index / TLS); a bare `host:port` is
+rejected.
 Capability declarations live in `model_catalog.capabilities` (see migration
 `0003_v1_2_developer_platform.up.sql` for the full schema).

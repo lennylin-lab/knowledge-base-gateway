@@ -78,7 +78,7 @@ type Config struct {
 	// V1.1 production settings. All optional; the gateway runs in
 	// development mode (in-memory stores, local limiter) when unset.
 	DatabaseURL   string // GATEWAY_DATABASE_URL enables PostgreSQL persistence
-	RedisAddr     string // GATEWAY_REDIS_ADDR enables the distributed limiter
+	RedisAddr     string // GATEWAY_REDIS_ADDR (redis:// or rediss:// URL) enables the distributed limiter
 	RedisEnabled  bool
 	LimitsMode    string // "local" (default, dev-only) or "redis"
 	AdminToken    string // GATEWAY_ADMIN_TOKEN; enables the admin API
@@ -309,7 +309,7 @@ func FromEnv() (Config, error) {
 	c.LimitsMode = env("GATEWAY_LIMITS_MODE", "local")
 	switch c.LimitsMode {
 	case "redis":
-		c.RedisAddr = env("GATEWAY_REDIS_ADDR", "127.0.0.1:6379")
+		c.RedisAddr = env("GATEWAY_REDIS_ADDR", "redis://127.0.0.1:6379")
 		c.RedisEnabled = true
 	case "local":
 	default:

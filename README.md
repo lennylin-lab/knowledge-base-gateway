@@ -119,7 +119,7 @@ production context in "V1.1 production mode" below.
 | `GATEWAY_DEFAULT_MODELS` | – | Dev-only default models: `subject:chat-model[:embedding-model]` comma-separated. Production slots live in `access_policies`. Optional even in dev: the injected `dev` subject defaults to the injected model |
 | `GATEWAY_DATABASE_URL` | – | PostgreSQL DSN; enables persistent keys/catalog/routes/policies/audit |
 | `GATEWAY_LIMITS_MODE` | `local` | `local` (dev-only, single instance) or `redis`; selects the backing store for rate/concurrency limits and token quotas |
-| `GATEWAY_REDIS_ADDR` | `127.0.0.1:6379` | Redis address for distributed limits |
+| `GATEWAY_REDIS_ADDR` | `redis://127.0.0.1:6379` | Redis URL for distributed limits. Must be a `redis://` or `rediss://` URL; the password (and optional ACL username, DB index, TLS) lives in the URL, with no extra variables |
 | `GATEWAY_ADMIN_TOKEN` | – | Legacy bootstrap bearer token for the admin API (platform-admin). In database mode the admin API also runs without it once scoped admin credentials exist; see `docs/admin-rbac.md` |
 | `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
 
@@ -279,10 +279,22 @@ Set `GATEWAY_DATABASE_URL` to enable PostgreSQL persistence (keys, catalog,
 providers, primary/backup routes, policies, audit records). Migrations live in
 `migrations/` and are applied with `go run ./cmd/migrate` (see "Schema
 migrations" below); there is no auto-migration at startup. Set
-`GATEWAY_LIMITS_MODE=redis` (+ `GATEWAY_REDIS_ADDR`) for the
-distributed rate/concurrency limiter — readiness fails until Redis answers.
+`GATEWAY_LIMITS_MODE=redis` and a `redis://` / `rediss://`
+`GATEWAY_REDIS_ADDR` for the distributed rate/concurrency limiter —
+readiness fails until Redis answers.
 Set `GATEWAY_ADMIN_TOKEN` to enable the admin API on `GATEWAY_ADMIN_ADDR`
 (default `:8081`, internal network only).
+
+`GATEWAY_REDIS_ADDR` must be a `redis://` or `rediss://` URL; a bare
+`host:port` is rejected at startup. The URL is parsed like a DSN: the password
+lives in the userinfo (`redis://:password@host:6379/0`), an optional ACL
+username comes before the password, the path selects the DB index, and
+`rediss://` enables TLS. Percent-encode URL-reserved characters in the
+password (`@` as `%40`, `:` as `%3A`, `#` as `%23`). No separate Redis
+credential variables exist. Parse failures are classified without echoing the
+URL, so the password never reaches logs. Upgrade note: a `host:port` value is
+no longer accepted; rewrite it as `redis://host:port` (add `:password@` when
+the server requires authentication).
 
 `GATEWAY_DATABASE_URL` is the configuration-mode boundary. In database mode
 the persisted configuration is authoritative: the development-only
@@ -301,7 +313,7 @@ in errors.
 |---|---|---|
 | `GATEWAY_DATABASE_URL` | – | PostgreSQL DSN; enables persistent keys/catalog/routes/policies/audit |
 | `GATEWAY_LIMITS_MODE` | `local` | `local` (dev-only, single instance) or `redis`; selects the backing store for rate/concurrency limits and token quotas |
-| `GATEWAY_REDIS_ADDR` | `127.0.0.1:6379` | Redis address for distributed limits |
+| `GATEWAY_REDIS_ADDR` | `redis://127.0.0.1:6379` | Redis URL for distributed limits. Must be a `redis://` or `rediss://` URL; the password (and optional ACL username, DB index, TLS) lives in the URL, with no extra variables |
 | `GATEWAY_ADMIN_TOKEN` | – | Legacy bootstrap bearer token for the admin API (platform-admin). In database mode the admin API also runs without it once scoped admin credentials exist; see `docs/admin-rbac.md` |
 | `GATEWAY_ADMIN_ADDR` | `:8081` | Admin API listen address |
 | `GATEWAY_PROVIDER` | `fake` | `fake`, `openai`, or `anthropic`; local dev mode only — ignored when `GATEWAY_DATABASE_URL` is set |
@@ -528,7 +540,7 @@ knowledge-base-server stack:
 |---|---|---|
 | `GATEWAY_DATABASE_URL` | – (required) | External PostgreSQL DSN injected into `migrate` and `gateway` |
 | `GATEWAY_LIMITS_MODE` | `redis` (in Compose) | `redis` (multi-instance, requires `GATEWAY_REDIS_ADDR`) or `local` (single-instance dev) |
-| `GATEWAY_REDIS_ADDR` | – (required when `redis`) | External Redis `host:port` injected into `gateway` |
+| `GATEWAY_REDIS_ADDR` | – (required when `redis`) | External Redis URL injected into `gateway`: `redis://` or `rediss://`, with credentials in the URL |
 | `GATEWAY_HOST_PORT` | `8091` | Host port for the gateway (`/healthz`, `/readyz`, `/v1/...`) |
 | `GATEWAY_ADMIN_HOST_PORT` | `8092` | Host port for the admin API (`/admin/...`, loopback only) |
 | `GATEWAY_ADMIN_TOKEN` | `smoke-admin-throwaway` | Admin API bearer token for the local stack; deterministic throwaway — set your own for anything non-disposable |

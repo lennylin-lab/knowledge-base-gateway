@@ -5,8 +5,8 @@
 #
 # Prerequisites:
 #   - External PostgreSQL is reachable at GATEWAY_DATABASE_URL (set in env or .env)
-#   - External Redis is reachable at GATEWAY_REDIS_ADDR when GATEWAY_LIMITS_MODE=redis
-#     (default in docker-compose.yml)
+#   - External Redis URL (redis:// or rediss://) is reachable at GATEWAY_REDIS_ADDR
+#     when GATEWAY_LIMITS_MODE=redis (the default in docker-compose.yml)
 #
 # Proves, within bounded timeouts:
 #   1. the gateway image builds and starts against external storage,
@@ -268,9 +268,15 @@ if [ -z "${GATEWAY_DATABASE_URL:-}" ]; then
   log "preflight: GATEWAY_DATABASE_URL must be set (in env or .env) pointing to an external PostgreSQL database"
   exit 1
 fi
-if [ "${GATEWAY_LIMITS_MODE:-redis}" = "redis" ] && [ -z "${GATEWAY_REDIS_ADDR:-}" ]; then
-  log "preflight: GATEWAY_REDIS_ADDR must be set when GATEWAY_LIMITS_MODE=redis (or set GATEWAY_LIMITS_MODE=local)"
-  exit 1
+if [ "${GATEWAY_LIMITS_MODE:-redis}" = "redis" ]; then
+  if [ -z "${GATEWAY_REDIS_ADDR:-}" ]; then
+    log "preflight: GATEWAY_REDIS_ADDR must be set when GATEWAY_LIMITS_MODE=redis (or set GATEWAY_LIMITS_MODE=local)"
+    exit 1
+  fi
+  case "${GATEWAY_REDIS_ADDR}" in
+    redis://*|rediss://*) ;;
+    *) log "preflight: GATEWAY_REDIS_ADDR must be a redis:// or rediss:// URL"; exit 1 ;;
+  esac
 fi
 
 # --- Build and start ---------------------------------------------------------

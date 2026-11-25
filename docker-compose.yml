@@ -65,6 +65,7 @@ services:
     environment:
       GATEWAY_DATABASE_URL: ${GATEWAY_DATABASE_URL:-}
       GATEWAY_LIMITS_MODE: ${GATEWAY_LIMITS_MODE:-redis}
+      # redis:// or rediss:// URL (credentials live in the URL).
       GATEWAY_REDIS_ADDR: ${GATEWAY_REDIS_ADDR:-}
       GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:-smoke-admin-throwaway}
       # Reasoning models legitimately pause between stream frames while

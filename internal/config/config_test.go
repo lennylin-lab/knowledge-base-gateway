@@ -320,7 +320,7 @@ func TestFromEnvDatabaseModeSkipsDevLists(t *testing.T) {
 	setEnv(t, map[string]string{
 		"GATEWAY_DATABASE_URL": "postgres://db.example/gw",
 		"GATEWAY_LIMITS_MODE":  "redis",
-		"GATEWAY_REDIS_ADDR":   "127.0.0.1:6379",
+		"GATEWAY_REDIS_ADDR":   "redis://127.0.0.1:6379",
 	})
 	if _, err := FromEnv(); err != nil {
 		t.Fatalf("database mode with redis rejected: %v", err)
@@ -701,5 +701,35 @@ func TestSummary(t *testing.T) {
 	}
 	if got, want := cfg.Summary(), "mode=dev provider=fake keys=2 models=1"; got != want {
 		t.Errorf("dev summary = %q, want %q", got, want)
+	}
+}
+
+// TestFromEnvRedisAddressIsURL pins the URL-only contract and its default:
+// GATEWAY_REDIS_ADDR is passed through verbatim (credentials included) and
+// defaults to a redis:// URL rather than a bare host:port.
+func TestFromEnvRedisAddressIsURL(t *testing.T) {
+	setEnv(t, map[string]string{"GATEWAY_LIMITS_MODE": "redis"})
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RedisEnabled {
+		t.Fatal("RedisEnabled = false, want true")
+	}
+	if got, want := cfg.RedisAddr, "redis://127.0.0.1:6379"; got != want {
+		t.Errorf("default RedisAddr = %q, want %q", got, want)
+	}
+
+	const url = "redis://:s3cret@redis.internal:6380/2"
+	setEnv(t, map[string]string{
+		"GATEWAY_LIMITS_MODE": "redis",
+		"GATEWAY_REDIS_ADDR":  url,
+	})
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RedisAddr != url {
+		t.Errorf("RedisAddr = %q, want the URL unchanged", cfg.RedisAddr)
 	}
 }
