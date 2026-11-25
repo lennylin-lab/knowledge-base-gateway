@@ -26,7 +26,7 @@ Authoritative rules, `list.md` structure, and the change-note template live in `
 ## Before Check / Finish (Outgoing Changes & Completion)
 
 - [ ] If this task adapted an incoming item from `../knowledge-base-docs/subsystems/gateway/list.md`, mark that checklist entry `- [x]` after tests pass.
-- [ ] If this task changes an external contract affecting another subsystem (`server`, `deploy`, `database`) — such as `/v1/*` or `/admin/*` endpoints, wire envelopes, error codes, model capability/discovery fields (`embedding_dim`, `retrieval_profile`, default model slots), `GATEWAY_*` or provider credential env vars, PostgreSQL/Redis requirements, or container image/migration contracts:
+- [ ] If this task changes an external contract affecting another subsystem (`server`, `panel`, `deploy`, `database`) — such as `/v1/*` or `/admin/*` endpoints, admin RBAC scopes, wire envelopes, error codes, model capability/discovery fields (`embedding_dim`, `retrieval_profile`, default model slots), `GATEWAY_*` or provider credential env vars, PostgreSQL/Redis requirements, or container image/migration contracts:
   - Write a self-contained change note at `../knowledge-base-docs/subsystems/<target>/<YYYY-MM-DD>/<slug>.md` per `../knowledge-base-docs/README.md`.
   - Add an unchecked `- [ ]` entry under `## <YYYY-MM-DD>` (newest date first) in `../knowledge-base-docs/subsystems/<target>/list.md` for every affected target.
 - [ ] **Strict boundary**: Describe only this repository's own changes, external contracts, compatibility, and verification steps in enough detail for consumers to adapt without reading this repo's source. Keep sibling repositories' source unread and leave their internal implementation changes to them.
