@@ -432,39 +432,51 @@ contract.
 all configuration is injected at run time by Compose or the deployment
 environment.
 
-`docker-compose.yml` defines the deployment-shaped local stack. The stack runs PostgreSQL and Redis with health checks, a one-shot migration
-job (`cmd/migrate up`, idempotent for a fully-applied schema), and the gateway
-in database-backed Redis mode
-(catalog/routes/policies/keys come from PostgreSQL; the dev-only
-`GATEWAY_API_KEYS` / `GATEWAY_MODELS` variables are not used). The gateway
-also runs the admin API with a deterministic throwaway token (loopback-only
-host port; override `GATEWAY_ADMIN_TOKEN` for anything non-disposable). Docker
-Compose reads the root `.env` for `${...}` interpolation; only variables
-listed in the Compose `environment:` sections are passed to the Go process.
-Destructive rollback is never part of startup.
+`docker-compose.yml` defines the gateway-only container stack: a one-shot
+migration job (`cmd/migrate up`, idempotent for a fully-applied schema) and the
+gateway in database-backed mode (catalog/routes/policies/keys come from
+PostgreSQL; the dev-only `GATEWAY_API_KEYS` / `GATEWAY_MODELS` variables are
+not used). **Storage dependencies (PostgreSQL and Redis) are intentionally not
+orchestrated in this repository** — provision them externally (via
+`knowledge-base-database` or `knowledge-base-deploy`) and configure
+`GATEWAY_DATABASE_URL`, `GATEWAY_LIMITS_MODE`, and `GATEWAY_REDIS_ADDR` in
+`.env` or the process environment. Whenever this repository's storage
+dependencies change (PostgreSQL engine/extensions/schema/migrations, Redis
+engine/auth/persistence/key prefixes, etc.), submit change notes to
+`../knowledge-base-docs/subsystems/database/` and
+`../knowledge-base-docs/subsystems/deploy/` (and register them in each target's
+`list.md`) so `database` and `deploy` handle the storage-side updates.
+
+The gateway also runs the admin API with a deterministic throwaway token
+(loopback-only host port; override `GATEWAY_ADMIN_TOKEN` for anything
+non-disposable). Docker Compose reads the root `.env` for `${...}`
+interpolation; only variables listed in the Compose `environment:` sections are
+passed to the Go process. Both services include `host.docker.internal` mapping
+so Linux hosts can reach a local external database stack directly. Destructive
+rollback is never part of startup.
 
 ```bash
 docker compose build            # build kb-gateway:local
-docker compose up -d            # postgres + redis + migrate + gateway
+docker compose up -d            # migrate + gateway (against external PostgreSQL/Redis)
 docker compose ps               # migrate shows Exited (0); gateway healthy
 docker compose logs -f gateway  # follow gateway logs
-docker compose stop             # stop everything (keep the data volume)
-docker compose down             # remove containers + network
-docker compose down -v          # also remove the PostgreSQL data volume
+docker compose stop             # stop gateway container
+docker compose down             # remove gateway/migrate containers + network
 scripts/smoke.sh                # bounded end-to-end smoke (see below)
 scripts/bootstrap-openai.sh     # import OpenAI chat + embedding catalog (see below)
 ```
 
 ### OpenAI catalog bootstrap
 
-After `docker compose up -d`, migrations seed only the fake provider and
-`gateway-echo`. To load real OpenAI-compatible chat and embedding models
-(`gpt-5.5`, `qwen3-embedding`, 1536-dim) into the local database:
+After `docker compose up -d` against an external PostgreSQL database,
+migrations seed only the fake provider and `gateway-echo`. To load real
+OpenAI-compatible chat and embedding models (`gpt-5.5`, `qwen3-embedding`,
+1536-dim) into the gateway database:
 
-1. Set upstream credentials in `.env`:
+1. Set `GATEWAY_DATABASE_URL` and upstream credentials in `.env`:
    `OPENAI_API_KEY__OPENAI_PRIMARY` and `OPENAI_API_KEY__OPENAI_EMBED`
    (or a shared `OPENAI_API_KEY` fallback).
-2. Run:
+2. Ensure `psql` is installed on the host and run:
 
 ```bash
 ./scripts/bootstrap-openai.sh
@@ -477,61 +489,60 @@ catalog defaults with `GATEWAY_OPENAI_*` variables (see script header).
 
 ### Smoke test
 
-`scripts/smoke.sh` builds and starts the stack, waits within bounded
-timeouts, verifies the migration job completed successfully, asserts
-`/healthz` is 200 and `/readyz` becomes 200, then stops and restarts Redis
-and PostgreSQL to prove `/readyz` fails (503) while `/healthz` stays 200 and
-readiness recovers afterwards. It then exercises the chat path end to end:
-using the throwaway admin token configured in `docker-compose.yml` (dev stack
-only), it mints a throwaway API key for the seeded subject through the admin
-API, completes a non-streaming chat request against the seeded fake provider
-(`gateway-echo`), and asserts an OpenAI-compatible success envelope before
-revoking the key. On any failure it prints the relevant service logs and
+`scripts/smoke.sh` builds and starts the gateway stack against the external
+PostgreSQL (`GATEWAY_DATABASE_URL`) and external Redis (`GATEWAY_REDIS_ADDR`
+when `GATEWAY_LIMITS_MODE=redis`), waits within bounded timeouts, verifies the
+migration job completed successfully and reached the latest schema version
+(`dirty=false`), asserts `/healthz` is 200 and `/readyz` becomes 200, then
+exercises the chat, models, and responses paths end to end: using the throwaway
+admin token configured in `docker-compose.yml` (dev stack only), it mints a
+throwaway API key for the seeded subject through the admin API, completes a
+non-streaming chat completion and `/v1/responses` call against the seeded fake
+provider (`gateway-echo`), and asserts OpenAI-compatible success envelopes
+before revoking the key. On any failure it prints the relevant service logs and
 exits with a distinct non-zero status:
 
 | Exit | Meaning |
 |---|---|
 | `0` | success |
-| `1` | preflight error (docker/curl missing, bad arguments) |
-| `2` | stack failed to build/start or the migration job did not complete |
+| `1` | preflight error (docker/curl missing, missing `GATEWAY_DATABASE_URL`/`GATEWAY_REDIS_ADDR`, bad arguments) |
+| `2` | stack failed to build/start or the migration job did not complete / schema version mismatch |
 | `3` | `/healthz` never returned 200 |
 | `4` | `/readyz` never returned 200 |
-| `5` | Redis outage: `/readyz` did not fail while Redis was down |
-| `6` | PostgreSQL outage: `/readyz` did not fail while PostgreSQL was down |
-| `7` | Redis restart: `/readyz` did not return to 200 |
-| `8` | PostgreSQL restart: `/readyz` did not return to 200 |
-| `9` | liveness regression: `/healthz` stopped answering during an outage |
 | `10` | admin API: never became ready or the API key could not be minted |
 | `11` | chat completion failed or the envelope was not a successful OpenAI-compatible completion |
+| `12` | responses/models path: model discovery or `/v1/responses` failed |
 
 The admin token and minted API keys are sent in request headers only and are
 never echoed — not in smoke output and not in gateway logs. Flags:
-`--skip-outage`, `--down` (tear the stack down after success), `--timeout N`
+`--skip-outage` (accepted as a no-op for compatibility since storage is
+external), `--down` (tear the gateway stack down after success), `--timeout N`
 (per-phase wait budget, default 90s; every phase above gets its own budget).
 
 ### Environment overrides
 
 Host ports default to values chosen not to collide with a co-existing
-knowledge-base-server stack (which uses 5432/6379):
+knowledge-base-server stack:
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `GATEWAY_DATABASE_URL` | – (required) | External PostgreSQL DSN injected into `migrate` and `gateway` |
+| `GATEWAY_LIMITS_MODE` | `redis` (in Compose) | `redis` (multi-instance, requires `GATEWAY_REDIS_ADDR`) or `local` (single-instance dev) |
+| `GATEWAY_REDIS_ADDR` | – (required when `redis`) | External Redis `host:port` injected into `gateway` |
 | `GATEWAY_HOST_PORT` | `8091` | Host port for the gateway (`/healthz`, `/readyz`, `/v1/...`) |
 | `GATEWAY_ADMIN_HOST_PORT` | `8092` | Host port for the admin API (`/admin/...`, loopback only) |
-| `GATEWAY_ADMIN_TOKEN` | `smoke-admin-throwaway` | Admin API bearer token for the local stack; deterministic throwaway (same policy as the PostgreSQL password) — set your own for anything non-disposable |
-| `POSTGRES_HOST_PORT` | `5433` | Host port for PostgreSQL |
-| `REDIS_HOST_PORT` | `6381` | Host port for Redis |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `gateway` / `gateway-local-throwaway` / `gateway` | Local PostgreSQL credentials; the default password is a deterministic throwaway (same policy as CI) — override it for anything non-disposable |
+| `GATEWAY_ADMIN_TOKEN` | `smoke-admin-throwaway` | Admin API bearer token for the local stack; deterministic throwaway — set your own for anything non-disposable |
 | `GATEWAY_IMAGE` | `kb-gateway:local` | Image tag built and used by the gateway and migrate services |
 | `GATEWAY_SMOKE_URL` | `http://127.0.0.1:${GATEWAY_HOST_PORT:-8091}` | Base URL the smoke script targets |
 | `GATEWAY_ADMIN_URL` | `http://127.0.0.1:${GATEWAY_ADMIN_HOST_PORT:-8092}` | Admin API base URL the smoke script targets |
 
-To run operational migration commands against the Compose database, reuse the
+To run operational migration commands against the external database, reuse the
 one-shot service (the image entrypoint is the gateway binary, the migrate
 service resets it):
 
 ```bash
 docker compose run --rm --no-deps migrate            # idempotent `up`
+docker compose run --rm --no-deps migrate -dir /app/migrations version
 ```
 
 `down`-style rollbacks stay operational-only (`cmd/migrate down` against a

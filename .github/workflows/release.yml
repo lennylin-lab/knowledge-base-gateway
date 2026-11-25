@@ -2,10 +2,12 @@
 # Registry (GHCR) when a version tag is pushed (v*). Nothing secret is baked
 # into the image: credentials, DSNs, and API keys are injected at run time.
 #
-# Production deploy sketch:
+# Production deploy sketch (against external PostgreSQL/Redis):
 #   export GATEWAY_IMAGE=ghcr.io/<owner>/knowledge-base-gateway:v1.3
+#   export GATEWAY_DATABASE_URL=postgres://<user>:<password>@<pg-host>:5432/gateway
+#   export GATEWAY_REDIS_ADDR=<redis-host>:6379
 #   docker compose pull
-#   docker compose up -d    # migrate job runs, then gateway starts
+#   docker compose up -d    # migrate job runs against external DB, then gateway starts
 #
 # Tag a release:
 #   git tag v1.3 && git push origin v1.3

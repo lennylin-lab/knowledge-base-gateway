@@ -10,10 +10,11 @@
 #   GATEWAY_OPENAI_CHAT_MODEL, GATEWAY_OPENAI_EMBED_MODEL, etc.
 #
 # Prerequisites:
+#   - External PostgreSQL reachable at GATEWAY_DATABASE_URL (set in env or .env)
 #   - docker compose up -d (migrate completed; subject_default / gateway-echo seed exists)
 #   - .env has OPENAI_API_KEY__OPENAI_PRIMARY and OPENAI_API_KEY__OPENAI_EMBED
 #     (or a shared OPENAI_API_KEY fallback)
-#   - Gateway container is up OR psql can reach PostgreSQL on the host port
+#   - Host `psql` installed to apply the catalog upsert SQL against GATEWAY_DATABASE_URL
 #
 # Usage (repo root):
 #   ./scripts/bootstrap-openai.sh
@@ -54,42 +55,16 @@ fi
 
 ADMIN_TOKEN="${GATEWAY_ADMIN_TOKEN:-smoke-admin-throwaway}"
 
-compose_postgres_running() {
-  "${COMPOSE[@]}" ps postgres --status running --quiet 2>/dev/null | grep -q .
-}
-
-compose_psql() {
-  "${COMPOSE[@]}" exec -T postgres \
-    psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-gateway}" -d "${POSTGRES_DB:-gateway}" "$@"
-}
-
 run_psql() {
-  if compose_postgres_running; then
-    compose_psql "$@"
-    return
+  if [[ -z "${GATEWAY_DATABASE_URL:-}" ]]; then
+    echo "error: GATEWAY_DATABASE_URL must be set (in env or .env) pointing to the external PostgreSQL database" >&2
+    exit 1
   fi
-
-  if [[ -n "${GATEWAY_DATABASE_URL:-}" ]]; then
-    if ! command -v psql >/dev/null 2>&1; then
-      echo "error: GATEWAY_DATABASE_URL is set but psql is not installed on the host" >&2
-      exit 1
-    fi
-    psql "${GATEWAY_DATABASE_URL}" -v ON_ERROR_STOP=1 "$@"
-    return
+  if ! command -v psql >/dev/null 2>&1; then
+    echo "error: psql is required on the host to import the catalog into GATEWAY_DATABASE_URL" >&2
+    exit 1
   fi
-
-  if command -v psql >/dev/null 2>&1; then
-    PGPASSWORD="${POSTGRES_PASSWORD:-gateway-local-throwaway}" \
-      psql -h "${POSTGRES_HOST:-127.0.0.1}" -p "${POSTGRES_HOST_PORT:-5433}" \
-      -U "${POSTGRES_USER:-gateway}" -d "${POSTGRES_DB:-gateway}" \
-      -v ON_ERROR_STOP=1 "$@"
-    return
-  fi
-
-  echo "error: compose postgres is not running and host psql is unavailable" >&2
-  echo "  start: docker compose up -d postgres" >&2
-  echo "  or set GATEWAY_DATABASE_URL / install psql for direct access" >&2
-  exit 1
+  psql "${GATEWAY_DATABASE_URL}" -v ON_ERROR_STOP=1 "$@"
 }
 
 sql_escape() {

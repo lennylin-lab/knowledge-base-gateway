@@ -1,30 +1,32 @@
 #!/usr/bin/env bash
-# Bounded smoke test for the gateway container stack (docker-compose.yml).
+# Bounded smoke test for the gateway container stack (docker-compose.yml)
+# running against external PostgreSQL (and external Redis when
+# GATEWAY_LIMITS_MODE=redis).
+#
+# Prerequisites:
+#   - External PostgreSQL is reachable at GATEWAY_DATABASE_URL (set in env or .env)
+#   - External Redis is reachable at GATEWAY_REDIS_ADDR when GATEWAY_LIMITS_MODE=redis
+#     (default in docker-compose.yml)
 #
 # Proves, within bounded timeouts:
-#   1. the stack builds and starts with no manual database setup,
-#   2. the one-shot migration job completed successfully,
+#   1. the gateway image builds and starts against external storage,
+#   2. the one-shot migration job completed successfully and reached the latest
+#      migration version (dirty=false),
 #   3. /healthz answers 200 (liveness),
-#   4. /readyz answers 200 only while dependencies are ready — stopping
-#      PostgreSQL or Redis flips readiness to 503 while liveness stays 200,
-#   5. restarting the dependency restores readiness,
-#   6. the chat path works end to end: a throwaway API key minted through the
+#   4. /readyz answers 200 (database, redis if enabled, catalog ready),
+#   5. the chat path works end to end: a throwaway API key minted through the
 #      admin API completes a non-streaming chat completion against the seeded
-#      fake provider with an OpenAI-compatible envelope.
+#      fake provider with an OpenAI-compatible envelope,
+#   6. /v1/models and /v1/responses work against the seeded fake provider.
 #
 # On any failure the relevant service logs are printed to stderr and the
 # script exits with a distinct non-zero status:
 #
 #   0  success
-#   1  preflight error (docker/curl missing, bad arguments)
-#   2  stack failed to build/start or migrate did not complete
+#   1  preflight error (docker/curl missing, missing GATEWAY_DATABASE_URL, bad arguments)
+#   2  stack failed to build/start or migrate did not complete / schema mismatch
 #   3  /healthz never returned 200
 #   4  /readyz never returned 200
-#   5  redis outage: /readyz did not fail while redis was down
-#   6  postgres outage: /readyz did not fail while postgres was down
-#   7  redis restart: /readyz did not return to 200
-#   8  postgres restart: /readyz did not return to 200
-#   9  liveness regression: /healthz stopped answering during an outage
 #  10  admin API: never became ready or the key could not be minted
 #  11  chat completion: request failed or the envelope was not a
 #      successful OpenAI-compatible completion
@@ -32,21 +34,48 @@
 #      protocol failed against the seeded fake provider
 #
 # Usage: scripts/smoke.sh [--skip-outage] [--down] [--timeout SECONDS]
+#   (--skip-outage is accepted for compatibility; storage containers are external
+#    and are not stopped or started by this script.)
 #
-# Logs printed on failure are structured gateway/migrate lines and standard
-# PostgreSQL/Redis service logs; none of them contain credentials — the DSN,
-# the admin token, and minted API keys are never echoed.
+# Logs printed on failure are structured gateway/migrate lines; none of them
+# contain credentials — the DSN, the admin token, and minted API keys are
+# never echoed.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE=(docker compose -f "$ROOT/docker-compose.yml")
+ENV_FILE="$ROOT/.env"
+
+# Load .env for defaults when not already set in the caller's environment
+# (existing environment variables take precedence, matching docker compose).
+if [ -f "$ENV_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|'#'*) continue ;;
+      *=*)
+        key="${line%%=*}"
+        val="${line#*=}"
+        key="${key#export }"
+        # Strip matching outer single or double quotes if present.
+        if [ "${#val}" -ge 2 ]; then
+          case "$val" in
+            \"*\") val="${val#\"}"; val="${val%\"}" ;;
+            \'*\') val="${val#\'}"; val="${val%\'}" ;;
+          esac
+        fi
+        if [ -z "${!key+x}" ]; then
+          export "$key=$val"
+        fi
+        ;;
+    esac
+  done < "$ENV_FILE"
+fi
 
 SMOKE_URL="${GATEWAY_SMOKE_URL:-http://127.0.0.1:${GATEWAY_HOST_PORT:-8091}}"
 ADMIN_URL="${GATEWAY_ADMIN_URL:-http://127.0.0.1:${GATEWAY_ADMIN_HOST_PORT:-8092}}"
 ADMIN_TOKEN="${GATEWAY_ADMIN_TOKEN:-smoke-admin-throwaway}"
 WAIT_SECONDS="${SMOKE_WAIT_SECONDS:-90}"
-OUTAGE_SECONDS="${SMOKE_OUTAGE_SECONDS:-30}"
-SKIP_OUTAGE=0
 TEARDOWN=0
 
 log() { printf '[smoke] %s\n' "$*"; }
@@ -58,7 +87,7 @@ usage() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --skip-outage) SKIP_OUTAGE=1 ;;
+    --skip-outage) ;; # accepted for compatibility; storage is external
     --down) TEARDOWN=1 ;;
     --timeout) shift; WAIT_SECONDS="${1:-90}" ;;
     -h|--help) usage; exit 0 ;;
@@ -95,43 +124,7 @@ wait_for() {
 dump_logs() {
   "${COMPOSE[@]}" ps -a >&2 2>/dev/null || true
   printf '\n[smoke] --- service logs (last 200 lines each) ---\n' >&2
-  "${COMPOSE[@]}" logs --no-color --tail=200 postgres redis migrate gateway >&2 2>/dev/null || true
-}
-
-# outage_and_recovery DEP NO_FAIL_RC NO_RECOVER_RC LIVENESS_RC
-outage_and_recovery() {
-  local dep="$1" no_fail_rc="$2" no_recover_rc="$3" liveness_rc="$4"
-  local deadline ready="" health=""
-
-  log "stopping $dep to verify readiness fails while liveness holds"
-  "${COMPOSE[@]}" stop "$dep" >/dev/null || { log "could not stop $dep"; return 2; }
-
-  deadline=$(( $(date +%s) + OUTAGE_SECONDS ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    ready="$(http_code "$SMOKE_URL/readyz")"
-    health="$(http_code "$SMOKE_URL/healthz")"
-    if [ "$ready" = "503" ] && [ "$health" = "200" ]; then
-      log "ok: /readyz -> 503 while /healthz stays 200 with $dep down"
-      break
-    fi
-    if [ "$health" != "200" ]; then
-      log "liveness regression: /healthz -> ${health:-none} during $dep outage"
-      return "$liveness_rc"
-    fi
-    sleep 1
-  done
-  if [ "$ready" != "503" ]; then
-    log "readiness did not fail while $dep was down (readyz=${ready:-none} healthz=${health:-none})"
-    return "$no_fail_rc"
-  fi
-
-  log "restarting $dep and waiting for readiness to recover"
-  "${COMPOSE[@]}" start "$dep" >/dev/null || { log "could not start $dep"; return 2; }
-  if ! wait_for "$SMOKE_URL/readyz" 200 "$(( $(date +%s) + WAIT_SECONDS ))"; then
-    log "readiness did not recover after $dep restart"
-    return "$no_recover_rc"
-  fi
-  return 0
+  "${COMPOSE[@]}" logs --no-color --tail=200 migrate gateway >&2 2>/dev/null || true
 }
 
 # --- Chat-path phase ----------------------------------------------------------
@@ -271,6 +264,14 @@ for bin in docker curl; do
   command -v "$bin" >/dev/null 2>&1 || { log "preflight: '$bin' is required but not installed"; exit 1; }
 done
 docker compose version >/dev/null 2>&1 || { log "preflight: 'docker compose' is not available"; exit 1; }
+if [ -z "${GATEWAY_DATABASE_URL:-}" ]; then
+  log "preflight: GATEWAY_DATABASE_URL must be set (in env or .env) pointing to an external PostgreSQL database"
+  exit 1
+fi
+if [ "${GATEWAY_LIMITS_MODE:-redis}" = "redis" ] && [ -z "${GATEWAY_REDIS_ADDR:-}" ]; then
+  log "preflight: GATEWAY_REDIS_ADDR must be set when GATEWAY_LIMITS_MODE=redis (or set GATEWAY_LIMITS_MODE=local)"
+  exit 1
+fi
 
 # --- Build and start ---------------------------------------------------------
 log "building and starting the stack (gateway on $SMOKE_URL)"
@@ -294,19 +295,17 @@ log "ok: migration job completed (exit 0)"
 # in the repository, so a migration silently failing to apply (or a stale
 # image shipping an old migrations directory) fails the smoke instead of
 # serving against a partially migrated schema. Mirrors the derivation in
-# .github/workflows/ci.yml; POSTGRES_USER/POSTGRES_DB defaults match
-# docker-compose.yml.
+# .github/workflows/ci.yml using the one-shot migrate service against the
+# external PostgreSQL database.
 expected_version=$((10#$(find "$ROOT/migrations" -maxdepth 1 -name '*.up.sql' \
   | sed -E 's|.*/([0-9]+)_.*|\1|' | sort -n | tail -1)))
-applied_version=$(docker compose -f "$ROOT/docker-compose.yml" exec -T postgres \
-  psql -U "${POSTGRES_USER:-gateway}" -d "${POSTGRES_DB:-gateway}" -t -A -c \
-  "SELECT version FROM schema_migrations" 2>/dev/null | head -1)
-applied_version=$((10#${applied_version:-0}))
-if [ "$applied_version" -ne "$expected_version" ]; then
-  log "schema version mismatch: applied ${applied_version}, migrations dir declares ${expected_version}"
+version_out="$("${COMPOSE[@]}" run --rm --no-deps migrate -dir /app/migrations version 2>/dev/null | tr -d '\r' | tail -1)"
+want_version="version ${expected_version} (dirty=false)"
+if [ "$version_out" != "$want_version" ]; then
+  log "schema version mismatch: got '${version_out:-empty}', want '${want_version}'"
   exit 2
 fi
-log "ok: schema at version ${applied_version}"
+log "ok: schema at ${version_out}"
 
 # --- Liveness, then readiness (each phase gets its own WAIT_SECONDS budget) ---
 if ! wait_for "$SMOKE_URL/healthz" 200 "$(( $(date +%s) + WAIT_SECONDS ))"; then
@@ -314,14 +313,6 @@ if ! wait_for "$SMOKE_URL/healthz" 200 "$(( $(date +%s) + WAIT_SECONDS ))"; then
 fi
 if ! wait_for "$SMOKE_URL/readyz" 200 "$(( $(date +%s) + WAIT_SECONDS ))"; then
   exit 4
-fi
-
-# --- Dependency outage and recovery -------------------------------------------
-if [ "$SKIP_OUTAGE" -ne 1 ]; then
-  outage_and_recovery redis 5 7 9    || exit $?
-  outage_and_recovery postgres 6 8 9 || exit $?
-else
-  log "skipping dependency outage checks (--skip-outage)"
 fi
 
 # --- Chat path: admin-minted key, non-streaming fake-provider completion ------
@@ -339,9 +330,9 @@ if [ "${responses_status:-0}" -ne 0 ]; then
   exit "$responses_status"
 fi
 
-log "PASS: migration completed at the expected version, /healthz and /readyz verified, outage and recovery behavior confirmed, chat and responses paths verified"
+log "PASS: migration completed at the expected version, /healthz and /readyz verified, chat and responses paths verified"
 if [ "$TEARDOWN" -eq 1 ]; then
-  log "tearing down stack and volumes (--down)"
-  "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  log "tearing down gateway stack (--down)"
+  "${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
 fi
 exit 0
